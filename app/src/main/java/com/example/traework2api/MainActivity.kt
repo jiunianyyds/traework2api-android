@@ -2,8 +2,10 @@ package com.example.traework2api
 
 import android.Manifest
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Typeface
@@ -42,27 +44,16 @@ class MainActivity : Activity() {
         private const val REQ_NOTIF = 1002
         private const val SIXTY_MINUTES_SEC = 3600L
 
-        // ---- design tokens：收口原先散在 helper 与页面里的圆角/间距/字号 ----
-        /** 容器类（卡片）圆角。 */
-        private const val RADIUS_CARD = 16f
-        /** 控件类（按钮/输入框）圆角。 */
-        private const val RADIUS_CONTROL = 12f
-        /** 胶囊（chip / 导航指示器）圆角：给一个大值即为全圆角。 */
-        private const val RADIUS_PILL = 100f
+        /** 二级页「保活设置」的 onSaveInstanceState 标记值。 */
+        private const val SUB_KEEP_ALIVE = "keepalive"
+        /** 二级页「外观风格」的 onSaveInstanceState 标记值。 */
+        private const val SUB_STYLE = "style"
+        private const val STATE_PAGE = "page"
+        private const val STATE_SUB = "sub"
 
-        /** 卡片之间的标准间距；页面里不再手传 8/10/12 混用。 */
-        private const val GAP = 12
-        /** 页面左右内边距。 */
-        private const val PAGE_PAD_H = 20
-        /** 页面上下内边距。 */
-        private const val PAGE_PAD_TOP = 16
-        private const val PAGE_PAD_BOTTOM = 24
-        /** 卡片内边距。 */
-        private const val CARD_PAD = 16
-
-        /** 内容最大宽度（dp）：手机竖屏不受影响，平板/横屏下不再让一行文字横跨整屏。 */
-        private const val CONTENT_MAX_DP = 640
-
+        // ---- design tokens ----
+        // 圆角/间距/内容宽度**不在这里**：它们跟着「外观风格」走，见下面按风格读取的属性。
+        // 这里只留不随风格变的字号 token。
         private const val FS_TITLE = 22f     // 顶部栏标题
         private const val FS_SECTION = 14    // 区块标题（小号灰色，与卡片标题拉开层级）
         private const val FS_CARD_TITLE = 17 // 卡片标题
@@ -74,7 +65,41 @@ class MainActivity : Activity() {
 
         /** 本地 API Key 打码占位（概览页默认显示它，避免截屏直接泄露）。 */
         private const val MASKED_KEY = "sk-••••••••••••••••••••••••"
+
+        /** 「使用引导」列出的端点（顺序即展示顺序）。复制时拼成完整 URL。 */
+        private val ENDPOINTS = listOf(
+            "POST" to "/v1/chat/completions",
+            "GET" to "/v1/models",
+            "GET" to "/healthz",
+        )
     }
+
+    // ------------------------------------------------------------------
+    // design token：圆角 / 间距 / 内容宽度 —— **跟随当前风格**（多风格本轮新增）
+    // 值只写在 AppStyle.Style 里；页面与 helper 只读这些属性，别在页面里写字面量。
+    // 之所以做成读属性的函数而不是 const：切风格时"形态"也要跟着变，const 改不了。
+    // ------------------------------------------------------------------
+    /** 容器类（卡片/搜索框）圆角。 */
+    private val RADIUS_CARD get() = AppStyle.current.cardRadius
+    /** 控件类（按钮）圆角。 */
+    private val RADIUS_CONTROL get() = AppStyle.current.controlRadius
+    /** 胶囊（chip / 导航指示器）圆角：给一个大值即为全圆角。 */
+    private val RADIUS_PILL get() = AppStyle.current.pillRadius
+
+    /** 卡片之间的标准间距；页面里不再手传 8/10/12 混用。 */
+    private val GAP get() = AppStyle.current.gap
+    /** 页面左右内边距。 */
+    private val PAGE_PAD_H get() = AppStyle.current.pagePadH
+    /** 页面上下内边距。 */
+    private val PAGE_PAD_TOP get() = AppStyle.current.pagePadTop
+    private val PAGE_PAD_BOTTOM get() = AppStyle.current.pagePadBottom
+    /** 卡片内边距。 */
+    private val CARD_PAD get() = AppStyle.current.cardPad
+    /** 顶栏上下内边距。 */
+    private val BAR_PAD_TOP get() = AppStyle.current.barPadTop
+    private val BAR_PAD_BOTTOM get() = AppStyle.current.barPadBottom
+    /** 内容最大宽度（dp）：手机竖屏不受影响，平板/横屏下不再让一行文字横跨整屏。 */
+    private val CONTENT_MAX_DP get() = AppStyle.current.contentMaxDp
 
     private enum class Page(val title: String, val subtitle: String, val icon: Int) {
         OVERVIEW("概览", "本地服务运行状态", R.drawable.ic_dashboard),
@@ -87,6 +112,8 @@ class MainActivity : Activity() {
     private lateinit var contentHost: FrameLayout
     private lateinit var pageTitle: TextView
     private lateinit var pageSubtitle: TextView
+    /** 顶栏里的「← 返回」，只在二级页可见（见 [render] / [openKeepAlive] / [openStylePage]）。 */
+    private lateinit var backAction: TextView
     private lateinit var navItems: Map<Page, TextView>
     private var currentPage = Page.OVERVIEW
     /**
@@ -96,6 +123,8 @@ class MainActivity : Activity() {
      * 低频页面，不值得占一个常驻 Tab。
      */
     private var showKeepAlive = false
+    /** 是否正停在外观风格二级页（与保活设置共用同一套二级页机制）。 */
+    private var showStyle = false
     private val apiKey: String by lazy { Gateway.apiKey(this) }
     /** 账号页积分/额度缓存（null=未拉到），展示用，不存凭据。 */
     private var accountBalance: Long? = null   // 当前可用积分
@@ -103,14 +132,41 @@ class MainActivity : Activity() {
     private var accountCheckin: Pair<Boolean, Long>? = null // (今日已签, 每日可领)
     /** 本地 API Key 明文默认打码（防止截图/旁观泄露），点「显示」才展开。 */
     private var apiKeyVisible = false
+    /** 服务启停进行中（"启动中…" / "停止中…"），null = 空闲。启停是异步的，中间得给个状态。 */
+    private var serviceBusy: String? = null
+    /** 积分刷新进行中：数值位显示「…」，否则用户点了「刷新」会觉得没反应。 */
+    private var quotaLoading = false
+    /**
+     * 「积分与用量」卡里那几个会被刷新改掉的控件 —— 刷新时**原地改文字**，不重建页面。
+     *
+     * 为什么不用 `render()`：重建会把滚动位置弹回页首，用户就看不到自己刚点的那张卡在变
+     * （实测：加载态的「…」因此根本看不见）。原地更新也顺带没有闪烁。
+     */
+    private var quotaApply: (() -> Unit)? = null
 
     /** 版本号取自 PackageManager，避免依赖 AGP 的 BuildConfig 开关。 */
     private val versionName: String by lazy {
         runCatching { packageManager.getPackageInfo(packageName, 0).versionName }.getOrNull() ?: "-"
     }
 
+    /**
+     * 外观偏好比任何控件都早一步生效：先把「亮/暗」落到 uiMode，
+     * 这样 `values-night` 资源、平台对话框、光标颜色都跟着用户的选择走。
+     */
+    override fun attachBaseContext(newBase: Context) {
+        AppStyle.init(newBase)
+        super.attachBaseContext(AppStyle.applyNightOverride(newBase))
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // 外观偏好必须在**建控件之前**加载并刷新亮暗，否则第一帧会用旧风格画一遍。
+        // （init 在 attachBaseContext 里已经调过一次，这里是幂等的二道保险。）
+        AppStyle.init(this)
+        AppStyle.refreshNight(this)
+        // 风格表自检：色表缺键 / 色值透明 / 对比度 < 4.5:1 都在启动时立刻炸，
+        // 而不是让用户在界面上看到"看不见的字"。
+        AppStyle.selfCheck()
         removeLegacyPlaintextToken()
         // 请求体按字节读的自检：中文 body 曾因按字符读而挂死，这里早失败早暴露。
         LocalFakeServer.selfCheck()
@@ -138,28 +194,36 @@ class MainActivity : Activity() {
         // ⚠️ 依然**不自动启动**：默认关闭，必须用户点「启动服务」（见 toggleService）。
 
         val root = FrameLayout(this).apply {
-            setBackgroundColor(color(R.color.wb_background))
+            setBackgroundColor(color("background"))
             fitsSystemWindows = true
         }
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         root.addView(col, FrameLayout.LayoutParams(-1, -1))
 
-        // 顶部栏（标题 + 副标题 + 1dp 分隔线，把顶栏和内容区分开）
+        // 顶部栏（标题 + 副标题 + 1dp 分隔线）
+        // 背景用 `background` 而不是 `surface`：让顶栏"退"到页面底色里、卡片"凸"出来，
+        // 层次只由卡片承载（旧版顶栏和卡片同色，整屏看着一样平）。
         // 外层全宽撑背景，内层限宽居中，这样平板/横屏下标题与内容左边缘是对齐的
         col.addView(LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(color(R.color.wb_surface))
+            setBackgroundColor(color("background"))
             addView(LinearLayout(this@MainActivity).apply {
                 orientation = LinearLayout.VERTICAL
-                setPadding(dp(PAGE_PAD_H), dp(14), dp(PAGE_PAD_H), dp(12))
+                setPadding(dp(PAGE_PAD_H), dp(BAR_PAD_TOP), dp(PAGE_PAD_H), dp(BAR_PAD_BOTTOM))
+                // 二级页才出现的返回入口。不靠系统返回键：纯小白不一定知道那个键，
+                // 顶栏给一个看得见的出口。放标题**上方**（不是左侧），
+                // 这样标题左边缘始终与内容区对齐。
+                addView(linkAction("← 返回") { render(Page.MORE) }
+                    .also { backAction = it }
+                    .apply { visibility = View.GONE })
                 addView(TextView(this@MainActivity).apply {
                     textSize = FS_TITLE
-                    setTextColor(color(R.color.wb_on_surface))
+                    setTextColor(color("on_surface"))
                     typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
-                }.also { pageTitle = it })
+                }.also { pageTitle = it }, top(6))
                 addView(TextView(this@MainActivity).apply {
                     textSize = FS_CAPTION.toFloat()
-                    setTextColor(color(R.color.wb_on_surface_variant))
+                    setTextColor(color("on_surface_variant"))
                 }.also { pageSubtitle = it }, top(4))
             }, LinearLayout.LayoutParams(contentWidth(), -2).apply { gravity = Gravity.CENTER_HORIZONTAL })
         })
@@ -173,7 +237,7 @@ class MainActivity : Activity() {
         val navBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
-            setBackgroundColor(color(R.color.wb_surface))
+            setBackgroundColor(color("background"))
         }
         navItems = Page.entries.associate { p ->
             val tv = TextView(this).apply {
@@ -197,7 +261,15 @@ class MainActivity : Activity() {
         col.addView(navBar)
 
         setContentView(root)
-        render(Page.OVERVIEW)
+        // 重建时回到原处：切风格/切亮暗（recreate）与系统夜间模式切换都会走到这里，
+        // 不恢复的话用户切一下风格就被弹回「概览」，体验很跳。
+        val restored = savedInstanceState?.getString(STATE_PAGE)
+            ?.let { name -> Page.entries.firstOrNull { it.name == name } } ?: Page.OVERVIEW
+        render(restored)
+        when (savedInstanceState?.getString(STATE_SUB)) {
+            SUB_KEEP_ALIVE -> openKeepAlive()
+            SUB_STYLE -> openStylePage()
+        }
         loadAndRefreshToken()
     }
 
@@ -207,8 +279,12 @@ class MainActivity : Activity() {
 
     private fun render(page: Page) {
         currentPage = page
-        // 点任意底部 Tab 都算"退出二级页"，否则会卡在保活页上出不去。
+        // 点任意底部 Tab 都算"退出二级页"，否则会卡在保活页/外观风格页上出不去。
         showKeepAlive = false
+        showStyle = false
+        backAction.visibility = View.GONE
+        // 页面要重建了，旧的"原地刷新"句柄作废（accountPage 构建时会重新登记）
+        quotaApply = null
         pageTitle.text = page.title
         pageSubtitle.text = page.subtitle
         contentHost.removeAllViews()
@@ -221,11 +297,11 @@ class MainActivity : Activity() {
         })
         navItems.forEach { (key, item) ->
             val active = key == page
-            item.setTextColor(color(if (active) R.color.wb_primary else R.color.wb_on_surface_variant))
+            item.setTextColor(color(if (active) "primary" else "on_surface_variant"))
             item.typeface = if (active) Typeface.create("sans-serif-medium", Typeface.NORMAL) else Typeface.DEFAULT
             // 选中态：贴在图标+文字上的胶囊（宽度由内容决定，见 onCreate 的 navBar 组装）
-            item.background = if (active) shape(R.color.wb_primary_container, RADIUS_PILL) else null
-            item.compoundDrawables.filterNotNull().forEach { it.mutate().setTint(color(if (active) R.color.wb_primary else R.color.wb_on_surface_variant)) }
+            item.background = if (active) shape("primary_container", RADIUS_PILL) else null
+            item.compoundDrawables.filterNotNull().forEach { it.mutate().setTint(color(if (active) "primary" else "on_surface_variant")) }
         }
     }
 
@@ -234,17 +310,56 @@ class MainActivity : Activity() {
         showKeepAlive = true
         pageTitle.text = "保活设置"
         pageSubtitle.text = "让服务在后台长期活着"
+        backAction.visibility = View.VISIBLE
         contentHost.removeAllViews()
         contentHost.addView(keepAlivePage())
     }
 
-    /** 二级页返回：回到「更多」。 */
-    private fun closeKeepAlive() = render(Page.MORE)
+    /** 打开「外观风格」二级页（顶栏换标题，Tab 高亮保持在「更多」）。 */
+    private fun openStylePage() {
+        showStyle = true
+        pageTitle.text = "外观风格"
+        pageSubtitle.text = "配色与形态，随你挑"
+        backAction.visibility = View.VISIBLE
+        contentHost.removeAllViews()
+        contentHost.addView(stylePage())
+    }
 
-    /** 系统返回键：在保活页时先退回「更多」，而不是直接退出 App。 */
+    /**
+     * 按"现在所在的位置"重绘：Tab 页或二级页都还原。
+     *
+     * ⚠️ 不能拿 `render(currentPage)` 当"刷新界面"用：那会把正停在二级页（保活设置 /
+     * 外观风格）的用户踢回 Tab 页。实测：切完风格重建后状态恢复是对的，但 token 加载
+     * 线程随后又 `render(currentPage)` 一次，人就被送回「更多」了。
+     */
+    private fun redraw() {
+        when {
+            showKeepAlive -> openKeepAlive()
+            showStyle -> openStylePage()
+            else -> render(currentPage)
+        }
+    }
+
+    /** 系统返回键：停在任一二级页时先退回「更多」，而不是直接退出 App。 */
     @Deprecated("Activity.onBackPressed 已废弃，但本项目未引 androidx（无 OnBackPressedDispatcher）")
     override fun onBackPressed() {
-        if (showKeepAlive) closeKeepAlive() else @Suppress("DEPRECATION") super.onBackPressed()
+        if (showKeepAlive || showStyle) render(Page.MORE) else @Suppress("DEPRECATION") super.onBackPressed()
+    }
+
+    /**
+     * 记住当前 Tab 与二级页。
+     *
+     * 两个场景都靠它才不会"跳页"：① 切风格/亮暗走 [recreate]；
+     * ② 系统夜间模式切换时本 Activity 会被系统重建（manifest 未声明 configChanges）。
+     */
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putString(STATE_PAGE, currentPage.name)
+        outState.putString(STATE_SUB, when {
+            showKeepAlive -> SUB_KEEP_ALIVE
+            showStyle -> SUB_STYLE
+            else -> ""
+        })
     }
 
     // ------------------------------------------------------------------
@@ -253,17 +368,22 @@ class MainActivity : Activity() {
 
     private fun overviewPage(): View = scroll {
         val running = GatewayService.running
-        addView(if (running) chipOk("服务运行中") else chipDanger("服务已停止"))
+        val busy = serviceBusy
+        addView(when {
+            busy != null -> chipInfo(busy)
+            running -> statusChip("服务运行中", "success", true)
+            else -> statusChip("服务已停止", "error", false)
+        })
         // 服务默认是**关闭**的（见 onCreate：不自动 start）。关闭时先说清"为什么连不上、
         // 该点哪里"，否则用户看到地址却连不上会以为坏了。
         if (!running) {
-            addView(card {
+            addView(card(tone = CardTone.SOFT) {
                 addView(text("服务未启动", FS_CARD_TITLE, true))
                 addView(caption("本服务默认关闭，需要你手动开启后才会监听本地端口。\n" +
                     "点下面的「启动服务」即可；不开启时客户端连不上，也不会有任何端口在监听。"), top(8))
             }, top(GAP))
         } else {
-            addView(card {
+            addView(card(tone = CardTone.SOFT) {
                 addView(text("后台常驻中", FS_CARD_TITLE, true))
                 addView(caption("服务跑在前台服务里：退出本 App、划掉最近任务都不会断，" +
                     "你可以切到任意客户端使用。\n停止请点下面的「停止服务」或通知栏的「停止」。"), top(8))
@@ -277,16 +397,21 @@ class MainActivity : Activity() {
                     full = true, outlined = pending == 0) { openKeepAlive() }, top(10))
             }, top(GAP))
         }
-        // 服务地址是本页核心信息：做成强调卡（等宽地址 + 主色 + 一键复制）
-        addView(card {
+        // 服务地址是本页核心信息：强调卡（有底色、无阴影）+ 等宽主色地址 + 一键复制
+        addView(card(tone = CardTone.EMPHASIS) {
             addView(caption("服务地址"))
             addView(row(8) {
-                addView(mono("http://127.0.0.1:${LocalFakeServer.PORT}", FS_BODY, true, R.color.wb_primary), weighted())
-                addView(linkAction("复制") { copyServerUrl() })
+                addView(mono("http://127.0.0.1:${LocalFakeServer.PORT}", FS_BODY, true, "primary"), weighted())
+                // 卡底本身就是 primary_container，按钮底要换成 surface 才看得见
+                addView(linkAction("复制", overContainer = true) { copyServerUrl() })
             }, top(6))
             addView(caption("把它作为 base URL 填进任意 OpenAI 兼容客户端"), top(8))
         }, top(GAP))
-        addView(action(if (running) "停止服务" else "启动服务", full = true, outlined = running) { toggleService() }, top(GAP))
+        addView(action(busy ?: if (running) "停止服务" else "启动服务", full = true, outlined = running || busy != null) { toggleService() }
+            .apply {
+                // 处理中禁用：不给点第二次，也不让用户以为"没点动"
+                if (busy != null) { isEnabled = false; alpha = 0.6f }
+            }, top(GAP))
         addView(card { addTraeCard(includeLogin = true) })
         addView(card {
             addView(caption("本地 API Key"))
@@ -302,9 +427,15 @@ class MainActivity : Activity() {
             }, top(6))
             addView(caption("供任意 OpenAI 客户端连接鉴权使用"), top(8))
         })
-        addView(card {
+        addView(card(tone = CardTone.SOFT) {
             addView(text("使用引导", FS_CARD_TITLE, true))
-            addView(caption("将上面的地址与 API Key 填入任意 OpenAI 兼容客户端：\nPOST /v1/chat/completions\nGET /v1/models\nGET /healthz"), top(8))
+            addView(caption("把上面的地址与 API Key 填进任意 OpenAI 兼容客户端。要单独测某个端点，点右边的「复制」："), top(8))
+            ENDPOINTS.forEach { (method, path) ->
+                addView(row(8) {
+                    addView(mono("$method $path", FS_CAPTION, colorName = "on_surface"), weighted())
+                    addView(linkAction("复制") { copyEndpoint(path) })
+                }, top(8))
+            }
         })
         addView(action("登录 / 切换 Trae 账号", full = true) { openLogin() }, top(GAP))
     }
@@ -320,7 +451,7 @@ class MainActivity : Activity() {
         val hasToken = !cred.accessToken.isBlank()
         addView(row {
             addView(text(cred.nickname.ifBlank { "Trae 账号" }, FS_CARD_TITLE, true), weighted())
-            addView(if (hasToken) chipOk("转发 已启用") else chipWarn("转发 未配置"))
+            addView(if (hasToken) statusChip("转发 已启用", "success", true) else statusChip("转发 未配置", "warning", false))
         })
         if (cred.uid.isNotBlank()) addView(caption("UID: ${cred.uid} · ${regionLabelFull(cred.region)}"), top(6))
         if (!cred.region.isSupported) addView(caption(TraeRegion.SG.unsupportedNote), top(4))
@@ -338,7 +469,7 @@ class MainActivity : Activity() {
         val metas = TraeAuthStore.list(this@MainActivity)
         val activeUid = TraeAuthStore.activeUid(this@MainActivity)
         if (metas.isEmpty()) {
-            addView(card {
+            addView(card(tone = CardTone.SOFT) {
                 addView(text("未登录", FS_CARD_TITLE, true))
                 addView(caption("登录后使用 Trae 账号进行真实转发"), top(6))
                 addView(action("立即登录", full = true) { openLogin() }, top(14))
@@ -403,18 +534,35 @@ class MainActivity : Activity() {
         })
         addView(section("积分与用量"))
         addView(card {
+            val refreshLabel = linkAction(if (quotaLoading) "刷新中…" else "刷新") { refreshQuota() }
+            val balanceView = text(quotaValue(accountBalance?.toString()), FS_METRIC, true, "primary")
+            val capView = text(quotaValue(accountCap?.toString()), FS_BODY, true)
+            val checkinView = text(quotaValue(checkinLabel()), FS_BODY, true)
+            // 登记"怎么把最新数据刷进这几个控件"，刷新时直接调用（见 quotaApply 的注释）
+            quotaApply = {
+                refreshLabel.text = if (quotaLoading) "刷新中…" else "刷新"
+                balanceView.text = quotaValue(accountBalance?.toString())
+                capView.text = quotaValue(accountCap?.toString())
+                checkinView.text = quotaValue(checkinLabel())
+            }
             addView(row {
                 addView(caption("当前可用积分"), weighted())
-                addView(linkAction("刷新") { refreshQuota() })
+                addView(refreshLabel)
             })
             // 主数值放大，一眼能读到；次要指标并排
-            addView(text(accountBalance?.toString() ?: "—", FS_METRIC, true, R.color.wb_primary), top(2))
+            addView(balanceView, top(2))
             addView(row(12) {
-                addView(metric("权益额度(上限)", accountCap?.toString() ?: "—"), weighted())
-                addView(metric("今日签到", accountCheckin?.let { if (it.first) "已签 · +${it.second}/日" else "未签" } ?: "—"), weighted(start = 12))
+                addView(metricOf("权益额度(上限)", capView), weighted())
+                addView(metricOf("今日签到", checkinView), weighted(start = 12))
             }, top(14))
         })
     }
+
+    private fun checkinLabel(): String? =
+        accountCheckin?.let { if (it.first) "已签 · +${it.second}/日" else "未签" }
+
+    /** 积分数值位：刷新中显示「…」，没拿到显示「—」。 */
+    private fun quotaValue(v: String?): String = if (quotaLoading) "…" else v ?: "—"
 
     /** Token 是否需要续期：过期则需重新登录，临近则由后台自动用 refresh 续期。 */
     private fun tokenRenewLabel(expiresAt: Long): String {
@@ -434,6 +582,12 @@ class MainActivity : Activity() {
         val edit = searchInput("搜索模型…")
         addView(edit, lp(-1, -2))
 
+        // 搜不到时的空态。没有它，用户打错一个字就是**整页空白**，会以为 App 坏了。
+        val empty = card(tone = CardTone.SOFT) {
+            addView(caption("没有匹配的模型。换个关键词，或清空搜索框看看全部。"))
+        }.apply { visibility = View.GONE }
+        addView(empty)
+
         // 客户端过滤：改可见性而非重建容器，避免丢失输入框焦点
         val cards = buildModelCards(this)
         edit.addTextChangedListener(object : android.text.TextWatcher {
@@ -442,6 +596,7 @@ class MainActivity : Activity() {
             override fun afterTextChanged(s: android.text.Editable?) {
                 val f = edit.text.toString().trim()
                 cards.forEach { (key, v) -> v.visibility = if (f.isBlank() || key.contains(f, true)) View.VISIBLE else View.GONE }
+                empty.visibility = if (f.isNotBlank() && cards.values.none { it.visibility == View.VISIBLE }) View.VISIBLE else View.GONE
             }
         })
     }
@@ -464,7 +619,7 @@ class MainActivity : Activity() {
         val name = m.optString("name", "").ifBlank { id }
         addView(text(name, FS_CARD_TITLE, true))
         addView(row(4) {
-            addView(mono(id, FS_CHIP, colorRes = R.color.wb_on_surface_variant).apply {
+            addView(mono(id, FS_CHIP, colorName = "on_surface_variant").apply {
                 maxLines = 1
                 ellipsize = android.text.TextUtils.TruncateAt.END
             }, weighted())
@@ -483,15 +638,21 @@ class MainActivity : Activity() {
         val records = UsageStore.all(this@MainActivity)
         if (records.isEmpty()) {
             addView(section("消耗汇总"))
-            addView(card { addView(caption("暂无记录 —— 发一次聊天请求后这里会显示用量与汇总")) })
+            addView(card(tone = CardTone.SOFT) { addView(caption("暂无记录 —— 发一次聊天请求后这里会显示用量与汇总")) })
             return@scroll
         }
         addView(card {
             addView(text("模型消耗汇总", FS_CARD_TITLE, true))
-            for (g in UsageStore.aggregate(this@MainActivity)) addView(row(8) {
-                addView(text(g.model.ifBlank { "?" }, FS_VALUE, true), weighted())
-                addView(mono("总 ${g.total} · 输出 ${g.output}", FS_CAPTION, colorRes = R.color.wb_on_surface_variant))
-            }, top(8))
+            val groups = UsageStore.aggregate(this@MainActivity)
+            // 条形按**相对最大的那组**画（不是占总量）：模型一多的话每条都只剩一小截，反而看不出差别
+            val max = groups.maxOfOrNull { it.total } ?: 0L
+            for (g in groups) {
+                addView(row(8) {
+                    addView(text(g.model.ifBlank { "?" }, FS_VALUE, true), weighted())
+                    addView(mono("总 ${g.total} · 输出 ${g.output}", FS_CAPTION, colorName = "on_surface_variant"))
+                }, top(12))
+                addView(shareBar(g.total, max), top(6))
+            }
         })
         addView(section("调用记录（最近 ${records.size} 条）"))
         for (r in records.asReversed()) addView(recordCard(r))
@@ -499,11 +660,11 @@ class MainActivity : Activity() {
 
     private fun recordCard(r: UsageStore.UsageRecord): View = card {
         addView(row {
-            addView(if (r.ok) chipOk("OK") else chipDanger("ERR"))
+            addView(if (r.ok) statusChip("OK", "success", true) else statusChip("ERR", "error", false))
             addView(text(r.model.ifBlank { "?" }, FS_VALUE), weighted(start = 10))
             // 时间戳用等宽字体，一列扫下来是对齐的
             addView(mono(SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(r.ts)), FS_CHIP,
-                colorRes = R.color.wb_on_surface_variant))
+                colorName = "on_surface_variant"))
         })
         val detail = StringBuilder()
             .append("in ${r.prompt} · out ${r.completion} · 总 ${r.total} · ${r.durationMs}ms")
@@ -516,17 +677,28 @@ class MainActivity : Activity() {
     // ------------------------------------------------------------------
 
     private fun morePage(): View = scroll {
-        addView(section("关于"))
+        // 外观入口放在最上面：这是"改长相"的地方，也顺带告诉用户当前在用什么风格。
+        addView(section("外观"))
         addView(card {
+            addView(row {
+                addView(text("外观风格", FS_CARD_TITLE, true), weighted())
+                addView(chipInfo(AppStyle.current.label))
+            })
+            addView(caption("当前：${AppStyle.current.label} · ${AppStyle.mode.label}。" +
+                "可切换多套配色与形态，亮/暗可单独设置。"), top(8))
+            addView(action("打开外观风格", full = true) { openStylePage() }, top(12))
+        })
+        addView(section("关于"))
+        addView(card(tone = CardTone.SOFT) {
             addView(text("应用说明", FS_CARD_TITLE, true))
             addView(caption("本应用针对 Trae 当前协议的个人学习自用适配，不保证长期兼容，不代表官方支持。"), top(8))
             addView(labelValue("版本", versionName), top(12))
         })
-        addView(card {
+        addView(card(tone = CardTone.SOFT) {
             addView(text("致谢", FS_CARD_TITLE, true))
             addView(caption("参考与致谢：\n• traework2api（本项目）\n• WorkBuddy2API-Android（UI 风格与组件写法参考）"), top(8))
         })
-        addView(card {
+        addView(card(tone = CardTone.SOFT) {
             addView(text("版权与免责声明", FS_CARD_TITLE, true))
             addView(caption("仅供个人学习与研究使用。使用本项目与 Trae 账号存在风险，请自行评估并遵守相关服务条款。"), top(8))
         })
@@ -598,7 +770,7 @@ class MainActivity : Activity() {
                 if (i > 0) addView(divider(), top(12))
                 addView(row(top = if (i > 0) 12 else 0) {
                     addView(text(if (it.ok) "✓" else "⚠", FS_BODY, true,
-                        if (it.ok) R.color.wb_success else R.color.wb_warning), lp(-2, -2, end = 8))
+                        if (it.ok) "success" else "warning"), lp(-2, -2, end = 8))
                     addView(text(it.title, FS_VALUE, true), weighted())
                     if (!it.ok) addView(if (it.autoOpenable) chipInfo("可一键") else chipWarn("需手动"))
                 })
@@ -650,6 +822,116 @@ class MainActivity : Activity() {
     }
 
     // ------------------------------------------------------------------
+    // 外观风格（二级页）
+    // ------------------------------------------------------------------
+
+    /**
+     * 「外观风格」页：风格 + 亮暗两组，全部用**当前风格实时渲染**（选中项主色描边 + ✓）。
+     *
+     * 点一下即持久化并重建生效 —— 颜色/圆角/间距散在几十个控件上（还有 chip、矢量图标
+     * tint、间距），逐个回刷既长又容易漏；重建则一定是完整、正确的一套。
+     */
+    private fun stylePage(): View = scroll {
+        addView(section("风格"))
+        AppStyle.STYLES.forEach { s -> addView(styleOption(s), top(GAP)) }
+
+        addView(section("亮暗模式"))
+        addView(card {
+            AppStyle.Mode.entries.forEachIndexed { i, m ->
+                if (i > 0) addView(divider(), top(12))
+                addView(modeOption(m), top(if (i > 0) 12 else 0))
+            }
+        })
+        addView(caption("切换后立即生效，并会记住你的选择；重开 App 仍是这套。"), top(12))
+    }
+
+    /** 风格卡：左侧色样 + 名称说明，选中项 = 主色 2dp 描边 + ✓ 标记。 */
+    private fun styleOption(s: AppStyle.Style): LinearLayout {
+        val selected = s.id == AppStyle.current.id
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(CARD_PAD), dp(14), dp(CARD_PAD), dp(14))
+            // 选中用主色加粗描边：不靠颜色单独传达（色盲也能从描边粗细 + ✓ 分辨）
+            background = shape("surface", RADIUS_CARD,
+                if (selected) "primary" else "outline_variant", if (selected) 2 else 1)
+            elevation = dp(AppStyle.current.elevation + (if (selected) 1 else 0)).toFloat()
+            addView(styleSwatch(s), lp(dp(48), dp(48)))
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                addView(text(s.label, FS_CARD_TITLE, true, if (selected) "primary" else "on_surface"))
+                addView(caption(s.note), top(3))
+            }, weighted(start = 14))
+            if (selected) addView(chipInfo("✓ 使用中"), lp(-2, -2, start = 10))
+            minimumHeight = dp(56)   // 触控目标 ≥ 48dp
+            setOnClickListener { switchStyle(s) }
+        }
+    }
+
+    /**
+     * 色样：用**该风格自己**的主色与圆角画一个小方块，内部一条 on_primary 短胶囊。
+     * 不这么做的话，没被选中的风格只能靠文字去猜它长什么样。
+     */
+    private fun styleSwatch(s: AppStyle.Style): View = FrameLayout(this).apply {
+        val dark = AppStyle.isNight
+        background = GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            setColor(AppStyle.previewColor(s, "primary", dark))
+            // 圆角上限 = 方块边长的一半（24dp）：让"方正"与"大圆角"在色样上就分得出来
+            cornerRadius = dp(minOf(s.cardRadius, 24f)).toFloat()
+            setStroke(dp(1), AppStyle.previewColor(s, "outline_variant", dark))
+        }
+        addView(View(this@MainActivity).apply {
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                setColor(AppStyle.previewColor(s, "on_primary", dark))
+                cornerRadius = dp(minOf(s.controlRadius, 8f)).toFloat()
+            }
+        }, FrameLayout.LayoutParams(dp(24), dp(7), Gravity.CENTER))
+    }
+
+    /** 亮暗模式选项：整行可点（高 ≥ 52dp），右侧圆形单选标记。 */
+    private fun modeOption(m: AppStyle.Mode): LinearLayout {
+        val selected = m.id == AppStyle.mode.id
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            minimumHeight = dp(52)
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                addView(text(m.label, FS_BODY, true, if (selected) "primary" else "on_surface"))
+                addView(caption(m.note), top(3))
+            }, weighted())
+            addView(radioDot(selected), lp(dp(22), dp(22), start = 12))
+            setOnClickListener { switchMode(m) }
+        }
+    }
+
+    /** 单选圆点：选中 = 主色实心 + 内圈 on_primary 小点；未选中 = 描边空心。 */
+    private fun radioDot(selected: Boolean): View = FrameLayout(this).apply {
+        background = if (selected) shape("primary", RADIUS_PILL) else shape("surface", RADIUS_PILL, "outline")
+        if (selected) addView(View(this@MainActivity).apply {
+            background = shape("on_primary", RADIUS_PILL)
+        }, FrameLayout.LayoutParams(dp(8), dp(8), Gravity.CENTER))
+    }
+
+    /** 切风格：持久化 → 提示 → 重建。 */
+    private fun switchStyle(s: AppStyle.Style) {
+        if (s.id == AppStyle.current.id) return
+        AppStyle.setStyle(this, s.id)
+        toast("已切换为「${s.label}」")
+        recreate()
+    }
+
+    /** 切亮暗：持久化 → 提示 → 重建（重建会重新走 attachBaseContext 覆写 uiMode）。 */
+    private fun switchMode(m: AppStyle.Mode) {
+        if (m.id == AppStyle.mode.id) return
+        AppStyle.setMode(this, m)
+        toast("亮暗模式：${m.label}")
+        recreate()
+    }
+
+    // ------------------------------------------------------------------
     // 底层数据 / 生命周期（保持原逻辑）
     // ------------------------------------------------------------------
 
@@ -668,18 +950,67 @@ class MainActivity : Activity() {
         copyLoginUrl(region)
     }
 
+    // ------------------------------------------------------------------
+    // 确认弹窗（统一样式）
+    // ------------------------------------------------------------------
+
+    /**
+     * 统一风格的确认弹窗。
+     *
+     * **为什么不直接用 `AlertDialog.Builder(this).setTitle(…).setMessage(…)`**：
+     * 那个走平台主题，配色来自 `colorAccent`（写死在 `values/colors.xml` 的**靛蓝**），
+     * 所以切到苔绿/落日/石墨之后，弹窗还是靛蓝高亮 + 系统灰底，和 App 完全脱节。
+     * 这里标题/正文/按钮全部自己画，窗口底也换成当前风格的 `surface` + 圆角。
+     *
+     * @param danger 破坏性操作（删除），确定键走 `error` 色描边
+     * @param content 需要额外控件时传进来（如粘贴回调的输入框）
+     */
+    private fun confirmDialog(
+        title: String,
+        message: String,
+        okText: String,
+        cancelText: String? = "取消",
+        danger: Boolean = false,
+        content: View? = null,
+        onOk: () -> Unit,
+    ): AlertDialog {
+        var dialog: AlertDialog? = null
+        val panel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(CARD_PAD), dp(CARD_PAD), dp(CARD_PAD), dp(CARD_PAD))
+            addView(text(title, FS_CARD_TITLE, true))
+            addView(text(message, FS_VALUE, false, "on_surface_variant"), top(8))
+            content?.let { addView(it, top(14)) }
+            addView(row(8) {
+                if (cancelText != null) {
+                    addView(action(cancelText, outlined = true) { dialog?.dismiss() }, weighted())
+                }
+                addView(action(okText, danger = danger) {
+                    dialog?.dismiss()
+                    onOk()
+                }, weighted(start = if (cancelText != null) 8 else 0))
+            }, top(18))
+        }
+        val dlg = AlertDialog.Builder(this).setView(panel).create()
+        dialog = dlg
+        // 窗口底换成当前风格的 surface + 统一圆角，替掉平台那层灰底
+        dlg.setOnShowListener { dlg.window?.setBackgroundDrawable(shape("surface", RADIUS_CARD)) }
+        dlg.show()
+        return dlg
+    }
+
     /**
      * 国际服（SG）登录：回调流与国内服相同，只是 host/ClientID 不同。
      * 该区域**已冻结为未开发**，所以先弹确认，避免用户白登一个用不上的账号。
      */
     private fun openLoginSg() {
         if (!TraeRegion.SG.canLogin) { toast("国际服常量未配置完整"); return }
-        android.app.AlertDialog.Builder(this)
-            .setTitle("国际服尚未开发")
-            .setMessage(TraeRegion.SG.unsupportedNote + "\n\n仍然要登录吗？")
-            .setPositiveButton("仍要登录") { _, _ -> openLogin(TraeRegion.SG) }
-            .setNegativeButton("用国服", null)
-            .show()
+        confirmDialog(
+            title = "国际服尚未开发",
+            message = TraeRegion.SG.unsupportedNote + "\n\n仍然要登录吗？",
+            okText = "仍要登录",
+            cancelText = "用国服",
+        ) { openLogin(TraeRegion.SG) }
     }
 
     /**
@@ -701,13 +1032,13 @@ class MainActivity : Activity() {
         val meta = TraeAuthStore.list(this).firstOrNull { it.uid == uid } ?: return
         // 切到**未开发区域**的账号会让转发走进半残链路（无多轮/无外部工具），先确认。
         if (!meta.region.isSupported) {
-            android.app.AlertDialog.Builder(this)
-                .setTitle("该账号属未开发区域")
-                .setMessage("${meta.nickname.ifBlank { uid }}（${regionLabel(meta.region)}）\n\n" +
-                    TraeRegion.SG.unsupportedNote + "\n\n仍然切换吗？")
-                .setPositiveButton("仍要切换") { _, _ -> doSwitchAccount(meta) }
-                .setNegativeButton("取消", null)
-                .show()
+            confirmDialog(
+                title = "该账号属未开发区域",
+                message = "${meta.nickname.ifBlank { uid }}（${regionLabel(meta.region)}）\n\n" +
+                    TraeRegion.SG.unsupportedNote + "\n\n仍然切换吗？",
+                okText = "仍要切换",
+                cancelText = "取消",
+            ) { doSwitchAccount(meta) }
             return
         }
         doSwitchAccount(meta)
@@ -724,17 +1055,17 @@ class MainActivity : Activity() {
 
     /** 删除账号（二次确认）：连密文一起删，避免残留凭据。 */
     private fun confirmRemoveAccount(meta: TraeAuthStore.AccountMeta) {
-        android.app.AlertDialog.Builder(this)
-            .setTitle("删除账号")
-            .setMessage("将删除「${meta.nickname.ifBlank { meta.uid }}」的本地凭据（含加密 token）。\n" +
-                "不影响 Trae 服务端的账号本身。")
-            .setPositiveButton("删除") { _, _ ->
-                TraeAuthStore.remove(this, meta.uid)
-                Toast.makeText(this, "已删除", Toast.LENGTH_SHORT).show()
-                render(currentPage)
-            }
-            .setNegativeButton("取消", null)
-            .show()
+        confirmDialog(
+            title = "删除账号",
+            message = "将删除「${meta.nickname.ifBlank { meta.uid }}」的本地凭据（含加密 token）。\n" +
+                "不影响 Trae 服务端的账号本身。",
+            okText = "删除",
+            danger = true,
+        ) {
+            TraeAuthStore.remove(this, meta.uid)
+            toast("已删除")
+            render(currentPage)
+        }
     }
 
     private fun regionLabel(region: TraeRegion): String =
@@ -754,36 +1085,44 @@ class MainActivity : Activity() {
             isSingleLine = false
             maxLines = 4
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
-            setTextColor(color(R.color.wb_on_surface))
-            setHintTextColor(color(R.color.wb_on_surface_variant))
-            setPadding(dp(14), dp(10), dp(14), dp(10))
+            setTextColor(color("on_surface"))
+            setHintTextColor(color("on_surface_variant"))
+            // 跟全站的输入框同一套外观，别用平台那根下划线
+            background = shape("surface_container", RADIUS_CONTROL)
+            setPadding(dp(14), dp(12), dp(14), dp(12))
         }
-        android.app.AlertDialog.Builder(this)
-            .setTitle("粘贴回调链接")
-            .setMessage("用系统浏览器打开登录链接登录后，把地址栏里那串 http://127.0.0.1:18080/authorize?... 完整粘进来。")
-            .setView(edit)
-            .setPositiveButton("登录") { _, _ ->
-                val url = edit.text?.toString().orEmpty()
-                if (url.isBlank()) { toast("没有粘贴内容"); return@setPositiveButton }
-                toast("正在换取 token…")
-                thread(name = "trae-paste-login") {
-                    val result = runCatching { TraeAuthApi.loginWithCallbackUrl(this, url) }
-                    runOnUiThread {
-                        result.onSuccess { cred ->
-                            toast("登录成功：${cred.nickname.ifBlank { cred.uid }}")
-                            loadAndRefreshToken()
-                        }.onFailure { e ->
-                            toast("登录失败：${e.message}")
-                            android.util.Log.w("TraeLogin", "粘贴登录失败", e)
-                        }
+        confirmDialog(
+            title = "粘贴回调链接",
+            message = "用系统浏览器打开登录链接登录后，把地址栏里那串 " +
+                "http://127.0.0.1:18080/authorize?... 完整粘进来。",
+            okText = "登录",
+            content = edit,
+        ) {
+            val url = edit.text?.toString().orEmpty()
+            if (url.isBlank()) { toast("没有粘贴内容，请重新打开本窗口"); return@confirmDialog }
+            toast("正在换取 token…")
+            thread(name = "trae-paste-login") {
+                val result = runCatching { TraeAuthApi.loginWithCallbackUrl(this, url) }
+                runOnUiThread {
+                    result.onSuccess { cred ->
+                        toast("登录成功：${cred.nickname.ifBlank { cred.uid }}")
+                        loadAndRefreshToken()
+                    }.onFailure { e ->
+                        toast("登录失败：${e.message}")
+                        android.util.Log.w("TraeLogin", "粘贴登录失败", e)
                     }
                 }
             }
-            .setNegativeButton("取消", null)
-            .show()
+        }
     }
 
     private fun copyApiKey() = copyToClipboard("apiKey", apiKey, "已复制 API Key")
+
+    /** 复制某个端点的完整地址（提示里把完整 URL 也念出来，用户才知道复制到了什么）。 */
+    private fun copyEndpoint(path: String) {
+        val url = "http://127.0.0.1:${LocalFakeServer.PORT}$path"
+        copyToClipboard("endpoint", url, "已复制 $url")
+    }
 
     private fun copyServerUrl() =
         copyToClipboard("serverUrl", "http://127.0.0.1:${LocalFakeServer.PORT}", "已复制服务地址")
@@ -799,7 +1138,11 @@ class MainActivity : Activity() {
     private fun refreshQuota() {
         val cred = TraeAuthStore.load(this)
         if (cred == null || cred.accessToken.isBlank()) { toast("未登录 Trae，请先登录"); return }
-        toast("正在刷新积分…")
+        if (quotaLoading) return
+        // 数值位立刻变「…」：网络往返有几百毫秒，不给反馈用户会以为没点动。
+        // 原地改控件而不是 redraw() —— 重建页面会把滚动位置弹回页首，用户就看不见这张卡了。
+        quotaLoading = true
+        quotaApply?.invoke()
         thread(name = "trae-fetch-quota") {
             val u = TraeUpstream.fetchUsage(cred.accessToken)
             val c = TraeUpstream.fetchCheckin(cred.accessToken)
@@ -807,8 +1150,9 @@ class MainActivity : Activity() {
                 accountBalance = u?.second
                 accountCap = u?.first
                 accountCheckin = c
+                quotaLoading = false
                 toast(if (u == null) "未获取到额度" else "已更新")
-                if (currentPage == Page.ACCOUNT) render(currentPage)
+                quotaApply?.invoke()
             }
         }
     }
@@ -821,9 +1165,14 @@ class MainActivity : Activity() {
      * 本地字段会和真实情况脱节。
      */
     private fun toggleService() {
-        if (GatewayService.running) {
+        if (serviceBusy != null) return
+        val stopping = GatewayService.running
+        // 启停是异步的（onStartCommand / onDestroy 都晚于这里的调用），
+        // 所以先切到「处理中」，否则这几百毫秒里界面毫无反应，用户会连点。
+        serviceBusy = if (stopping) "停止中…" else "启动中…"
+        redraw()
+        if (stopping) {
             GatewayService.stop(this)
-            toast("服务已停止")
         } else {
             GatewayService.start(this)
             // Android 13+ 通知要运行时授权。被拒也能跑（前台服务照常），
@@ -833,10 +1182,13 @@ class MainActivity : Activity() {
             ) {
                 requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQ_NOTIF)
             }
-            toast("服务已启动")
         }
-        // 服务启停是异步的（onStartCommand 晚于 start 调用），稍等再重绘，否则会画成旧状态。
-        contentHost.postDelayed({ render(currentPage) }, 400)
+        // 等异步动作落地再重绘，否则会画成旧状态；顺便把结果用 toast 说清楚。
+        contentHost.postDelayed({
+            serviceBusy = null
+            toast(if (stopping) "服务已停止" else "服务已启动")
+            redraw()
+        }, 500)
     }
 
     /**
@@ -852,7 +1204,7 @@ class MainActivity : Activity() {
             Gateway.locked {
                 TraeAuthApi.restartWithValidToken(this, skewSec = SIXTY_MINUTES_SEC)
             }
-            runOnUiThread { render(currentPage) }
+            runOnUiThread { redraw() }
         }
     }
 
@@ -882,8 +1234,9 @@ class MainActivity : Activity() {
     }
 
     // ------------------------------------------------------------------
-    // Wb 风格 View 组装 helper（这就是本项目的"组件库"）
-    // 改样式只改这一段；圆角/间距/字号只看 companion 里的 design token。
+    // View 组装 helper（这就是本项目的"组件库"）
+    // 改样式只改这一段；圆角/间距/字号只看上面跟随风格的 design token。
+    // 颜色**只写语义名**（"primary" / "on_surface" …），色值全在 AppStyle 的风格表里。
     // ------------------------------------------------------------------
 
     private fun scroll(build: LinearLayout.() -> Unit): ScrollView {
@@ -901,11 +1254,27 @@ class MainActivity : Activity() {
     /** 手机竖屏 = 屏宽（不受影响）；平板/横屏 = CONTENT_MAX_DP 并居中。 */
     private fun contentWidth(): Int = minOf(resources.displayMetrics.widthPixels, dp(CONTENT_MAX_DP))
 
-    private fun card(topMargin: Int = GAP, build: LinearLayout.() -> Unit): LinearLayout = LinearLayout(this).apply {
+    /**
+     * 卡片层次（三种，用来拉开信息优先级，而不是每张卡都长一样）。
+     *
+     * - [NORMAL] `surface` + 1dp 描边 + 阴影 = 常规内容卡，"凸起"在页面之上；
+     * - [SOFT] `surface_container` 无描边无阴影 = 说明 / 空态，退到后面；
+     * - [EMPHASIS] `primary_container` 无描边无阴影 = 本页最该看的那块（如服务地址），最抢眼。
+     *
+     * 底色不是 `surface` 的卡，里面的正文/说明对比度由 `AppStyle.selfCheck()` 单独钉过。
+     */
+    private enum class CardTone(val fill: String, val stroke: String?) {
+        NORMAL("surface", "outline_variant"),
+        SOFT("surface_container", null),
+        EMPHASIS("primary_container", null),
+    }
+
+    private fun card(topMargin: Int = GAP, tone: CardTone = CardTone.NORMAL, build: LinearLayout.() -> Unit): LinearLayout = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL
         setPadding(dp(CARD_PAD), dp(CARD_PAD), dp(CARD_PAD), dp(CARD_PAD))
-        background = shape(R.color.wb_surface, RADIUS_CARD, R.color.wb_outline_variant)
-        elevation = dp(1).toFloat()
+        background = shape(tone.fill, RADIUS_CARD, tone.stroke)
+        // 只有常规卡有阴影：有底色的面板靠颜色分层，再叠阴影会显脏
+        elevation = dp(if (tone == CardTone.NORMAL) AppStyle.current.elevation else 0).toFloat()
         build()
         layoutParams = lp(-1, -2, top = topMargin)
     }
@@ -917,51 +1286,71 @@ class MainActivity : Activity() {
         layoutParams = lp(-1, -2, top = top)
     }
 
-    private fun text(value: String, size: Int = FS_BODY, bold: Boolean = false, colorRes: Int = R.color.wb_on_surface): TextView = TextView(this).apply {
+    private fun text(value: String, size: Int = FS_BODY, bold: Boolean = false, colorName: String = "on_surface"): TextView = TextView(this).apply {
         text = value
         textSize = size.toFloat()
-        setTextColor(color(colorRes))
+        setTextColor(color(colorName))
         if (bold) setTypeface(typeface, Typeface.BOLD)
         setLineSpacing(0f, 1.12f)
     }
 
     /** 等宽文本：地址、模型 id、时间戳用它，数字和标识符能对齐。 */
-    private fun mono(value: String, size: Int = FS_VALUE, bold: Boolean = false, colorRes: Int = R.color.wb_on_surface): TextView =
+    private fun mono(value: String, size: Int = FS_VALUE, bold: Boolean = false, colorName: String = "on_surface"): TextView =
         TextView(this).apply {
             text = value
             textSize = size.toFloat()
-            setTextColor(color(colorRes))
+            setTextColor(color(colorName))
             typeface = Typeface.create(Typeface.MONOSPACE, if (bold) Typeface.BOLD else Typeface.NORMAL)
             setLineSpacing(0f, 1.12f)
         }
 
-    private fun caption(value: String): TextView = text(value, FS_CAPTION, false, R.color.wb_on_surface_variant)
+    private fun caption(value: String): TextView = text(value, FS_CAPTION, false, "on_surface_variant")
 
     /** 区块标题：小号灰字；原先 16sp 深色，和卡片标题（17sp）几乎分不出层级。 */
-    private fun section(value: String): TextView = text(value, FS_SECTION, true, R.color.wb_on_surface_variant).apply {
+    private fun section(value: String): TextView = text(value, FS_SECTION, true, "on_surface_variant").apply {
         letterSpacing = 0.04f
         setPadding(0, dp(18), 0, dp(8))
     }
 
     /** 1dp 分隔线：顶栏/底栏与内容区分层。 */
     private fun divider(): View = View(this).apply {
-        setBackgroundColor(color(R.color.wb_outline_variant))
+        setBackgroundColor(color("outline_variant"))
         layoutParams = LinearLayout.LayoutParams(-1, dp(1))
     }
 
-    /** 底层胶囊。语义场景请用 chipOk / chipWarn / chipDanger / chipInfo，别在这里手配颜色对。 */
-    private fun chip(value: String, backgroundRes: Int, textRes: Int): TextView = text(value, FS_CHIP, true, textRes).apply {
-        gravity = Gravity.CENTER
-        minHeight = dp(32)
+    /**
+     * 状态圆点：**形状 + 颜色双编码**（色盲只靠颜色分不出的状态，靠实心/空心也能分）。
+     *
+     * 实心 = 成立 / 进行中；空心（描边）= 未成立 / 已停止。
+     */
+    private fun dot(tone: String, on: Boolean, sizeDp: Int = 9): View = View(this).apply {
+        background = if (on) shape(tone, RADIUS_PILL) else shape("surface", RADIUS_PILL, tone, 2)
+        layoutParams = lp(dp(sizeDp), dp(sizeDp))
+    }
+
+    /**
+     * 底层胶囊。语义场景请用 chipOk / chipWarn / chipInfo / statusChip，别在这里手配颜色对。
+     *
+     * 传了 [dotTone] 会在文字左边加一个状态点（[dotOn] 决定实心还是空心）。
+     */
+    private fun chip(value: String, backgroundName: String, textName: String, dotTone: String? = null, dotOn: Boolean = false): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.HORIZONTAL
+        gravity = Gravity.CENTER_VERTICAL
+        minimumHeight = dp(32)
         setPadding(dp(12), 0, dp(12), 0)
-        background = shape(backgroundRes, RADIUS_PILL)
+        background = shape(backgroundName, RADIUS_PILL)
+        dotTone?.let { addView(dot(it, dotOn), lp(dp(9), dp(9), end = 7)) }
+        addView(text(value, FS_CHIP, true, textName))
         layoutParams = lp(-2, -2)   // 显式 wrap：否则在竖直容器里会被拉成整条横幅
     }
 
-    private fun chipOk(value: String) = chip(value, R.color.wb_success_container, R.color.wb_success)
-    private fun chipWarn(value: String) = chip(value, R.color.wb_warning_container, R.color.wb_warning)
-    private fun chipDanger(value: String) = chip(value, R.color.wb_error_container, R.color.wb_error)
-    private fun chipInfo(value: String) = chip(value, R.color.wb_primary_container, R.color.wb_primary)
+    /** 带状态点的语义胶囊：**状态一眼可见**（点 + 字，不只靠颜色）。 */
+    private fun statusChip(value: String, tone: String, on: Boolean): LinearLayout =
+        chip(value, "${tone}_container", tone, dotTone = tone, dotOn = on)
+
+    private fun chipOk(value: String) = chip(value, "success_container", "success")
+    private fun chipWarn(value: String) = chip(value, "warning_container", "warning")
+    private fun chipInfo(value: String) = chip(value, "primary_container", "primary")
 
     /** 键值行：标签列只给最小宽度（不再是死 96dp，长标签能撑开），值可长按复制。 */
     private fun labelValue(label: String, value: String): View = row {
@@ -969,11 +1358,29 @@ class MainActivity : Activity() {
         addView(text(value, FS_VALUE).apply { setTextIsSelectable(true) }, weighted(start = 12))
     }
 
-    /** 指标块：小标签在上、数值在下，并排展示两个次要指标用。 */
-    private fun metric(label: String, value: String): LinearLayout = LinearLayout(this).apply {
+    /**
+     * 指标块：小标签在上、数值在下，并排展示两个次要指标用。
+     *
+     * 值控件由调用方给（而不是这里现造）—— 这样"刷新数据"可以**原地改文字**而不重建页面
+     * （重建会把滚动位置弹回页首，见 `quotaApply`）。
+     */
+    private fun metricOf(label: String, valueView: TextView): LinearLayout = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL
         addView(caption(label))
-        addView(text(value, FS_BODY, true), top(2))
+        addView(valueView, top(2))
+    }
+
+    /**
+     * 占比条：整条 = [value] 占 [max] 的比例（用 weight 分两段，不引任何依赖）。
+     * 给"模型消耗汇总"用 —— 两列数字扫不出谁吃得多，加条一眼就有结论。
+     */
+    private fun shareBar(value: Long, max: Long): View = LinearLayout(this).apply {
+        orientation = LinearLayout.HORIZONTAL
+        background = shape("surface_variant", RADIUS_PILL)
+        val ratio = if (max <= 0L) 0f else (value.toFloat() / max).coerceIn(0f, 1f)
+        addView(View(this@MainActivity).apply { background = shape("primary", RADIUS_PILL) },
+            LinearLayout.LayoutParams(0, dp(6), ratio))
+        if (ratio < 1f) addView(View(this@MainActivity), LinearLayout.LayoutParams(0, dp(6), 1f - ratio))
     }
 
     /** 搜索框：与卡片同一套白底 + 描边。 */
@@ -981,45 +1388,66 @@ class MainActivity : Activity() {
         hint = hintText
         isSingleLine = true
         inputType = InputType.TYPE_CLASS_TEXT
-        setTextColor(color(R.color.wb_on_surface))
-        setHintTextColor(color(R.color.wb_on_surface_variant))
-        background = shape(R.color.wb_surface, RADIUS_CARD, R.color.wb_outline_variant)
+        setTextColor(color("on_surface"))
+        setHintTextColor(color("on_surface_variant"))
+        background = shape("surface", RADIUS_CARD, "outline_variant")
         setPadding(dp(14), dp(12), dp(14), dp(12))
     }
 
-    private fun linkAction(label: String, click: () -> Unit): TextView = TextView(this).apply {
+    /**
+     * 小胶囊文字按钮。
+     *
+     * [overContainer] 用在**强调卡内部**（底色本身就是 `primary_container`）——
+     * 那时按钮底要改成 `surface`，否则和卡片同色，会只剩一行字飘在那里。
+     */
+    private fun linkAction(label: String, overContainer: Boolean = false, click: () -> Unit): TextView = TextView(this).apply {
         text = label
         textSize = FS_CAPTION.toFloat()
         typeface = Typeface.DEFAULT_BOLD
-        setTextColor(color(R.color.wb_primary))
+        setTextColor(color("primary"))
         gravity = Gravity.CENTER
-        minHeight = dp(40)
+        minHeight = dp(48)   // 触控目标 ≥ 48dp（无障碍最低要求），原来 40dp 偏小
         minWidth = dp(48)
         setPadding(dp(14), 0, dp(14), 0)
-        background = shape(R.color.wb_primary_container, RADIUS_PILL)
+        background = shape(if (overContainer) "surface" else "primary_container", RADIUS_PILL)
         setOnClickListener { click() }
     }
 
-    private fun action(label: String, outlined: Boolean = false, full: Boolean = false, click: () -> Unit): Button = Button(this).apply {
+    /**
+     * 主按钮。
+     *
+     * [danger] 用于**删除**这类破坏性操作：文字与描边走 `error` 色，一眼看出"这个按钮点了会少东西"。
+     * 不给实心红底 —— 色板里没有 `on_error`，浅色的 error 配白字在深色风格下会看不清。
+     */
+    private fun action(label: String, outlined: Boolean = false, full: Boolean = false, danger: Boolean = false, click: () -> Unit): Button = Button(this).apply {
         text = label
         isAllCaps = false
         minHeight = dp(48)
         minWidth = dp(48)
         setPadding(dp(18), 0, dp(18), 0)
-        setTextColor(color(if (outlined) R.color.wb_primary else R.color.wb_on_primary))
-        background = if (outlined) shape(R.color.wb_surface, RADIUS_CONTROL, R.color.wb_outline) else shape(R.color.wb_primary, RADIUS_CONTROL)
+        setTextColor(color(if (danger) "error" else if (outlined) "primary" else "on_primary"))
+        background = if (danger) shape("surface", RADIUS_CONTROL, "error")
+        else if (outlined) shape("surface", RADIUS_CONTROL, "outline")
+        else shape("primary", RADIUS_CONTROL)
         setOnClickListener { click() }
         if (full) layoutParams = lp(-1, dp(48))
     }
 
-    private fun shape(fillRes: Int, radiusDp: Float, strokeRes: Int? = null): GradientDrawable = GradientDrawable().apply {
+    /** 所有背景的唯一来源。`strokeDp` 供选中态加粗描边用（如「外观风格」页的选中卡）。 */
+    private fun shape(fillName: String, radiusDp: Float, strokeName: String? = null, strokeDp: Int = 1): GradientDrawable = GradientDrawable().apply {
         shape = GradientDrawable.RECTANGLE
-        setColor(color(fillRes))
+        setColor(color(fillName))
         cornerRadius = dp(radiusDp).toFloat()
-        strokeRes?.let { setStroke(dp(1), color(it)) }
+        strokeName?.let { setStroke(dp(strokeDp), color(it)) }
     }
 
-    private fun color(res: Int) = getColor(res)
+    /**
+     * 按语义名取色 —— 风格与亮暗在**运行期**决定。
+     *
+     * ⚠️ 这里**不能**改回 `getColor(R.color.wb_*)`：资源 id 是编译期常量，
+     * 只有 `values/` 与 `values-night/` 两份，换不了风格。
+     */
+    private fun color(name: String) = AppStyle.color(name)
     private fun toast(value: String) = Toast.makeText(this, value, Toast.LENGTH_SHORT).show()
     private fun dp(value: Int) = (value * resources.displayMetrics.density + 0.5f).toInt()
     private fun dp(value: Float) = (value * resources.displayMetrics.density + 0.5f).toInt()
