@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- 保活：前台服务 + 常驻通知（Android 8+ 唯一不会被随手回收的服务形态）。 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- Android 13+ 通知要运行时授权；被拒时服务仍能跑，但用户看不到"正在运行"。 -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 部分唤醒锁：持有它的进程会被 Cached App Freezer 跳过（冻结豁免）。
+         没有它，MIUI/原生冻结器会让端口仍在监听但进程不被调度、请求全部挂起。 -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- 电池优化白名单：引导用户把本 App 加入"忽略电池优化"。
+         这是厂商省电白名单的正门 —— 比任何技术手段都管用，**真机上的命门**。 -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- 看门狗 / 划掉后兜底的精确闹钟：Android 12+ 需显式声明才允许在 Doze 下唤醒进程，
+         用于在 ColorOS 等**无视 START_STICKY 强杀**前台服务后把它重新拉起来。 -->
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
+    <!-- ⚠️ 刻意**没有** RECEIVE_BOOT_COMPLETED：用户要求"重启手机后必须自己打开 App 手动开"，
+         所以不做开机自启。别"顺手"加上它和 BootReceiver。 -->
+
+    <application
+        android:allowBackup="false"
+        android:icon="@drawable/ic_launcher"
+        android:label="@string/app_name"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.TraeWork2API"
+        android:usesCleartextTraffic="false">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <!-- 内置 WebView 登录窗（LoginWebActivity）已整体移除：
+             它依赖页面 JS 回调、SDK 超时即失败；现只保留「浏览器 + 粘贴回调」登录。 -->
+        <!-- 保活服务。stopWithTask=false：用户划掉最近任务时不随任务栈一起销毁。
+             specialUse 类型：本服务不属于 dataSync 等既有类别（API 35+ 的 dataSync 还有 6 小时上限），
+             且本项目是自装自用、不上架，用 specialUse 语义最准。 -->
+        <service
+            android:name=".GatewayService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse"
+            android:stopWithTask="false">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="User-started on-device OpenAI-compatible API gateway" />
+        </service>
+    </application>
+
+</manifest>

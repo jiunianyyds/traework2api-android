@@ -1,0 +1,24 @@
+# Gradle / 构建产物
+.gradle/
+build/
+app/build/
+.kotlin/
+
+# 本地环境配置（含本机 SDK 路径，不该进版本库）
+local.properties
+
+# IDE
+.idea/
+*.iml
+*.iws
+*.ipr
+.DS_Store
+captures/
+
+# 日志与临时文件
+*.log
+*.hprof
+
+# 外部参考工程（各自是**独立的 git 仓库**，权威上游，不属于本项目代码）
+# 不纳入本仓库：否则 Git 只会存一个空的 submodule 指针，内容并不会被保存下来。
+reference/
