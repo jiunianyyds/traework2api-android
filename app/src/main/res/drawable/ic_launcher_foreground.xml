@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 自适应图标的前景层：白色「双向箭头」＝ 请求转发出去 / 响应回来。
+     108×108 画布、图形居中；可见区只有中间 72×72（圆形遮罩时约 66），
+     所以图形缩到约 54 宽（= 画布的 50%），落在安全区内，任何遮罩都不会被切。
+     描边参数与底部导航图标同一套（圆头 / 圆角）。 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="8.1"
+        android:strokeLineCap="round"
+        android:pathData="M37.8,45.2 H66.6" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M66.6,35.3 L81.0,45.2 L66.6,55.1 Z" />
+    <path
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="8.1"
+        android:strokeLineCap="round"
+        android:pathData="M70.2,66.8 H41.4" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M41.4,56.9 L27.0,66.8 L41.4,76.7 Z" />
+</vector>

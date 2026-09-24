@@ -1,3 +1,11 @@
-<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
-    <path android:fillColor="@color/wb_on_surface_variant" android:pathData="M6,10a2,2 0,1 0,0 4,2 2,0 0,0 0,-4zM12,10a2,2 0,1 0,0 4,2 2,0 0,0 0,-4zM18,10a2,2 0,1 0,0 4,2 2,0 0,0 0,-4z"/>
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 更多：三个圆点（实心，r=1.6 与其余图标的 1.7 描边视觉重量相当）。 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="@color/wb_on_surface_variant"
+        android:pathData="M5.60,10.40 a1.60,1.60 0 1 0 0,3.20 a1.60,1.60 0 1 0 0,-3.20 z M12.00,10.40 a1.60,1.60 0 1 0 0,3.20 a1.60,1.60 0 1 0 0,-3.20 z M18.40,10.40 a1.60,1.60 0 1 0 0,3.20 a1.60,1.60 0 1 0 0,-3.20 z" />
 </vector>

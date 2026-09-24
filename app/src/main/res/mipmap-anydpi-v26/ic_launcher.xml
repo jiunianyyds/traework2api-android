@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 自适应图标（Android 8 / API 26+）：系统按启动器自己的形状（圆 / 方圆形 / 圆角方形）遮罩，
+     不再像 legacy 图标那样被缩小一圈。背景层 = 纯靛蓝，前景层 = 白色双向箭头。
+     monochrome 是 Android 13+ 的「主题图标」：系统把它的 alpha 拿去按壁纸配色，
+     所以直接复用前景层（白色不影响，只用形状）。 -->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@drawable/ic_launcher_background" />
+    <foreground android:drawable="@drawable/ic_launcher_foreground" />
+    <monochrome android:drawable="@drawable/ic_launcher_foreground" />
+</adaptive-icon>
