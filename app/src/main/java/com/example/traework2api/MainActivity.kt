@@ -144,6 +144,18 @@ class MainActivity : Activity() {
      */
     private var quotaApply: (() -> Unit)? = null
 
+    /**
+     * 「刷新模型」完成后**原地更新模型 Tab**（重建卡片 + 更新计数），不整页 render。
+     *
+     * 与 [quotaApply] 同一个理由：`render()`/`redraw()` 会 `removeAllViews()`，
+     * 把搜索框内容与滚动位置一起丢掉（这个坑项目里踩过，见 MEMORY「积分刷新」）。
+     * 每次 [modelsPage] 构建时重新登记，离开本页后作废。
+     */
+    private var modelsRefreshApply: (() -> Unit)? = null
+
+    /** 模型表刷新进行中：按钮置灰 + 文案变「刷新中…」，否则用户点了没反馈会连点。 */
+    private var modelsLoading = false
+
     /** 版本号取自 PackageManager，避免依赖 AGP 的 BuildConfig 开关。 */
     private val versionName: String by lazy {
         runCatching { packageManager.getPackageInfo(packageName, 0).versionName }.getOrNull() ?: "-"
@@ -178,6 +190,11 @@ class MainActivity : Activity() {
         TraeAuthApi.selfCheck()
         // 国际服 plan_item 累积快照 → 增量的 diff 自检（错则客户端看到内容重复）
         TraeIntlUpstream.selfCheck()
+        // 上游模型表解析自检：空 config_name 必须跳过、非聊天项必须过滤、name/context 回落规则
+        // （解析错会让"刷新模型"把好好的清单覆盖成垃圾）。
+        TraeUpstream.selfCheck()
+        // 模型表自检：空表绝不允许生效 —— 那会让所有客户端看不到任何模型（本任务最贵的失败面）。
+        ModelsRepo.selfCheck()
         // 恢复上次选择的区域：不恢复的话重启后会回落 CN，
         // 国际服 token 就会被发到国内服 host（实测 401/1001 或 4001）。
         TraeRegion.load(this)
@@ -283,8 +300,9 @@ class MainActivity : Activity() {
         showKeepAlive = false
         showStyle = false
         backAction.visibility = View.GONE
-        // 页面要重建了，旧的"原地刷新"句柄作废（accountPage 构建时会重新登记）
+        // 页面要重建了，旧的"原地刷新"句柄作废（accountPage / modelsPage 构建时会重新登记）
         quotaApply = null
+        modelsRefreshApply = null
         pageTitle.text = page.title
         pageSubtitle.text = page.subtitle
         contentHost.removeAllViews()
@@ -582,30 +600,70 @@ class MainActivity : Activity() {
         val edit = searchInput("搜索模型…")
         addView(edit, lp(-1, -2))
 
+        // 刷新按钮 + 计数。计数是"刷新真的起作用了"的证据 —— 否则点了没新增时用户会以为没生效。
+        val countView = caption("")
+        fun refreshCountLabel() {
+            countView.text = if (ModelsRepo.isDynamic) "已刷新 · ${ModelsRepo.current().length()} 个模型"
+            else "内置清单 · ${ModelsRepo.current().length()} 个模型"
+        }
+        val refreshBtn = action("刷新模型") { refreshModels() }
+        // 刷新中：按钮置灰 + 文案变「刷新中…」（照抄记录页/积分刷新那套，别新造轮子）
+        fun refreshButtonLabel() {
+            refreshBtn.isEnabled = !modelsLoading
+            refreshBtn.text = if (modelsLoading) "刷新中…" else "刷新模型"
+        }
+        addView(row(top = GAP) {
+            addView(refreshBtn)
+            addView(countView, weighted(start = GAP))
+        })
+
         // 搜不到时的空态。没有它，用户打错一个字就是**整页空白**，会以为 App 坏了。
         val empty = card(tone = CardTone.SOFT) {
             addView(caption("没有匹配的模型。换个关键词，或清空搜索框看看全部。"))
         }.apply { visibility = View.GONE }
         addView(empty)
 
+        // 卡片容器：刷新时**只清空并重塞它的子项**，不动搜索框/按钮/空态（原地更新，滚动位置不丢）
+        val cardHost = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
+        addView(cardHost)
+
+        // 过滤逻辑收成一个函数：刷新重塞后也要重跑一次，否则过滤会作用在已失效的旧 View 上
+        var cards = HashMap<String, View>()
+        fun applyFilter() {
+            val f = edit.text.toString().trim()
+            cards.forEach { (key, v) -> v.visibility = if (f.isBlank() || key.contains(f, true)) View.VISIBLE else View.GONE }
+            empty.visibility = if (f.isNotBlank() && cards.values.none { it.visibility == View.VISIBLE }) View.VISIBLE else View.GONE
+        }
+        fun rebuildCards() {
+            cardHost.removeAllViews()
+            cards = buildModelCards(cardHost)
+            applyFilter()
+        }
+
         // 客户端过滤：改可见性而非重建容器，避免丢失输入框焦点
-        val cards = buildModelCards(this)
         edit.addTextChangedListener(object : android.text.TextWatcher {
             override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
             override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
-            override fun afterTextChanged(s: android.text.Editable?) {
-                val f = edit.text.toString().trim()
-                cards.forEach { (key, v) -> v.visibility = if (f.isBlank() || key.contains(f, true)) View.VISIBLE else View.GONE }
-                empty.visibility = if (f.isNotBlank() && cards.values.none { it.visibility == View.VISIBLE }) View.VISIBLE else View.GONE
-            }
+            override fun afterTextChanged(s: android.text.Editable?) = applyFilter()
         })
+
+        // 刷新回调交给 build 完之后的代码用：本页重建后句柄要跟着换，不能留旧的
+        modelsRefreshApply = {
+            rebuildCards()
+            refreshCountLabel()
+            refreshButtonLabel()
+        }
+        rebuildCards()
+        refreshCountLabel()
+        refreshButtonLabel()
     }
 
-    /** 用当前内存模型表（固定默认清单）构建卡片；返回 (匹配词→View) 供过滤。 */
+    /** 用当前内存模型表构建卡片；返回 (匹配词→View) 供过滤。 */
     private fun buildModelCards(container: LinearLayout): HashMap<String, View> {
         val cards = HashMap<String, View>()
-        for (i in 0 until ModelsRepo.current().length()) {
-            val m = ModelsRepo.current().optJSONObject(i) ?: continue
+        val arr = ModelsRepo.current()
+        for (i in 0 until arr.length()) {
+            val m = arr.optJSONObject(i) ?: continue
             val id = m.optString("id", "")
             val c = modelCard(m)
             cards[id] = c
@@ -1153,6 +1211,40 @@ class MainActivity : Activity() {
                 quotaLoading = false
                 toast(if (u == null) "未获取到额度" else "已更新")
                 quotaApply?.invoke()
+            }
+        }
+    }
+
+    /**
+     * 「刷新模型」：从上游拉真实模型表并**原地更新**模型 Tab。
+     *
+     * 三条必须守住的行为（任务书 §3.2）：
+     *  - **原地更新**，不 `render()`/`redraw()` —— 那会丢搜索框内容与滚动位置；
+     *  - 网络在后台线程，回主线程改 UI（项目无协程库，用 `Thread{}` + `runOnUiThread`）；
+     *  - **禁止静默失败**：拉不到要 toast 说人话，且仍显示内置清单。
+     */
+    private fun refreshModels() {
+        val cred = TraeAuthStore.load(this)
+        if (cred == null || cred.accessToken.isBlank()) { toast("未登录 Trae，请先登录"); return }
+        if (modelsLoading) return
+        modelsLoading = true
+        // 立刻切「刷新中…」：网络往返有几百毫秒，不给反馈用户会连点
+        modelsRefreshApply?.invoke()
+        toast("正在刷新模型…")
+        thread(name = "trae-refresh-models") {
+            val arr = TraeUpstream.fetchModels(cred.accessToken, cred.uid)
+            runOnUiThread {
+                modelsLoading = false
+                val before = ModelsRepo.current().length()
+                if (arr == null) {
+                    // 拉不到：静态表兜底不变，但必须明确告诉用户（不许静默失败）
+                    toast("拉取失败，仍显示内置清单（${ModelsRepo.current().length()} 个模型）")
+                } else {
+                    ModelsRepo.applyFetched(arr)
+                    val after = ModelsRepo.current().length()
+                    toast(if (after > before) "已更新：$before → $after 个模型" else "已是最新（$after 个模型）")
+                }
+                modelsRefreshApply?.invoke()
             }
         }
     }
