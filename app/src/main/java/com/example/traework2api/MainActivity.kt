@@ -129,7 +129,9 @@ class MainActivity : Activity() {
     /** 账号页积分/额度缓存（null=未拉到），展示用，不存凭据。 */
     private var accountBalance: Long? = null   // 当前可用积分
     private var accountCap: Long? = null       // 权益额度(上限)
-    private var accountCheckin: Pair<Boolean, Long>? = null // (今日已签, 每日可领)
+    private var accountCheckin: TraeUpstream.CheckinStatus? = null   // 签到状态（含 enable）
+    /** 签到请求进行中（防连点：实测重复 claim 会白发请求）。 */
+    private var checkinBusy = false
     /** 本地 API Key 明文默认打码（防止截图/旁观泄露），点「显示」才展开。 */
     private var apiKeyVisible = false
     /** 服务启停进行中（"启动中…" / "停止中…"），null = 空闲。启停是异步的，中间得给个状态。 */
@@ -313,6 +315,14 @@ class MainActivity : Activity() {
             Page.RECORDS -> recordsPage()
             Page.MORE -> morePage()
         })
+        // 账号页**自动拉一次**积分/额度：不拉的话三个数值位永远显示「—」，
+        // 用户会以为功能坏了（实测就是这个现象），得先手动点「刷新」才有数据。
+        // `accountCheckin == null` 保证只在没数据时自动拉一次，不会每次切页都打上游。
+        if (page == Page.ACCOUNT && accountCheckin == null &&
+            accountBalance == null && accountCap == null
+        ) {
+            contentHost.post { refreshQuota() }
+        }
         navItems.forEach { (key, item) ->
             val active = key == page
             item.setTextColor(color(if (active) "primary" else "on_surface_variant"))
@@ -553,6 +563,9 @@ class MainActivity : Activity() {
         addView(section("积分与用量"))
         addView(card {
             val refreshLabel = linkAction(if (quotaLoading) "刷新中…" else "刷新") { refreshQuota() }
+            val checkinAction = action(checkinActionLabel()) { claimCheckin() }
+            // 未登录时 accountCheckin 为 null，quotaApply 不会被调用，所以这里先按初值同步一次状态
+            refreshCheckinButton(checkinAction)
             val balanceView = text(quotaValue(accountBalance?.toString()), FS_METRIC, true, "primary")
             val capView = text(quotaValue(accountCap?.toString()), FS_BODY, true)
             val checkinView = text(quotaValue(checkinLabel()), FS_BODY, true)
@@ -562,10 +575,12 @@ class MainActivity : Activity() {
                 balanceView.text = quotaValue(accountBalance?.toString())
                 capView.text = quotaValue(accountCap?.toString())
                 checkinView.text = quotaValue(checkinLabel())
+                refreshCheckinButton(checkinAction)
             }
             addView(row {
                 addView(caption("当前可用积分"), weighted())
-                addView(refreshLabel)
+                addView(checkinAction, weighted(start = 12))
+                addView(refreshLabel, weighted(start = 12))
             })
             // 主数值放大，一眼能读到；次要指标并排
             addView(balanceView, top(2))
@@ -576,8 +591,29 @@ class MainActivity : Activity() {
         })
     }
 
+    /**
+     * 「签到」按钮文案：已签/进行中/未开放 时置灰。
+     *
+     * **必须置灰已签状态**：实测重复 claim 虽不扣积分，但会白发一次请求
+     * （上游回 `code=9004`），所以从 UI 上就堵住。
+     */
+    private fun checkinActionLabel(): String = when {
+        checkinBusy -> "签到中…"
+        accountCheckin == null -> "未登录"
+        accountCheckin?.checkedIn == true -> "今日已签到"
+        accountCheckin?.enable == false -> "未开放"
+        else -> "签到"
+    }
+
+    private fun refreshCheckinButton(btn: android.widget.TextView) {
+        btn.text = checkinActionLabel()
+        btn.isEnabled = !checkinBusy && accountCheckin?.checkedIn != true &&
+            accountCheckin?.enable != false && accountCheckin != null
+        btn.alpha = if (btn.isEnabled) 1f else 0.5f
+    }
+
     private fun checkinLabel(): String? =
-        accountCheckin?.let { if (it.first) "已签 · +${it.second}/日" else "未签" }
+        accountCheckin?.let { if (it.checkedIn) "已签 · +${it.credits}/日" else "未签" }
 
     /** 积分数值位：刷新中显示「…」，没拿到显示「—」。 */
     private fun quotaValue(v: String?): String = if (quotaLoading) "…" else v ?: "—"
@@ -1210,6 +1246,50 @@ class MainActivity : Activity() {
                 accountCheckin = c
                 quotaLoading = false
                 toast(if (u == null) "未获取到额度" else "已更新")
+                quotaApply?.invoke()
+            }
+        }
+    }
+
+    /**
+     * 「签到」：领取今日积分。
+     *
+     * 流程照 reference `scheduler.go:100` 的顺序：**先看状态再决定发不发 claim** ——
+     * 已签 / 账号未开放签到时不发请求（实测重复 claim 会白发一次并回 `code=9004`）。
+     *
+     * 上游业务码（实测，见 [TraeUpstream.claimCheckin]）：
+     *  - `0`：成功
+     *  - `9004`：已签或参数问题，上游 message 是英文且含糊，**不直接展示**，映射成「今日已签到」
+     *  - 其它：把 code 报出来，方便排查
+     *
+     * 签到成功后**重查一次**积分：用户最想看的就是"签完变成多少"。
+     */
+    private fun claimCheckin() {
+        val cred = TraeAuthStore.load(this)
+        if (cred == null || cred.accessToken.isBlank()) { toast("未登录 Trae，请先登录"); return }
+        if (checkinBusy) return
+        if (accountCheckin?.checkedIn == true) { toast("今日已签到"); return }
+        if (accountCheckin?.enable == false) { toast("该账号未开放签到"); return }
+        checkinBusy = true
+        quotaApply?.invoke()          // 按钮立刻变「签到中…」
+        thread(name = "trae-checkin") {
+            val code = TraeUpstream.claimCheckin(cred.accessToken)
+            // 签到后重查积分与状态：拿到最新余额，同时把按钮切成「今日已签到」
+            val u = TraeUpstream.fetchUsage(cred.accessToken)
+            val c = TraeUpstream.fetchCheckin(cred.accessToken)
+            runOnUiThread {
+                checkinBusy = false
+                accountBalance = u?.second ?: accountBalance
+                accountCap = u?.first ?: accountCap
+                accountCheckin = c ?: accountCheckin
+                toast(
+                    when (code) {
+                        0 -> "签到成功"
+                        9004 -> "今日已签到"
+                        null -> "签到失败：网络不通，请稍后重试"
+                        else -> "签到失败（code=$code）"
+                    }
+                )
                 quotaApply?.invoke()
             }
         }
