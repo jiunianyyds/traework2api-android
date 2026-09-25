@@ -8,7 +8,155 @@
 
 ---
 
-## [未发布] - 2026-09-24
+## [0.3.0] - 2026-09-25
+
+「模型 Tab 增加刷新模型按钮」+ **换上游 function 解锁新模型**。`versionName` 0.2.0 → **0.3.0**、`versionCode` 2 → **3**。
+
+### 背景：任务书 §1.2 的悲观推断被实测推翻
+
+任务书交接时实测「新模型（`DeepSeek-V4.1-Flash` / `GLM-5.3`）在当前 function 下一律 `4001`」，
+据此警告「光加刷新按钮，很可能刷出来了也调不通」。本次按要求**先探测再动手**，探测结论是：
+
+- 4001 的**真因不是"模型不可用"**，而是**模型挂在别的 function 下** —— 老代码发的是
+  `function=solo_work_lite`，而新模型只在 **`solo_work_remote`** 下存在。
+- 实测同一 token 下逐个 function 拉表：`solo_work_lite` 47 个（无新模型）、
+  `solo_work_remote` **49 个且包含 `deepseek-v4.1-flash` / `glm-5.3` / `step-5-preview`**。
+- 换成 `solo_work_remote` 后**新模型真能聊天**（中文正常、`done` 正常、无 error），
+  且**旧 12 个模型逐个实测全部正常、工具调用无回归** —— 所以换过来是"白捡"。
+
+### Added
+- **`TraeUpstream.fetchModels()`（新）**：打 `POST {agentHost}/api/ide/v1/get_detail_param` 拉真实模型表
+  （请求体照抄 reference `FetchModels`），复用既有 `Builder.solo()` 头（**一行都不用加**）。
+- **`TraeUpstream.parseModels()`（新）**：`config_info_list` → `/v1/models` 形状；
+  `name` 取 `display_config.display_name`（空回落 id）、`context_length` 取
+  `model_detail_list[0].max_input_tokens`（取不到回落 131072）。
+- **`TraeUpstream.isChatModel()`（新）**：过滤上游表里的**非聊天项**。
+  上游表混着 `custom_model_*` 占位、`summary` / `file_search_agent` / `browser_use_subagent`
+  等内部 agent，它们当 config_name 发过去会 4001，摆在模型 Tab 里只会让用户选错。
+  **判据全部改用上游自己的字段**（见下方 Fixed），过滤后 **15 个**。
+
+### Fixed（用户实测反馈后修正，2026-09-25）
+用户指出**「我自己接入的第三方 API 模型为什么出现在 Trae 内置模型列表里」** —— 真 bug，已修。
+
+- **根因**：第一版 `isChatModel()` **只用名字黑名单猜**，而第三方模型的名字
+  （`mistral-small-4` / `glm-4.5-air` / `gemini-3.1-pro` / `oc/muse-spark-…`）
+  **长得跟官方模型一样**，黑名单根本挡不住 → 6 个第三方模型混进了列表：
+  `mistral-small-4`、`oc/muse-spark-1.3-contributor`、`gemini-3.1-pro`（显示名「肖恩ai-…」）、
+  `agnes-2.5-flash`、`deepseek-v4-flash-0731`（显示名「ZZ …」）、`glm-4.5-air`，
+  外加两个 `TRAE-DeepSeek-V4-Flash`（也是用户自己接的）。
+- **真因排查**：把上游 49 项的字段全 dump 出来，发现上游**本来就有权威标记**：
+  `config_source`（**1=官方内置 / 3=用户接入第三方**）与
+  `display_config.is_custom_model`。第三方那批**全是 `config_source=3` + `is_custom_model=true`**，
+  两个字段完全一致地分开了两批 —— 之前完全没用上。
+- **修复**：判据改为读上游字段（`config_source==1` 且 `is_custom_model!=true`），
+  名字黑名单只留作兜底。
+- **顺带修掉另一个真 bug**：`is_invisible_to_user` 之前也被忽略 ——
+  上游自己标"不对用户展示"的项（`glm-5` / `DeepSeek-V4-Flash` / `DeepSeek-V4-Pro` /
+  `summary` / `sagitta`…）会露出来。**这正是之前列表里出现两个同名
+  `DeepSeek-V4-Flash` 的原因**（一条 invisible、一条可见，只按名字过滤会把两条都留下）。
+- ⚠️ 注意取舍：`glm-5` / `glm-5-turbo` / `DeepSeek-V4-Flash` / `DeepSeek-V4-Pro` 这 4 个
+  **旧静态清单里有、但上游标了"不可见"**，因此刷新后**会从列表消失**。
+  这是**跟着上游走的正确结果**（它们在新 function 下已不是给终端用户选的），
+  但**重启回静态表时会又出现** —— 这是"静态兜底"与"上游真表"的固有差异，已知、可接受。
+  `DEFAULT_MODE = "DeepSeek-V4-Flash"` 不受影响（它不查列表有效性）。
+- 结果：**49 → 15 个**，全是 Trae 官方内置且可直呼的模型。
+- **`TraeUpstream.selfCheck()`（新）**：钉住解析（空 `config_name` 跳过、name/context 回落、
+  空表返回 null）**+ 过滤器两侧边界**（真模型不许被误过滤、内部项必须挡住）。
+- **`ModelsRepo.selfCheck()`（新）**：表非空 + **空表不许覆盖静态表**。
+- **模型 Tab「刷新模型」按钮**：手动拉取并**原地更新**（`modelsRefreshApply` 句柄），
+  旁边一个计数标签（「内置清单 · 12 个模型」/「已刷新 · 15 个模型」）让用户确信按钮真起作用了。
+
+### Changed
+- **`TraeUpstream.FUNCTION`：`solo_work_lite` → `solo_work_remote`**（本次核心改动）。
+  这是全局生效的转发常量，**旧模型实测无回归**（见验证）。
+- **`ModelsRepo`：由「不可变静态清单」改为「静态兜底 + 可选动态表」** ——
+  把阶段6 砍掉的拉取能力捡回来。`current()` 永远非空：
+  `private var dynamic` 为 null（没刷过/刷失败/未登录）时回落静态表。
+  **`DEFAULT_MODE` 绝不跟着动态表变**（仍是 `DeepSeek-V4-Flash`，用户要求"别默认用贵的"）。
+- `ModelsRepo` / `MainActivity` 的注释同步更新（原文写着"此清单固定不变，不做真模型拉取替换"，
+  已过时）。
+
+### 硬约束（违反即 bug，都已在代码里注释）
+1. **静态表必须保留兜底**：`/v1/models` 与模型 Tab 都读 `current()`，
+   返回空数组会让**所有客户端看不到任何模型**（比少一个新模型严重得多）。
+2. **空表/解析失败一律拒绝覆盖**（`applyFetched` 的 `length() > 0` 闸）。
+3. **第一版不做持久化**：重启回静态表（用户要的是"刷最新"，不是"离线缓存"）。
+
+### Fixed / 顺手守住的坑
+- 刷新**不能用 `render()`/`redraw()`**：那会 `removeAllViews()` 重建内容区，
+  **搜索框内容与滚动位置全丢**（项目踩过，见 MEMORY「积分刷新」）。
+  做法是把卡片容器的重建登记成 `modelsRefreshApply` 句柄，只清空重塞卡片容器。
+- 重塞后**必须同步 TextWatcher 的 `cards` map**：否则刷新后搜索过滤会作用在已失效的旧 View 上
+  （表现：搜索框像坏了）。已把过滤收成 `applyFilter()`，重塞后重跑一次。
+
+### 验证（模拟器实测，全部真跑）
+- `.\gradlew.bat assembleDebug --offline` 通过；装机 `logcat -b crash -d` **为空**
+  （10 个启动自检全过：原 8 个 + `TraeUpstream.selfCheck` + `ModelsRepo.selfCheck`）。
+- **刷新真拉到数据**：`/v1/models` 与 UI 计数一致（`uiautomator dump` 读到「已刷新 · 15 个模型」）。
+  初版过滤有 bug 时是 29；用户指出第三方混入后改用上游字段过滤，现为 **15**（见 Fixed）。
+- **`/v1/models` 跟着变是零改动**：它读的就是 `ModelsRepo.current()`（任务书预判正确）。
+- **新模型刷新后真能聊天**（这是本任务的目的）：`deepseek-v4.1-flash` 经网关返回
+  「我是由深度求索公司创造的AI助手，乐于用中文为你解答问题并提供帮助。」+ `[DONE]`、无 error。
+- **无回归**：`DeepSeek-V4-Flash` 中文流式正常（「1+1等于2。」）；工具调用仍
+  `finish_reason:"tool_calls"`、`get_weather` 保留、`reasoning_content:null` 污染 0 次；
+  旧 12 个模型在新 function 下逐个实测全部 OK。
+- **刷新后搜索仍有效**：输 `zzzz` → 空态卡出现、无模型卡可见；清空 → 卡片回来。
+- **重启回静态表**（非持久化符合预期）：重启 App 后显示「内置清单 · 12 个模型」。
+- **失败不清空**：断网时点刷新 → 日志 `拉模型表异常: UnknownHostException`、
+  清单仍是 12 个（**没被清空**）、系统日志确认 toast 弹出（非静默失败）。
+- **自检真的能抓错**（不只验证"通过"）：故意把 `applyFetched` 的 `length() > 0` 闸改坏 →
+  启动即崩，崩溃日志给出精确消息 `自检失败：空表覆盖了静态表`（`ModelsRepo.kt:70`）；改回后正常。
+- ⚠️ 探测过程中的一个坑：新模型一度回**英文**，我差点误判成"新 function 有问题" ——
+  真因是 **PowerShell 管道把中文 body 变成了问号**（§4.10 记过的老坑）。用 UTF-8 文件
+  push 后中文正常。**测中文一定要先写文件再 push。**
+
+### 已知限制（明确，别当 bug）
+- **模型表过滤用的是黑名单**：上游若新增词形不在模式里的内部 agent，会漏进列表。
+  代价可接受（多一项而已，不炸），升级路径见 `isChatModel` 注释。
+- 静默失败已排除，但**拉取失败只 toast 一次**，不重试、不自动重拉（用户要的是手动刷新）。
+- 上游表里有**重名项**（两个 `DeepSeek-V4-Flash`，display_name 不同）：UI 的 `cards` map 以 id 为键，
+  重名会被后一个覆盖 → 该类模型在**搜索过滤**时以最后一条为准。实测不影响刷新与聊天。
+
+---
+
+## [0.2.0] - 2026-09-24
+
+首个「国服可用 + UI 完整」的版本。`versionName` 0.1.0 → **0.2.0**、`versionCode` 1 → **2**
+（本版之前那批 `[未发布]` 条目一并归到这里）。
+
+### 版本号与打包（本次改动）
+
+#### Added
+- **`build-apk.ps1`（新，工程根）**：构建 debug APK 并按版本号命名到 `out\`，
+  产出 `out\TraeWork2API-<versionName>-debug.apk`（**`out/` 已加入 `.gitignore`**）。
+  - **版本号只有一个来源**：脚本用正则从 `app\build.gradle.kts` 读 `versionName`，
+    不在脚本里写死 —— 两处写死早晚会对不上。
+  - 拷贝前先删同名旧文件：APK 被占用时 `Copy-Item` 会**静默失败**，
+    留下一个旧 APK 冒充新产物（比报错更糟）。
+  - ⚠️ **脚本刻意全用英文**：本机 `powershell.exe` 是 **5.1**，它按 **GBK** 读 `.ps1`，
+    UTF-8 中文注释会被拆成能破坏字符串引号的字节 → 直接**语法报错、脚本跑不起来**
+    （本次实测踩到）。中文说明放在 `docs\` 与本文件里。
+
+#### Changed
+- `app/build.gradle.kts`：`versionName = "0.1.0"` → `"0.2.0"`，`versionCode = 1` → `2`。
+- `docs\真机保活验证清单.md`：APK 名同步为 `out\TraeWork2API-0.2.0-debug.apk`
+  （原文写的 `0.1.0` 且那个 `out\` 当时**并不存在**，现在脚本能真产出），并说明用 `build-apk.ps1` 生成。
+- 界面版本号无需改代码：`MainActivity` 的 `versionName` 是 `by lazy { PackageManager... }`，
+  自动跟着 `versionName` 走（**这处 plumbing 早就有了，本次只是让值不再是 0.1.0**）。
+
+#### 验证（模拟器实测）
+- `.\build-apk.ps1` → `BUILD SUCCESSFUL`，产出 `out\TraeWork2API-0.2.0-debug.apk`（1.5 MB）。
+- **版本号真的进了 APK**（不只看脚本输出）：`aapt2 dump badging` →
+  `versionCode='2' versionName='0.2.0'`。
+- 装机后 `logcat -b crash -d` 为空（8 个启动自检全过）。
+- **界面显示正确**：`uiautomator dump` 的「更多 → 关于」卡里读到文案顺序
+  `应用说明 | … | 版本 | 0.2.0 | 致谢`。
+- **端到端无回归**：点「启动服务」→ `healthz=200` / `models=200` →
+  真实流式聊天请求返回 `"content":"版本验证通过"`、`[DONE]` ×1、**error 帧 0**。
+
+---
+
+## [0.2.0] - 2026-09-24
 
 ### UI 全面重做：多风格（4 套）× 独立亮暗，运行期可切换
 
@@ -195,7 +343,7 @@ Android 8+ 会当 legacy 图标塞进遮罩里再缩小一圈，看起来总比�
 
 ---
 
-## [未发布] - 2026-09-23
+## [0.2.0] - 2026-09-23
 
 ### 新增 UI 全面重做任务书（仅文档，未改代码）
 

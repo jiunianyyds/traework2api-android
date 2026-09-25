@@ -25,3 +25,6 @@ reference/
 
 # UI 验证截图（65 张约 12MB，属过程产物、会不断重生成，不该占版本库体积）
 docs/ui-shots/
+
+# 打包产物（build-apk.ps1 产出，APK 是编译结果，不该进版本库）
+out/

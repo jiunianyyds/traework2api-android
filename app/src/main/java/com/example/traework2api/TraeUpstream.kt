@@ -23,12 +23,16 @@ import java.util.concurrent.TimeUnit
  */
 object TraeUpstream {
 
+    /** 日志 tag（任务书要求用 `TraeUpstream:*`；**只打模型名，绝不打 token**）。 */
+    private const val TAG = "TraeUpstream"
+
     // host 随区域变化，统一从 TraeRegion 取（见该文件；国内版为已实测值）。
     private val region: TraeRegion get() = TraeRegion.current
     private val AGENT_HOST: String get() = region.agentHost
     private val UG_HOST: String get() = region.ugHost
 
     const val EP_CHAT = "/api/agent/v3/llm_utils_chat"
+    const val EP_MODELS = "/api/ide/v1/get_detail_param"
     const val EP_CHECKIN_STATUS = "/trae/api/v2/ug/checkin_credits/status"
     const val EP_ENT_USAGE = "/trae/api/v2/pay/ide_user_ent_usage"
 
@@ -37,7 +41,15 @@ object TraeUpstream {
     const val IDE_VERSION_CODE = "20260716"
     const val DEVICE_BRAND = "83DG"
     const val OS_VERSION = "Windows 11 Pro"
-    const val FUNCTION = "solo_work_lite"
+    /**
+     * 上游 function 值。**必须 `solo_work_remote`**：
+     *
+     * 实测（2026-09-25，CN 账号）新模型（`deepseek-v4.1-flash` / `glm-5.3` / `step-5-preview`）
+     * **只挂在 `solo_work_remote` 下**；用老的 `solo_work_lite` 打它们一律 `error code=4001
+     * param is invalid`。反过来旧 12 个模型在 `solo_work_remote` 下逐个实测全部正常，
+     * 工具调用也无回归 —— 所以全局换过来是"白捡"新模型。
+     */
+    const val FUNCTION = "solo_work_remote"
 
     /**
      * 请求没带 model 时用的默认模型。
@@ -190,6 +202,193 @@ object TraeUpstream {
         if (!region.canQueryQuota) return null
         val root = ug(tok, UG_HOST + EP_CHECKIN_STATUS) ?: return null
         return root.optBoolean("checked_in", false) to root.optLong("credits", 0)
+    }
+
+    /**
+     * 拉上游真实模型表（`get_detail_param`，照抄 reference/traework2api 的 FetchModels）。
+     *
+     * 返回 OpenAI `/v1/models` 形状的数组（id/name/config_name/context_length/object/owned_by/created）；
+     * 失败/解析出空表返回 null —— **调用方必须保留静态兜底**，空表覆盖会让所有客户端看不到模型。
+     *
+     * token 只进内存与请求头，绝不落日志。
+     */
+    fun fetchModels(tok: String, uid: String = ""): JSONArray? {
+        // 区域分派交给调用方判断？不 —— 表也走同一个 SOLO 端点，只有 CN 实测过。
+        if (!region.canQueryQuota) return null
+        val body = JSONObject()
+            .put("function", FUNCTION)
+            .put("config_names", JSONObject.NULL)
+            .put("need_prompt", false)
+            .put("current_config_info", JSONObject.NULL)
+            .put("poly_prompt", true)
+            .put("mode_type", JSONObject.NULL)
+            .put("agent_type", JSONObject.NULL)
+        val req = Request.Builder()
+            .url(AGENT_HOST + EP_MODELS)
+            .post(body.toString().toRequestBody("application/json".toMediaType()))
+            .solo(tok, stream = false, uid = uid)
+            .build()
+        return try {
+            client.newCall(req).execute().use { r ->
+                val text = r.body?.string().orEmpty()
+                if (!r.isSuccessful) {
+                    android.util.Log.w(TAG, "拉模型表失败: http ${r.code} ${text.take(200)}")
+                    return null
+                }
+                parseModels(JSONObject(text))
+            }
+        } catch (e: Exception) {
+            android.util.Log.w(TAG, "拉模型表异常: ${e.javaClass.simpleName}: ${e.message}")
+            null
+        }
+    }
+
+    /**
+     * 解析 `config_info_list` → `/v1/models` 数组。空 `config_name` 跳过（reference 同款闸）。
+     *
+     * `name` 取 `display_config.display_name`（空则回落 id）；
+     * `context_length` 取 `model_detail_list[0].max_input_tokens`（取不到回落 131072，与静态表一致）。
+     *
+     * **过滤**：上游表混着大量非聊天项（`custom_model_*` 占位、`summary` / `file_search_agent` /
+     * `browser_use_subagent` 等内部 agent、以及各类子能力项）。它们当 config_name 发过去
+     * 聊天会 4001，摆在「模型」Tab 里只会让用户选错。判据见 [isChatModel]。
+     */
+    internal fun parseModels(root: JSONObject): JSONArray? {
+        val list = root.optJSONArray("config_info_list") ?: return null
+        val arr = JSONArray()
+        for (i in 0 until list.length()) {
+            val cfg = list.optJSONObject(i) ?: continue
+            val id = cfg.optString("config_name", "").trim()
+            if (id.isEmpty()) continue
+            if (!isChatModel(cfg)) continue
+            val name = cfg.optJSONObject("display_config")?.optString("display_name", "")?.trim().orEmpty()
+            var ctx = 0L
+            cfg.optJSONArray("model_detail_list")?.optJSONObject(0)
+                ?.let { ctx = it.optLong("max_input_tokens", 0L) }
+            if (ctx <= 0L) ctx = 131072L
+            arr.put(
+                JSONObject()
+                    .put("id", id).put("name", name.ifEmpty { id })
+                    .put("config_name", id).put("context_length", ctx)
+                    .put("object", "model").put("owned_by", "trae-solo")
+                    .put("created", 1753600000)
+            )
+        }
+        return if (arr.length() == 0) null else arr
+    }
+
+    /**
+     * 这个条目是不是**Trae 官方内置、且能直接聊天**的模型。
+     *
+     * 判据全部来自上游字段（2026-09-25 把 49 项逐项 dump 出来核对过），**不再猜名字**：
+     *
+     *  1. **`config_source == 1`** —— 只留官方内置。实测你的表里 `config_source=3` 的那批
+     *     （`mistral-small-4` / `gemini-3.1-pro`(肖恩ai-…) / `glm-4.5-air` / `oc/muse-spark-…` /
+     *     `deepseek-v4-flash-0731`(ZZ …) / 两个 `TRAE-DeepSeek-V4-Flash`）正是**用户自己接入的第三方 API**。
+     *     它们不该出现在"Trae 内置模型"页里 —— 名字里的「肖恩ai」「ZZ」就是用户配置时的前缀。
+     *  2. **`display_config.is_custom_model == false`** —— 与上一条互为印证（第三方项均为 true）。
+     *  3. **`is_invisible_to_user == false`** —— 上游自己标"不对用户展示"的内部项
+     *     （实测：`glm-5` / `glm-5-turbo` / `DeepSeek-V4-Flash` / `DeepSeek-V4-Pro` /
+     *     `summary` / `file_search_agent` / `sagitta` / `aquila`…）不该露出来。
+     *     ⚠️ 注意：**同名两条**（一条 invisible、一条可见）正是靠这条区分开的，
+     *     之前只按名字过滤会把两条都留下，UI 里出现重复的 `DeepSeek-V4-Flash`。
+     *  4. **名字里没有内部 agent 词形** —— 兜底：`custom_model_*` 占位、`*_agent`、`summary`、
+     *     `sagitta`、`aquila`、`file_search_*`、`explore_*`、`computer_use_*`、`browser_use_*`。
+     *     这些即使上游标了可见也不是给人聊天的。
+     *
+     * 任一条不满足即排除。前三条是上游的**权威字段**，第四条只是补充，所以不再依赖名字猜测。
+     *
+     * ⚠️ **已知局限**：本判据无法排除「官方内置但当前账号用不了」的模型。
+     * 实测 `Doubao-Seed-Evolving`（会员专属，见任务书 §1.3）确实出现在表里且
+     * `config_source=1`/可见，但真实聊天返回 `4001`（当前账号不是会员）。
+     * 上游表里没有一个"当前账号是否有权用"的字段可判，所以**只能留着**——
+     * 它确实是一个 Trae 内置模型，只是该账号无权调用。真要按权限过滤得逐个试聊天（太贵，不做）。
+     */
+    internal fun isChatModel(cfg: JSONObject): Boolean {
+        if (cfg.optInt("config_source", 0) != 1) return false
+        val dc = cfg.optJSONObject("display_config")
+        if (dc?.optBoolean("is_custom_model", false) == true) return false
+        if (cfg.optBoolean("is_invisible_to_user", false)) return false
+        if (dc == null) return false          // 没有 display_config 的条目不是正常模型
+        return isBuiltinChatName(cfg.optString("config_name", "").trim())
+    }
+
+    /** 名字词形兜底（见 [isChatModel] 第 4 条）：挡住内部 agent / 占位项。 */
+    private fun isBuiltinChatName(id: String): Boolean {
+        val s = id.lowercase()
+        if (s.startsWith("custom_model")) return false
+        val blocked = listOf(
+            "agent", "subagent", "summary", "sagitta", "aquila",
+            "file_search", "explore_", "computer_use", "browser_use",
+        )
+        return blocked.none { s.contains(it) }
+    }
+
+    /**
+     * 解析自检。**fixture 照抄上游真实字段形状**（2026-09-25 dump 过 49 项），
+     * 每个 check 对应一个真实踩过/差点踩到的坑。
+     */
+    fun selfCheck() {
+        /** 造一条上游条目：[src]=config_source、[invisible]/[custom] 是上游自己的标记。 */
+        fun entry(id: String, name: String = "", src: Int = 1, invisible: Boolean = false,
+                  custom: Boolean = false, ctx: Long = 0L, withDc: Boolean = true): JSONObject {
+            val o = JSONObject().put("config_name", id)
+                .put("config_source", src).put("is_invisible_to_user", invisible)
+            if (withDc) {
+                o.put("display_config", JSONObject()
+                    .put("display_name", name).put("is_custom_model", custom))
+            }
+            if (ctx > 0) o.put("model_detail_list", JSONArray().put(JSONObject().put("max_input_tokens", ctx)))
+            return o
+        }
+
+        val root = JSONObject().put("config_info_list", JSONArray()
+            .put(entry("DeepSeek-V4-Flash", "DeepSeek V4 Flash", ctx = 65536))   // 官方内置可见 → 留下
+            .put(entry("  "))                                                    // 空 config_name → 跳过
+            .put(entry("no-name-no-detail", withDc = false))                     // 无 display_config → 过滤
+            .put(entry("custom_model_gpt-6", "x"))                               // 占位项 → 过滤
+            .put(entry("summary", "x"))                                          // 内部 agent → 过滤
+            .put(entry("file_search_agent", "search_agent_qwen_fast"))           // 内部 agent → 过滤
+            .put(entry("glm-5", "GLM-5", invisible = true))                      // 上游标"不对用户展示" → 过滤
+            // 🔴 第三方接入：config_source=3 + is_custom_model=true（"肖恩ai-…"/"ZZ …" 就是这类）→ 过滤
+            .put(entry("gemini-3.1-pro", "肖恩ai-gemini-3.1-pro", src = 3, custom = true))
+            .put(entry("DeepSeek-V4-Flash", "TRAE-DeepSeek-V4-Flash", src = 3, custom = true)))
+        val out = parseModels(root) ?: throw IllegalStateException("自检失败：模型表解析返回 null")
+
+        // 只有官方内置那条该留下：空名、无 display_config、占位、agent、不可见、第三方全部挡掉
+        check(out.length() == 1) { "自检失败：应只剩 1 条官方内置模型，得到 ${out.length()} 条" }
+        val a = out.getJSONObject(0)
+        check(a.getString("id") == "DeepSeek-V4-Flash") { "自检失败：留下的不是官方内置模型" }
+        check(a.getString("name") == "DeepSeek V4 Flash") { "自检失败：name 应取 display_name" }
+        check(a.getLong("context_length") == 65536L) { "自检失败：context_length 应取 max_input_tokens" }
+
+        // 回落规则：name 缺省回落 id、context 缺省回落 131072
+        val fb = parseModels(JSONObject().put("config_info_list",
+            JSONArray().put(entry("no-name-no-detail"))))!!
+        check(fb.getJSONObject(0).getString("name") == "no-name-no-detail") { "自检失败：name 缺省应回落 id" }
+        check(fb.getJSONObject(0).getLong("context_length") == 131072L) { "自检失败：context 缺省应回落 131072" }
+
+        // 空表 / 无表必须返回 null（否则会把静态表覆盖成空 = 所有客户端看不到模型）
+        check(parseModels(JSONObject()) == null) { "自检失败：没有 config_info_list 时应返回 null" }
+        check(parseModels(JSONObject().put("config_info_list", JSONArray())) == null) {
+            "自检失败：空表应返回 null（空表覆盖会让所有客户端看不到模型）"
+        }
+
+        // 逐条边界（用真实 id 钉住，防止以后改判据把真模型误伤）
+        val builtin = { id: String -> entry(id, "x") }
+        check(isChatModel(builtin("deepseek-v4.1-flash"))) { "自检失败：新模型 deepseek-v4.1-flash 被误过滤" }
+        check(isChatModel(builtin("glm-5.3"))) { "自检失败：新模型 glm-5.3 被误过滤" }
+        check(isChatModel(builtin("step-5-preview"))) { "自检失败：新模型 step-5-preview 被误过滤" }
+        check(isChatModel(builtin("DeepSeek-V4-Flash"))) { "自检失败：DeepSeek-V4-Flash 被误过滤" }
+        check(!isChatModel(entry("mistral-small-4", src = 3, custom = true))) { "自检失败：第三方模型应被过滤" }
+        check(!isChatModel(entry("gemini-3.1-pro", src = 3, custom = true))) { "自检失败：第三方模型应被过滤" }
+        check(!isChatModel(entry("glm-4.5-air", src = 3, custom = true))) { "自检失败：第三方模型应被过滤" }
+        check(!isChatModel(builtin("custom_model_gpt-6"))) { "自检失败：custom_model_* 占位项应被过滤" }
+        check(!isChatModel(builtin("summary"))) { "自检失败：summary 应被过滤" }
+        check(!isChatModel(builtin("file_search_agent"))) { "自检失败：内部 agent 应被过滤" }
+        check(!isChatModel(builtin("browser_use_subagent"))) { "自检失败：内部 subagent 应被过滤" }
+        check(!isChatModel(builtin("explore_sub_agent_v2"))) { "自检失败：内部 agent 应被过滤" }
+        check(!isChatModel(entry("glm-5", invisible = true))) { "自检失败：上游标不可见的项应被过滤" }
     }
 
     /**
