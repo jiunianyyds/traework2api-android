@@ -296,8 +296,10 @@ class GatewayService : Service() {
             @Suppress("DEPRECATION") Notification.Builder(this)
         }
         return builder
-            // 用系统自带图标：不为一条通知新增 drawable 资源。
-            .setSmallIcon(android.R.drawable.stat_sys_upload)
+            // 复用应用图标的前景层（白色双向箭头）：通知栏小图标必须**纯白剪影**，
+            // 系统只取 alpha 通道自己染色 —— 直接用 ic_launcher 那种靛蓝底会糊成一个方块。
+            // 前景层正好是「白箭头 + 透明底」，拿来即用，不新增 drawable。
+            .setSmallIcon(R.drawable.ic_launcher_foreground)
             .setContentTitle("TraeWork2API 网关")
             .setContentText("本地服务运行中 · 端口 ${LocalFakeServer.PORT}")
             .setContentIntent(open)
