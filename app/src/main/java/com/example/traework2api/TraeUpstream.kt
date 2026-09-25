@@ -34,6 +34,7 @@ object TraeUpstream {
     const val EP_CHAT = "/api/agent/v3/llm_utils_chat"
     const val EP_MODELS = "/api/ide/v1/get_detail_param"
     const val EP_CHECKIN_STATUS = "/trae/api/v2/ug/checkin_credits/status"
+    const val EP_CLAIM = "/trae/api/v2/ug/checkin_credits/claim"
     const val EP_ENT_USAGE = "/trae/api/v2/pay/ide_user_ent_usage"
 
     const val APP_ID = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8"
@@ -197,12 +198,55 @@ object TraeUpstream {
         return (total.toLong()) to (total - consumed).toLong()
     }
 
-    /** 签到每日可领积分（checkin_credits/status `checked_in`,`credits`）；失败/区域未配置返回 null。 */
-    fun fetchCheckin(tok: String): Pair<Boolean, Long>? {
+    /**
+     * 签到状态（`checkin_credits/status`）。失败/区域未配置返回 null。
+     *
+     * 上游真实返回（2026-09-25 用真账号 dump 过，三种请求体返回一致）：
+     * `{"checked_in":true,"code":0,"credits":150,"did_checked_in":false,"enable":true,`
+     * `"extra_credits":50,"message":"success"}`
+     *
+     * - [CheckinStatus.checkedIn] 今日是否已签（true 时 UI 必须置灰按钮，见 MainActivity）
+     * - [CheckinStatus.credits] 签到每日可领积分
+     * - [CheckinStatus.enable] 该账号是否开放签到；上游 `false` 时**不该发 claim**
+     */
+    data class CheckinStatus(val checkedIn: Boolean, val credits: Long, val enable: Boolean)
+
+    fun fetchCheckin(tok: String): CheckinStatus? {
         if (!region.canQueryQuota) return null
         val root = ug(tok, UG_HOST + EP_CHECKIN_STATUS) ?: return null
-        return root.optBoolean("checked_in", false) to root.optLong("credits", 0)
+        return parseCheckin(root)
     }
+
+    /**
+     * 执行签到（`checkin_credits/claim`）。返回业务 code，网络失败返回 null。
+     *
+     * ⚠️ **实测（2026-09-25，真账号，今天已签状态下试发）**：返回
+     * `{"code":9004,"message":"The submitted order parameters are incorrect..."}` ——
+     * 注意**不是** GitHub `L0NE-6/Trae-AutoCheckin` 里写的 `9095`，那份参考在这里对不上。
+     * 上游 message 是英文且很含糊，**不要直接展示给用户**，由调用方映射成人话。
+     *
+     * ⚠️ 同样实测：body 用 `{}` 还是 `{"req_source":1}`、带不带设备头，**返回一字不差** ——
+     * 参考实现说的"空体会被拒成 9074"在本账号上不成立，所以**不额外加设备头/设备号**。
+     *
+     * ⚠️ 幂等性：重复领取**不会**扣积分或改坏状态（已复测 `checked_in`/`credits` 不变），
+     * 但会产生一次无谓请求 —— UI 仍应在 `checkedIn=true` 时禁止点击。
+     */
+    fun claimCheckin(tok: String): Int? {
+        if (!region.canQueryQuota) return null
+        return ug(tok, UG_HOST + EP_CLAIM)?.optInt("code", -1)
+    }
+
+    /**
+     * 把上游 status 的 JSON 解析成 [CheckinStatus]。
+     *
+     * 抽出来单独一个函数是为了**能自检**（`fetchCheckin` 要发网络请求，自检里不能打上游）。
+     * 回落规则：字段缺失按 `false`/`0` 处理，**不抛异常** —— 上游多给/少给字段不该让页面崩。
+     */
+    internal fun parseCheckin(root: JSONObject): CheckinStatus = CheckinStatus(
+        checkedIn = root.optBoolean("checked_in", false),
+        credits = root.optLong("credits", 0),
+        enable = root.optBoolean("enable", false),
+    )
 
     /**
      * 拉上游真实模型表（`get_detail_param`，照抄 reference/traework2api 的 FetchModels）。
@@ -389,6 +433,22 @@ object TraeUpstream {
         check(!isChatModel(builtin("browser_use_subagent"))) { "自检失败：内部 subagent 应被过滤" }
         check(!isChatModel(builtin("explore_sub_agent_v2"))) { "自检失败：内部 agent 应被过滤" }
         check(!isChatModel(entry("glm-5", invisible = true))) { "自检失败：上游标不可见的项应被过滤" }
+
+        // 签到状态解析：用**上游真实返回**当 fixture（2026-09-25 真账号 dump 的原文）
+        val real = parseCheckin(JSONObject(
+            """{"checked_in":true,"code":0,"credits":150,"did_checked_in":false,""" +
+                """"enable":true,"extra_credits":50,"message":"success"}"""
+        ))
+        check(real.checkedIn) { "自检失败：checked_in=true 应解析为已签" }
+        check(real.credits == 150L) { "自检失败：credits 应解析为 150" }
+        check(real.enable) { "自检失败：enable=true 应解析为开放签到" }
+        // 未签 + 未开放：两个布尔必须各自独立解析（混了会让按钮该灰的时候可点）
+        val fresh = parseCheckin(JSONObject("""{"checked_in":false,"enable":false,"credits":100}"""))
+        check(!fresh.checkedIn && !fresh.enable) { "自检失败：未签/未开放应都为 false" }
+        check(fresh.credits == 100L) { "自检失败：未签时 credits 仍应解析" }
+        // 字段缺失不许崩（上游加字段/少字段都要活）
+        val empty = parseCheckin(JSONObject("{}"))
+        check(!empty.checkedIn && !empty.enable && empty.credits == 0L) { "自检失败：字段缺失应回落而非抛异常" }
     }
 
     /**

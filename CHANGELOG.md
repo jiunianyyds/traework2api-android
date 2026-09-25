@@ -8,6 +8,74 @@
 
 ---
 
+## [0.4.0] - 2026-09-25
+
+「一键签到」+ **修掉「今日签到」一直显示 `—`**。`versionName` 0.3.0 → **0.4.0**、`versionCode` 3 → **4**。
+
+### 背景：先探测，结果推翻了 GitHub 参考实现
+
+用户要"软件内一键签到"。动手前先用真账号探测（**只读 status + 一次无损 claim**），
+结论与网上最有名的参考 `L0NE-6/Trae-AutoCheckin` **对不上**，幸好没照抄：
+
+| 项 | 该参考实现说 | **实测（本账号）** |
+|---|---|---|
+| 已签时 claim 返回 | `9095` | **`9004`**（"order parameters incorrect"） |
+| body 必须带 `req_source` | "空体会被拒成 9074" | **三种 body 返回一字不差，`req_source` 无影响** |
+| 必须带设备头 | "缺了会被拒成 9074" | **无影响，不需要** |
+| status 字段 | `checked_in`/`credits`/`enable` | 另有 **`did_checked_in`** 与 **`extra_credits`** |
+
+→ 因为实测 `req_source`/设备头无效，**原计划"改 `ug()` 加设备号"整个不用做**，
+签到就是复用现成的 `ug()`（它本来就 POST `{}`）。**需求因此变简单了，而不是变复杂。**
+
+### Added
+- **`TraeUpstream.EP_CLAIM`** + **`claimCheckin()`**：打 `checkin_credits/claim`，返回业务 code。
+- **`TraeUpstream.CheckinStatus`**（`checkedIn`/`credits`/`enable`）+ **`parseCheckin()`**：
+  把 `fetchCheckin()` 的返回从 `Pair<Boolean,Long>` 换成带 `enable` 的数据类 ——
+  **`enable` 是"该账号是否开放签到"，`false` 时不该发 claim**（reference `scheduler.go:104` 同款判断）。
+- **`parseCheckin` 自检**：fixture 直接用**真账号 dump 的原文 JSON**，钉住三个字段独立解析、
+  以及"字段缺失要回落而不是抛异常"（上游多给/少给字段不能把页面打崩）。
+- **账号页「积分与用量」卡的「签到」按钮**（放在「当前可用积分」标题行，挨着「刷新」）：
+  文案随状态变 —— `签到` / `签到中…` / `今日已签到` / `未开放`；
+  后三种**置灰禁用**（`isEnabled=false` + alpha 0.5）。
+- **签到成功后自动重查积分与状态**：用户最想看的就是"签完变成多少"。
+
+### Fixed
+- **「今日签到」永远显示 `—`**（用户报的 bug）。**根因不是解析错，而是从来不自动加载**：
+  `accountBalance`/`accountCap`/`accountCheckin` 初始化为 `null`，只有手动点「刷新」才填充，
+  所以一进账号页三个数值位都是 `—`（「权益额度」「当前可用积分」同样中招）。
+  修法：账号页首次渲染时 `contentHost.post { refreshQuota() }` 自动拉一次；
+  用"三个缓存都为 null"做闸，**不会每次切页都打上游**。
+  ✅ 实测：进页面直接显示 `2578` / `8350` / `已签 · +150/日`。
+
+### 硬约束（违反即 bug）
+1. **已签状态必须从 UI 上堵住**：实测重复 claim **不扣积分、不改坏状态**（已复测），
+   但会白发一次请求并回 `9004`。所以 `checkedIn==true` 时按钮**置灰**，`claimCheckin()` 里也有第二道闸。
+2. **先看状态再决定发不发 claim**（reference `scheduler.go:100` 的顺序）：
+   已签 / `enable=false` 都不发请求。**绝不盲发 claim。**
+3. **上游 message 直接展示会看不懂**：`9004` 的原文是英文
+   `"The submitted order parameters are incorrect. Please try placing the order again"`，
+   文案由本地映射成「今日已签到」，**不透传上游英文**。
+4. **只有国服能签到**（`region.canQueryQuota`）：国际服账号点了永远失败，属已知边界。
+
+### 验证（模拟器实测）
+- 构建通过；装机 `logcat -b crash -d` **空**。
+- **status 真实字段**（只读）：`checked_in=true, code=0, credits=150, enable=true, extra_credits=50`。
+- **claim 真实返回**：`code=9004`（今天已签状态下试发，与探测一致）→ 文案映射为「今日已签到」。
+- **无害性已复测**：claim 试发后 status 仍 `checked_in=true`、`credits=150`，未扣分未改状态。
+- **已签路径**：按钮显示「今日已签到」、`enabled=false`；**硬点它无任何反应、不发请求**。
+- **未签路径**（临时把 `checkedIn` 强制为 false 模拟，验完已删）：按钮变「签到」且 `enabled=true`、
+  标签「未签」；点击后真实打到上游、`claim code=9004` 回来 —— 主路径端到端跑通。
+- **自动加载**：杀进程重进账号页，无需点刷新即显示 `2578` / `8350` / `已签 · +150/日`。
+- 临时代码（探测函数、探测按钮、模拟开关、日志）**全部已删并 grep 确认无残留**。
+
+### 已知限制（明确，别当 bug）
+- **只做手动签到**：不做定时、不做多账号批量、不做 9074 限流重试
+  （那是有 cron 的桌面工具 `TraeWorkAssistant` 的活）。撞上限流会显示失败码。
+- 签到成功与否依赖上游 `code==0`，**未做"积分真的到账"的二次断言**（怕一次签到打三次请求）。
+- `enable=false` 的具体触发条件未探明（本账号一直是 `true`），只按上游字段如实反映。
+
+---
+
 ## [0.3.0] - 2026-09-25
 
 「模型 Tab 增加刷新模型按钮」+ **换上游 function 解锁新模型**。`versionName` 0.2.0 → **0.3.0**、`versionCode` 2 → **3**。
