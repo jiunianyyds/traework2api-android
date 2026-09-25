@@ -8,6 +8,28 @@
 
 ---
 
+## [0.4.2] - 2026-09-25
+
+**修通知栏图标不是应用图标。** `versionName` 0.4.1 → **0.4.2**、`versionCode` 5 → **6**。
+
+### Fixed
+- **前台服务通知显示的是系统「上传箭头」，而不是 App 图标**（用户报的）。
+  根因在 `GatewayService.notification()`：写死 `setSmallIcon(android.R.drawable.stat_sys_upload)`
+  —— 那是 **Android 系统自带**的 drawable，跟应用图标毫无关系，所以换 App 图标它永远不变。
+  修法：改用 `R.drawable.ic_launcher_foreground` —— 它本来就是「白色双向箭头 + 透明底」，
+  **正好符合通知小图标「纯白剪影」的硬要求**（系统只取 alpha 通道自己染色；
+  直接拿 `ic_launcher`（靛蓝底）会糊成一个实心方块）。**复用现有资源，没新增 drawable。**
+  原注释「不为一条通知新增 drawable」的意图仍然成立 —— 确实没新增。
+
+### 验证
+- `dumpsys notification` 显示 `icon=Icon(typ=RESOURCE pkg=com.example.traework2api id=0x7f020004)`：
+  **图标来自 App 自己的包**（之前是 `android` 包的系统图标）。
+- `aapt2 dump resources` 确认 `0x7f020004` = `drawable/ic_launcher_foreground`。
+- 通知图标资源加载无报错（`Couldn't create icon` 等日志为空）；服务正常，`/v1/models` 返回 12 个模型。
+- 冷启 `logcat -b crash` 空。
+
+---
+
 ## [0.4.1] - 2026-09-25
 
 删掉「更多」页的「账号区域」卡。`versionName` 0.4.0 → **0.4.1**、`versionCode` 4 → **5**。
