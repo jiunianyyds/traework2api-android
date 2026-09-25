@@ -796,13 +796,6 @@ class MainActivity : Activity() {
             addView(text("版权与免责声明", FS_CARD_TITLE, true))
             addView(caption("仅供个人学习与研究使用。使用本项目与 Trae 账号存在风险，请自行评估并遵守相关服务条款。"), top(8))
         })
-        addView(card {
-            addView(text("账号区域", FS_CARD_TITLE, true))
-            addView(caption("国内版与国际版是两套 host 与登录入口，各自独立登录。"), top(8))
-            addView(caption("国际服（未开发）：登录可通，但聊天不支持多轮上下文与外部工具调用；" +
-                "且免费额度极少（约 \$1/月）。建议用国服。"), top(8))
-            addView(action("登录国际服（Trae SG · 未开发）", outlined = true) { openLoginSg() }, top(10))
-        })
         addView(section("保活"))
         addView(card {
             addView(row {
@@ -1091,20 +1084,6 @@ class MainActivity : Activity() {
         dlg.setOnShowListener { dlg.window?.setBackgroundDrawable(shape("surface", RADIUS_CARD)) }
         dlg.show()
         return dlg
-    }
-
-    /**
-     * 国际服（SG）登录：回调流与国内服相同，只是 host/ClientID 不同。
-     * 该区域**已冻结为未开发**，所以先弹确认，避免用户白登一个用不上的账号。
-     */
-    private fun openLoginSg() {
-        if (!TraeRegion.SG.canLogin) { toast("国际服常量未配置完整"); return }
-        confirmDialog(
-            title = "国际服尚未开发",
-            message = TraeRegion.SG.unsupportedNote + "\n\n仍然要登录吗？",
-            okText = "仍要登录",
-            cancelText = "用国服",
-        ) { openLogin(TraeRegion.SG) }
     }
 
     /**
