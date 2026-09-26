@@ -63,7 +63,7 @@ class LocalFakeServer(private val apiKey: String) {
 
         private const val TAG = "LocalFakeServer"
 
-        /** 模型表（当前内存：真拉取结果或静态回退）。 */
+        /** `/v1/models` 输出的模型表。**未刷新时是空数组**（模型 Tab 还没加载），属设计意图。 */
         fun staticModels(): JSONArray = ModelsRepo.current()
 
         /**
