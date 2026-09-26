@@ -43,6 +43,8 @@ class MainActivity : Activity() {
         /** 通知权限请求码（Android 13+ 前台服务的常驻通知要用）。 */
         private const val REQ_NOTIF = 1002
         private const val SIXTY_MINUTES_SEC = 3600L
+        /** 模型页刷新按钮文案：空状态卡与工具条共用同一份，改一处两边同步。 */
+        private const val REFRESH_MODELS_LABEL = "刷新模型目录"
 
         /** 二级页「保活设置」的 onSaveInstanceState 标记值。 */
         private const val SUB_KEEP_ALIVE = "keepalive"
@@ -639,19 +641,29 @@ class MainActivity : Activity() {
         // 刷新按钮 + 计数。计数是"刷新真的起作用了"的证据 —— 否则点了没新增时用户会以为没生效。
         val countView = caption("")
         fun refreshCountLabel() {
-            countView.text = if (ModelsRepo.isDynamic) "已刷新 · ${ModelsRepo.current().length()} 个模型"
-            else "内置清单 · ${ModelsRepo.current().length()} 个模型"
+            countView.text = "已加载 · ${ModelsRepo.current().length()} 个模型"
         }
-        val refreshBtn = action("刷新模型") { refreshModels() }
+        val refreshBtn = action(REFRESH_MODELS_LABEL) { refreshModels() }
         // 刷新中：按钮置灰 + 文案变「刷新中…」（照抄记录页/积分刷新那套，别新造轮子）
         fun refreshButtonLabel() {
             refreshBtn.isEnabled = !modelsLoading
-            refreshBtn.text = if (modelsLoading) "刷新中…" else "刷新模型"
+            refreshBtn.text = if (modelsLoading) "刷新中…" else REFRESH_MODELS_LABEL
         }
-        addView(row(top = GAP) {
+        // 工具条（计数 + 按钮）：只在"已加载"时显示 —— 空状态下列表还没有，
+        // 顶上摆一个计数「已加载 · 0 个模型」纯属添乱，刷新按钮统一放到空状态卡里。
+        val toolbar = row(top = GAP) {
             addView(refreshBtn)
             addView(countView, weighted(start = GAP))
-        })
+        }
+        addView(toolbar)
+
+        // 未加载：整页只有一张说明卡 + 刷新按钮（用户要的"空状态"，见 CHANGELOG 0.4.3）
+        val notLoaded = card {
+            addView(text("模型目录尚未加载", FS_CARD_TITLE, true))
+            addView(caption("连接账号后点击「$REFRESH_MODELS_LABEL」，将从上游加载真实可用模型。"), top(8))
+            addView(action(REFRESH_MODELS_LABEL, full = true) { refreshModels() }, top(12))
+        }
+        addView(notLoaded)
 
         // 搜不到时的空态。没有它，用户打错一个字就是**整页空白**，会以为 App 坏了。
         val empty = card(tone = CardTone.SOFT) {
@@ -675,6 +687,15 @@ class MainActivity : Activity() {
             cards = buildModelCards(cardHost)
             applyFilter()
         }
+        /** 未加载时藏起搜索框/工具条/列表，只留说明卡；加载后反过来。 */
+        fun applyLoadedState() {
+            val loaded = ModelsRepo.isDynamic
+            notLoaded.visibility = if (loaded) View.GONE else View.VISIBLE
+            edit.visibility = if (loaded) View.VISIBLE else View.GONE
+            toolbar.visibility = if (loaded) View.VISIBLE else View.GONE
+            cardHost.visibility = if (loaded) View.VISIBLE else View.GONE
+            if (!loaded) empty.visibility = View.GONE
+        }
 
         // 客户端过滤：改可见性而非重建容器，避免丢失输入框焦点
         edit.addTextChangedListener(object : android.text.TextWatcher {
@@ -688,10 +709,12 @@ class MainActivity : Activity() {
             rebuildCards()
             refreshCountLabel()
             refreshButtonLabel()
+            applyLoadedState()
         }
         rebuildCards()
         refreshCountLabel()
         refreshButtonLabel()
+        applyLoadedState()
     }
 
     /** 用当前内存模型表构建卡片；返回 (匹配词→View) 供过滤。 */
@@ -1280,7 +1303,7 @@ class MainActivity : Activity() {
      * 三条必须守住的行为（任务书 §3.2）：
      *  - **原地更新**，不 `render()`/`redraw()` —— 那会丢搜索框内容与滚动位置；
      *  - 网络在后台线程，回主线程改 UI（项目无协程库，用 `Thread{}` + `runOnUiThread`）；
-     *  - **禁止静默失败**：拉不到要 toast 说人话，且仍显示内置清单。
+     *  - **禁止静默失败**：拉不到要 toast 说人话（失败时保持空状态，不伪造清单）。
      */
     private fun refreshModels() {
         val cred = TraeAuthStore.load(this)
@@ -1289,15 +1312,15 @@ class MainActivity : Activity() {
         modelsLoading = true
         // 立刻切「刷新中…」：网络往返有几百毫秒，不给反馈用户会连点
         modelsRefreshApply?.invoke()
-        toast("正在刷新模型…")
+        toast("正在加载模型目录…")
         thread(name = "trae-refresh-models") {
             val arr = TraeUpstream.fetchModels(cred.accessToken, cred.uid)
             runOnUiThread {
                 modelsLoading = false
                 val before = ModelsRepo.current().length()
                 if (arr == null) {
-                    // 拉不到：静态表兜底不变，但必须明确告诉用户（不许静默失败）
-                    toast("拉取失败，仍显示内置清单（${ModelsRepo.current().length()} 个模型）")
+                    // 拉不到：**保持空状态**（不拿旧清单冒充），但必须明确告诉用户
+                    toast("拉取失败，请检查网络后重试")
                 } else {
                     ModelsRepo.applyFetched(arr)
                     val after = ModelsRepo.current().length()
