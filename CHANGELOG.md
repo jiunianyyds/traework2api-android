@@ -42,10 +42,19 @@ UI 规范看 `docs/UI现状清单.md`，本文件只是改动流水。（原引�
   流式 SSE 18 帧 + `[DONE]`；错 key / 空 body → 401（鉴权生效）。
 - 产物 `out/TraeWork2API-0.4.9-debug.apk`，SHA256 `EFED4178…A6213`。
 
-### 开源待办（不阻塞，推仓库前记得）
+### 开源完成（2026-10-12 当晚）
 
-- 上游 traework2api（Go 版）的原仓库链接在 requirements.md 之外没有权威出处，
-  README 里暂写的链接推仓库前请核实/替换为真实地址。
+- 仓库已创建并推送：**https://github.com/jiunianyyds/traework2api-android**（public，main 分支，45 个文件）。
+- 上传采用**白名单全新导出**（单独一次提交，不带本地 git 历史），因此下列内容**不在仓库里**：
+  `.workbuddy/`（其他 AI 工具的本地记忆）、`交接文档.md`、`AGENTS.md`、
+  `traework2api-android-requirements.md`、`docs/`（7 份内部过程文档）、
+  `local.properties`、`reference/`、`out/`、构建产物。
+- 上传前修掉一处真实泄漏：`gradle-wrapper.properties` 的 `distributionUrl` 原指向本机绝对路径
+  （`file:///C:/Users/Administrator/.gradle/...`），既暴露本机用户名又会让别人构建失败；
+  已改为官方 `https://services.gradle.org/distributions/gradle-9.3.1-all.zip`
+  （**只改仓库副本，本机离线构建配置未动**）。
+- README/NOTICE 里上游链接已核实为真实地址 `https://github.com/Sliverkiss/traework2api`
+  （初稿那条是占位 URL，已修）。
 
 ---
 

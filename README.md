@@ -67,7 +67,7 @@
 
 本项目站在两个项目的肩膀上：
 
-- **[traework2api](https://github.com/nineai-official/traework2api)**（Go）——
+- **[Sliverkiss/traework2api](https://github.com/Sliverkiss/traework2api)**（Go）——
   上游协议与业务逻辑的参考实现，已获原作者授权二次创作，依约保留署名；
 - **[WorkBuddy2API-Android](https://github.com/jilin0105/WorkBuddy2API-Android)**——
   UI 资源骨架（主题/色板结构/图标）的参考，MIT 许可。
