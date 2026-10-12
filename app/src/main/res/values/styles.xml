@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 文本字号统一在 MainActivity 的 design token 里（FS_*），这里只保留主题，
+         tw_ 与 tw_ 两套重复色已合并为 tw_ 一套。 -->
+    <style name="Theme.TraeWork2API" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowBackground">@color/tw_background</item>
+        <item name="android:colorAccent">@color/tw_primary</item>
+        <item name="android:colorControlHighlight">@color/tw_primary_container</item>
+        <item name="android:windowActionModeOverlay">true</item>
+    </style>
+</resources>

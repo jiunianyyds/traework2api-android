@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 账号：头 + 肩。与其余导航图标同一套线条语言（1.7dp 描边 / 圆头）。 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:strokeColor="@color/tw_on_surface_variant"
+        android:strokeWidth="1.7"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M12.00,5.20 a3.40,3.40 0 1 0 0,6.80 a3.40,3.40 0 1 0 0,-6.80 z M5.2,19.8 v-0.7 a5.6,5.6 0 0 1 5.6,-5.6 h2.4 a5.6,5.6 0 0 1 5.6,5.6 v0.7" />
+</vector>

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 记录：表盘 + 指针（调用时间）。与其余导航图标同一套线条语言（1.7dp 描边 / 圆头）。 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:strokeColor="@color/tw_on_surface_variant"
+        android:strokeWidth="1.7"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M12.00,4.30 a7.70,7.70 0 1 0 0,15.40 a7.70,7.70 0 1 0 0,-15.40 z M12,7.9 V12.4 L15.3,14.9" />
+</vector>

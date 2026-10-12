@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 概览：2×2 圆角方块。
+     24dp 视口、1.7dp 描边、圆头圆角 —— 5 个导航图标共用同一套线条语言。
+     颜色只是占位，实际由 MainActivity 用 setTint() 按当前风格刷。 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:strokeColor="@color/tw_on_surface_variant"
+        android:strokeWidth="1.7"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M6.20,4.40 h3.00 a1.80,1.80 0 0 1 1.80,1.80 v3.00 a1.80,1.80 0 0 1 -1.80,1.80 h-3.00 a1.80,1.80 0 0 1 -1.80,-1.80 v-3.00 a1.80,1.80 0 0 1 1.80,-1.80 z M14.80,4.40 h3.00 a1.80,1.80 0 0 1 1.80,1.80 v3.00 a1.80,1.80 0 0 1 -1.80,1.80 h-3.00 a1.80,1.80 0 0 1 -1.80,-1.80 v-3.00 a1.80,1.80 0 0 1 1.80,-1.80 z M6.20,13.00 h3.00 a1.80,1.80 0 0 1 1.80,1.80 v3.00 a1.80,1.80 0 0 1 -1.80,1.80 h-3.00 a1.80,1.80 0 0 1 -1.80,-1.80 v-3.00 a1.80,1.80 0 0 1 1.80,-1.80 z M14.80,13.00 h3.00 a1.80,1.80 0 0 1 1.80,1.80 v3.00 a1.80,1.80 0 0 1 -1.80,1.80 h-3.00 a1.80,1.80 0 0 1 -1.80,-1.80 v-3.00 a1.80,1.80 0 0 1 1.80,-1.80 z" />
+</vector>

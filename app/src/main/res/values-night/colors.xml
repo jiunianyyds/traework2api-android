@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 深色色板：与 values/colors.xml 一一对应，只改值不改名。 -->
+    <color name="tw_primary">#BEC2FF</color>
+    <color name="tw_primary_container">#34358B</color>
+    <color name="tw_on_primary">#20205F</color>
+    <color name="tw_on_primary_container">#E1E0FF</color>
+    <color name="tw_secondary">#8AB8E8</color>
+    <color name="tw_background">#101016</color>
+    <color name="tw_surface">#19191F</color>
+    <color name="tw_surface_container">#23232B</color>
+    <color name="tw_surface_variant">#2E2E38</color>
+    <color name="tw_on_surface">#E5E1EA</color>
+    <color name="tw_on_surface_variant">#B5B3C0</color>
+    <color name="tw_outline">#8B8B97</color>
+    <color name="tw_outline_variant">#3A3A44</color>
+    <color name="tw_success">#66E3A0</color>
+    <color name="tw_success_container">#1E4A34</color>
+    <color name="tw_warning">#FFD08A</color>
+    <color name="tw_warning_container">#5A3D17</color>
+    <color name="tw_error">#FFB4A8</color>
+    <color name="tw_error_container">#5A2B2B</color>
+</resources>
