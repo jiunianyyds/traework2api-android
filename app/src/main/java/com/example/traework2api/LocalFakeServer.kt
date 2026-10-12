@@ -396,13 +396,27 @@ class LocalFakeServer(private val apiKey: String) {
 
             val out = sock.getOutputStream()
             val query = path.substringBefore('?')
+            // 访问日志：客户端的路径五花八门（实测 Chatbox 走的就不是官方 SDK 那套），
+            // 出问题时靠它一眼看出"对方到底请求了哪个路径、我们答了什么" ——
+            // 没有这行日志时只能靠猜（这正是"获取模型失败"排查卡住的原因）。
+            android.util.Log.i(TAG, "→ $method $path auth=${authHeader != null} len=$contentLength chunked=$chunked")
             when {
+                // CORS 预检**必须最先答、且任何路径都答**：浏览器/WebView 系的客户端
+                // （实测 Chatbox 就是）在真正发请求前先问一句 `OPTIONS`，
+                // 它只认状态码与 Access-Control-* 头，不看 body。之前这个请求落到了
+                // `/v1/models` 分支、回了 200+模型表但**没有 CORS 头** → 预检失败
+                // → 客户端表现为"获取模型失败"。204 是预检的标准应答。
+                method == "OPTIONS" -> writeRaw(out, 204, "text/plain", "")
                 query == "/healthz" && method == "GET" -> writeRaw(out, 200, "text/plain", "ok")
-                query == "/v1/models" -> {
+                // 路径别名：**部分客户端请求不带 `/v1` 的 `/models`**（Chatbox 就是），
+                // 只认 `/v1/models` 会让它们在"获取模型"这一步直接失败。两个都收。
+                query == "/v1/models" || query == "/models" -> {
                     // /v1/models 仅返回固定模型清单（无敏感数据），免鉴权便于各类客户端拉取；ponytail: 聊天接口仍必须鉴权
-                    writeJson(out, 200, JSONObject().put("object", "list").put("data", staticModels()))
+                    val data = staticModels()
+                    android.util.Log.i(TAG, "← 200 $query （${data.length()} 个模型）")
+                    writeJson(out, 200, JSONObject().put("object", "list").put("data", data))
                 }
-                query == "/v1/chat/completions" && method == "POST" -> {
+                (query == "/v1/chat/completions" || query == "/chat/completions") && method == "POST" -> {
                     if (!authorized(authHeader)) { writeUnauthorized(out); return }
                     // 两种传体方式都要认：多数客户端发 Content-Length，但 **Chatbox 发 chunked**
                     // （实测 `Transfer-Encoding: chunked`，此时 Content-Length 缺失、contentLength=0）。
@@ -443,7 +457,12 @@ class LocalFakeServer(private val apiKey: String) {
                         }
                     }
                 }
-                else -> writeJson(out, 404, openAIError("not_found", "unknown endpoint: $path", 404))
+                else -> {
+                    // 未知路径必须留痕：客户端"连不上/用不了"时，这条日志直接指出是路径没对上，
+                    // 而不是让人去猜端口、鉴权、防火墙。
+                    android.util.Log.w(TAG, "← 404 未知端点: $method $path")
+                    writeJson(out, 404, openAIError("not_found", "unknown endpoint: $path", 404))
+                }
             }
         }
     }
@@ -489,6 +508,10 @@ class LocalFakeServer(private val apiKey: String) {
             out.write("HTTP/1.1 200 OK\r\n".toByteArray())
             out.write("Content-Type: text/event-stream\r\n".toByteArray())
             out.write("Cache-Control: no-cache\r\n".toByteArray())
+            // 流式响应头是**手写**的，不走 writeRaw —— CORS 头必须在这里补一份，
+            // 否则 WebView 系客户端能拉到模型、却仍然发不出对话（流式响应被判跨站拦截）。
+            out.write("Access-Control-Allow-Origin: *\r\n".toByteArray())
+            out.write("Access-Control-Allow-Headers: *\r\n".toByteArray())
             out.write("Connection: close\r\n\r\n".toByteArray())
             out.flush()
         }
@@ -599,12 +622,19 @@ class LocalFakeServer(private val apiKey: String) {
 
     private fun writeRaw(out: OutputStream, status: Int, contentType: String, body: String) {
         val reason = when (status) {
-            200 -> "OK"; 401 -> "Unauthorized"; 404 -> "Not Found"
+            200 -> "OK"; 204 -> "No Content"; 401 -> "Unauthorized"; 404 -> "Not Found"
             else -> "Error"
         }
         val bytes = body.toByteArray(Charsets.UTF_8)
         out.write("HTTP/1.1 $status $reason\r\n".toByteArray())
         out.write("Content-Type: $contentType\r\n".toByteArray())
+        // CORS：**每一个响应都要带**。实测 Chatbox 拉模型前会先发 `OPTIONS /v1/models` 预检，
+        // 缺这几个头预检就失败（现象正是"获取模型失败"，且它会每 500ms 重试）。
+        // 本地服务只在本机/局域网内、且聊天接口另有 API Key 鉴权，放开跨站头无实际风险。
+        out.write("Access-Control-Allow-Origin: *\r\n".toByteArray())
+        out.write("Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n".toByteArray())
+        out.write("Access-Control-Allow-Headers: *\r\n".toByteArray())
+        out.write("Access-Control-Max-Age: 86400\r\n".toByteArray())
         out.write("Content-Length: ${bytes.size}\r\n".toByteArray())
         out.write("Connection: close\r\n\r\n".toByteArray())
         out.write(bytes)

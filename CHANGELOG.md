@@ -8,6 +8,51 @@ UI 规范看 `docs/UI现状清单.md`，本文件只是改动流水。（原引�
 
 ---
 
+## [0.4.10] - 2026-10-12
+
+**修「Chatbox 获取模型失败」：服务端缺 CORS 预检应答。**
+`versionName` 0.4.9 → **0.4.10**、`versionCode` 13 → **14**。
+
+用户报"用 Chatbox 获取失败"。**没有靠猜**：先给服务端补访问日志（见 Added），
+再在模拟器上装好 Chatbox 真实复现，日志一眼看出根因。
+
+### Fixed
+
+1. **【高】Chatbox（及所有 WebView 系客户端）"获取模型失败"** —— 实测日志：
+   Chatbox 拉模型前先发 **`OPTIONS /v1/models`** 预检，服务端虽然回了 200 + 完整模型表，
+   但**没有任何 `Access-Control-*` 头** → 预检不通过 → 客户端判定请求失败
+   （且它会每 500ms 重试，日志里连打 4 次 `OPTIONS`，与用户看到的"获取失败"完全对应）。
+   修法三处，缺一处都会留残：
+   ① `OPTIONS` **任何路径**一律最先应答 `204 No Content` + CORS 头（预检只看状态码和那几个头，不看 body）；
+   ② `writeRaw` 给**所有**响应补 `Access-Control-Allow-Origin/Methods/Headers/Max-Age`；
+   ③ **流式响应头是手写的、不走 `writeRaw`**，单独补一份 —— 否则模型能拉到、对话仍然发不出去。
+2. **【中】路径别名**：部分客户端请求的是不带 `/v1` 的 `/models`、`/chat/completions`，
+   原来直接落 404。现在两套路径都收。
+
+### Added
+
+- **服务端访问日志**：`→ METHOD path auth=… len=… chunked=…` 与 `← 状态码`，
+  未知端点另打一条 warn。**这次排查卡住就是因为没有它** —— 客户端是 Flutter 应用、
+  自身日志看不到 HTTP 细节，只能靠服务端说话。以后"连不上/用不了"先看这条日志，
+  就能区分是路径没对上、没带 key，还是根本没连进来。
+
+### Verified（模拟器实测，非推断）
+
+- **Chatbox 真机复现 → 修复确认**：修复前日志为连续 `OPTIONS /v1/models`（预检失败、重试 4 次），
+  界面"没有可用模型"；修复后日志 `OPTIONS` → `GET /v1/models` 200，
+  Chatbox 界面**列出全部 19 个模型**（Seed-Evolving … Qwen3.7-Plus）。
+- curl 逐项验证：`OPTIONS` → `204` 带全套 CORS 头；`GET /v1/models` → `200` 带 CORS；
+  **流式响应头含 `Access-Control-Allow-Origin`**；非流式聊天 `200` 正常回复；
+  错 key / 空 body → `401`（鉴权未受影响）。
+
+### 权衡说明
+
+- 本次修复的回归闸是**端到端实测**（起真服务 + 真客户端），没有做成启动自检：
+  项目现有自检全是纯函数，而要验证预检必须开真 socket；在 `onCreate` 里开监听端口一旦
+  卡住就是启动挂死（比崩更糟）。故如实标注为"实测覆盖"，非自检覆盖。
+
+---
+
 ## [0.4.9] - 2026-10-12
 
 **开源准备：许可证三件套 + 资源命名去上游痕迹 + 版本号。**
@@ -49,8 +94,8 @@ UI 规范看 `docs/UI现状清单.md`，本文件只是改动流水。（原引�
   `.workbuddy/`（其他 AI 工具的本地记忆）、`交接文档.md`、`AGENTS.md`、
   `traework2api-android-requirements.md`、`docs/`（7 份内部过程文档）、
   `local.properties`、`reference/`、`out/`、构建产物。
-- 上传前修掉一处真实泄漏：`gradle-wrapper.properties` 的 `distributionUrl` 原指向本机绝对路径
-  （`file:///C:/Users/Administrator/.gradle/...`），既暴露本机用户名又会让别人构建失败；
+- 上传前修掉一处真实泄漏：`gradle-wrapper.properties` 的 `distributionUrl` 原指向**本机绝对路径**
+  （`file:///C:/Users/<本机用户名>/.gradle/...`），既暴露本机用户名又会让别人构建失败；
   已改为官方 `https://services.gradle.org/distributions/gradle-9.3.1-all.zip`
   （**只改仓库副本，本机离线构建配置未动**）。
 - README/NOTICE 里上游链接已核实为真实地址 `https://github.com/Sliverkiss/traework2api`
