@@ -399,7 +399,9 @@ class LocalFakeServer(private val apiKey: String) {
             // 访问日志：客户端的路径五花八门（实测 Chatbox 走的就不是官方 SDK 那套），
             // 出问题时靠它一眼看出"对方到底请求了哪个路径、我们答了什么" ——
             // 没有这行日志时只能靠猜（这正是"获取模型失败"排查卡住的原因）。
-            android.util.Log.i(TAG, "→ $method $path auth=${authHeader != null} len=$contentLength chunked=$chunked")
+            // ⚠️ 只记**去掉查询串**的路径：部分客户端把 API Key 放在 `?key=` 里，
+            // 打整条 path 等于把凭据写进 logcat。
+            android.util.Log.i(TAG, "→ $method $query auth=${authHeader != null} len=$contentLength chunked=$chunked")
             when {
                 // CORS 预检**必须最先答、且任何路径都答**：浏览器/WebView 系的客户端
                 // （实测 Chatbox 就是）在真正发请求前先问一句 `OPTIONS`，
@@ -459,9 +461,9 @@ class LocalFakeServer(private val apiKey: String) {
                 }
                 else -> {
                     // 未知路径必须留痕：客户端"连不上/用不了"时，这条日志直接指出是路径没对上，
-                    // 而不是让人去猜端口、鉴权、防火墙。
-                    android.util.Log.w(TAG, "← 404 未知端点: $method $path")
-                    writeJson(out, 404, openAIError("not_found", "unknown endpoint: $path", 404))
+                    // 而不是让人去猜端口、鉴权、防火墙。同样不记查询串（可能含 key）。
+                    android.util.Log.w(TAG, "← 404 未知端点: $method $query")
+                    writeJson(out, 404, openAIError("not_found", "unknown endpoint: $query", 404))
                 }
             }
         }
