@@ -158,6 +158,20 @@ object TraeAuthStore {
         setActive(context, cred.uid)
     }
 
+    /**
+     * 只更新**指定账号**的 token（不改活跃账号、不写元数据）；账号不存在则忽略。
+     *
+     * 为什么不直接用 [save]：它会把保存的账号设为当前账号 —— 后台批量签到给非活跃账号
+     * 续期时走它，用户的当前账号会被**偷偷切走**。
+     */
+    fun updateTokens(context: Context, cred: Cred) {
+        if (readIndex(context).none { it.uid == cred.uid }) return
+        prefs(context).edit()
+            .putString(accessKey(cred.uid), encrypt(cred.accessToken))
+            .putString(refreshKey(cred.uid), encrypt(cred.refreshToken))
+            .apply()
+    }
+
     /** 只更新元数据（不改 token）；账号不存在则忽略。 */
     fun updateMeta(context: Context, meta: AccountMeta) {
         if (readIndex(context).none { it.uid == meta.uid }) return

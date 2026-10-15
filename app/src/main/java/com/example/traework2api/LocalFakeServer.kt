@@ -59,7 +59,12 @@ class LocalFakeServer(private val apiKey: String) {
     var failoverRollback: ((originalUid: String) -> Unit)? = null
 
     companion object {
-        const val PORT = 8788
+        /**
+         * 8788 太常见（各类本地服务 demo 都爱用它），容易与其他 App 的测试服务撞端口。
+         * 首选 84772 超出 TCP 端口上限（最大 65535，实测 `IllegalArgumentException: Port
+         * value out of range`），备选 4772 是特权端口（<1024）绑定受限 —— 落到 8787。
+         */
+        const val PORT = 8787
 
         private const val TAG = "LocalFakeServer"
 
@@ -155,9 +160,19 @@ class LocalFakeServer(private val apiKey: String) {
             return code == 401 || code == 403 || code == 429 || code >= 500
         }
 
+        /**
+         * 单请求体上限。**不是可调项，是安全边界**：
+         * `contentLength` 直接来自客户端写的 `Content-Length` 头，`ByteArray(contentLength)`
+         * 会照着它分配 —— 一个 `Content-Length: 2147483647` 就能触发 2GB 分配，
+         * 抛的是 `OutOfMemoryError`（不是 `Exception`，`catch (e: Exception)` **抓不到**），
+         * 直接把进程干掉。对话请求体远超 8MB 也不现实（那是整本书的量）。
+         */
+        private const val MAX_BODY_BYTES = 8 * 1024 * 1024
+
         /** 与实例方法同逻辑的静态版，供 [selfCheck] 直接调用。 */
         private fun readBody(input: java.io.InputStream, contentLength: Int): String {
             if (contentLength <= 0) return ""
+            require(contentLength <= MAX_BODY_BYTES) { "请求体过大: $contentLength 字节 > $MAX_BODY_BYTES" }
             val bytes = ByteArray(contentLength)
             var off = 0
             while (off < contentLength) {
@@ -336,6 +351,9 @@ class LocalFakeServer(private val apiKey: String) {
 
     private fun handle(client: java.net.Socket) {
         client.use { sock ->
+            // 读超时：请求行/头是**逐字节**读的（[readLineRaw]），客户端建连后只要慢慢发包、
+            // 或干脆不发，就能永久占住一个连接线程。15s 足够任何正常客户端把请求发完。
+            try { sock.soTimeout = 15_000 } catch (_: Exception) {}
             val input = sock.getInputStream()
             // 请求行/头逐字节读到 CRLF 为止：不用 BufferedReader，因为它会预读一批字节
             // 进自己的缓冲区，body 再从底层读就会缺一段（body 必须按 Content-Length 字节精确读）。
@@ -378,20 +396,45 @@ class LocalFakeServer(private val apiKey: String) {
 
             val out = sock.getOutputStream()
             val query = path.substringBefore('?')
+            // 访问日志：客户端的路径五花八门（实测 Chatbox 走的就不是官方 SDK 那套），
+            // 出问题时靠它一眼看出"对方到底请求了哪个路径、我们答了什么" ——
+            // 没有这行日志时只能靠猜（这正是"获取模型失败"排查卡住的原因）。
+            // ⚠️ 只记**去掉查询串**的路径：部分客户端把 API Key 放在 `?key=` 里，
+            // 打整条 path 等于把凭据写进 logcat。
+            android.util.Log.i(TAG, "→ $method $query auth=${authHeader != null} len=$contentLength chunked=$chunked")
             when {
+                // CORS 预检**必须最先答、且任何路径都答**：浏览器/WebView 系的客户端
+                // （实测 Chatbox 就是）在真正发请求前先问一句 `OPTIONS`，
+                // 它只认状态码与 Access-Control-* 头，不看 body。之前这个请求落到了
+                // `/v1/models` 分支、回了 200+模型表但**没有 CORS 头** → 预检失败
+                // → 客户端表现为"获取模型失败"。204 是预检的标准应答。
+                method == "OPTIONS" -> writeRaw(out, 204, "text/plain", "")
                 query == "/healthz" && method == "GET" -> writeRaw(out, 200, "text/plain", "ok")
-                query == "/v1/models" -> {
+                // 路径别名：**部分客户端请求不带 `/v1` 的 `/models`**（Chatbox 就是），
+                // 只认 `/v1/models` 会让它们在"获取模型"这一步直接失败。两个都收。
+                query == "/v1/models" || query == "/models" -> {
                     // /v1/models 仅返回固定模型清单（无敏感数据），免鉴权便于各类客户端拉取；ponytail: 聊天接口仍必须鉴权
-                    writeJson(out, 200, JSONObject().put("object", "list").put("data", staticModels()))
+                    val data = staticModels()
+                    android.util.Log.i(TAG, "← 200 $query （${data.length()} 个模型）")
+                    writeJson(out, 200, JSONObject().put("object", "list").put("data", data))
                 }
-                query == "/v1/chat/completions" && method == "POST" -> {
+                (query == "/v1/chat/completions" || query == "/chat/completions") && method == "POST" -> {
                     if (!authorized(authHeader)) { writeUnauthorized(out); return }
                     // 两种传体方式都要认：多数客户端发 Content-Length，但 **Chatbox 发 chunked**
                     // （实测 `Transfer-Encoding: chunked`，此时 Content-Length 缺失、contentLength=0）。
                     // 只认 Content-Length 的话 chunked 请求的 body 会读成空串 → 上游收到空请求
                     // → 什么都不返回 → 客户端显示**空气泡**。curl 默认发 Content-Length，
                     // 所以这个 bug 只用 curl 测是发现不了的。
-                    val body = if (chunked) readChunkedBody(input) else readBody(input, contentLength)
+                    val body = if (chunked) readChunkedBody(input)
+                    else try {
+                        readBody(input, contentLength)
+                    } catch (e: Exception) {
+                        // 体过大/非法：必须**明确回 413**，不能让它冒泡成"连接被重置"。
+                        android.util.Log.w(TAG, "请求体被拒: ${e.message}")
+                        writeJson(out, 413, openAIError("invalid_request_error",
+                            "请求体过大（上限 ${MAX_BODY_BYTES / 1024 / 1024} MB）", 413))
+                        return
+                    }
                     // 每次请求都问一次「当下有效」的凭证：服务长驻，token 会过期，
                     // 靠启动时快照的那一个迟早变 401（见 credProvider 注释）。
                     val fresh = try { credProvider?.invoke() } catch (e: Exception) {
@@ -402,10 +445,26 @@ class LocalFakeServer(private val apiKey: String) {
                         writeJson(out, 200, fakeCompletion())
                     } else {
                         // X-Uid 必须与本次 token 同属一个账号，否则上游接受连接却不返回数据。
-                        streamingChat(out, body, fresh)
+                        //
+                        // ⚠️ 必须兜住：`prepareBody` 会抛 JSONException（`messages` 存在但不是数组）、
+                        // OkHttp 会抛 IOException。未兜的话异常穿到连接线程，而**流式响应头是在
+                        // prepareBody 之后才写的** —— 客户端已发出请求却收到零字节，
+                        // 表现成"连接被重置"，既没有状态行也无法诊断。
+                        try {
+                            streamingChat(out, body, fresh)
+                        } catch (e: Exception) {
+                            android.util.Log.w(TAG, "转发失败: ${e.javaClass.simpleName}: ${e.message}")
+                            // 只在还没写过任何字节时补错误响应（流式头一旦发了就不能再补）
+                            try { writeJson(out, 502, openAIError("upstream_error", "上游转发失败", 502)) } catch (_: Exception) {}
+                        }
                     }
                 }
-                else -> writeJson(out, 404, openAIError("not_found", "unknown endpoint: $path", 404))
+                else -> {
+                    // 未知路径必须留痕：客户端"连不上/用不了"时，这条日志直接指出是路径没对上，
+                    // 而不是让人去猜端口、鉴权、防火墙。同样不记查询串（可能含 key）。
+                    android.util.Log.w(TAG, "← 404 未知端点: $method $query")
+                    writeJson(out, 404, openAIError("not_found", "unknown endpoint: $query", 404))
+                }
             }
         }
     }
@@ -451,6 +510,10 @@ class LocalFakeServer(private val apiKey: String) {
             out.write("HTTP/1.1 200 OK\r\n".toByteArray())
             out.write("Content-Type: text/event-stream\r\n".toByteArray())
             out.write("Cache-Control: no-cache\r\n".toByteArray())
+            // 流式响应头是**手写**的，不走 writeRaw —— CORS 头必须在这里补一份，
+            // 否则 WebView 系客户端能拉到模型、却仍然发不出对话（流式响应被判跨站拦截）。
+            out.write("Access-Control-Allow-Origin: *\r\n".toByteArray())
+            out.write("Access-Control-Allow-Headers: *\r\n".toByteArray())
             out.write("Connection: close\r\n\r\n".toByteArray())
             out.flush()
         }
@@ -561,12 +624,19 @@ class LocalFakeServer(private val apiKey: String) {
 
     private fun writeRaw(out: OutputStream, status: Int, contentType: String, body: String) {
         val reason = when (status) {
-            200 -> "OK"; 401 -> "Unauthorized"; 404 -> "Not Found"
+            200 -> "OK"; 204 -> "No Content"; 401 -> "Unauthorized"; 404 -> "Not Found"
             else -> "Error"
         }
         val bytes = body.toByteArray(Charsets.UTF_8)
         out.write("HTTP/1.1 $status $reason\r\n".toByteArray())
         out.write("Content-Type: $contentType\r\n".toByteArray())
+        // CORS：**每一个响应都要带**。实测 Chatbox 拉模型前会先发 `OPTIONS /v1/models` 预检，
+        // 缺这几个头预检就失败（现象正是"获取模型失败"，且它会每 500ms 重试）。
+        // 本地服务只在本机/局域网内、且聊天接口另有 API Key 鉴权，放开跨站头无实际风险。
+        out.write("Access-Control-Allow-Origin: *\r\n".toByteArray())
+        out.write("Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n".toByteArray())
+        out.write("Access-Control-Allow-Headers: *\r\n".toByteArray())
+        out.write("Access-Control-Max-Age: 86400\r\n".toByteArray())
         out.write("Content-Length: ${bytes.size}\r\n".toByteArray())
         out.write("Connection: close\r\n\r\n".toByteArray())
         out.write(bytes)

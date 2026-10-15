@@ -6,7 +6,6 @@ import android.app.AlertDialog
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
-import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
@@ -15,7 +14,6 @@ import android.os.Bundle
 import android.text.InputType
 import android.view.Gravity
 import android.view.View
-import android.view.ViewGroup
 import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
@@ -36,7 +34,7 @@ import kotlin.concurrent.thread
  * 顶部栏 + 卡片风格 + 选中态胶囊指示器。
  *
  * 视觉规则：圆角/间距/字号一律走下面的 design token，不要在页面里再写字面量；
- * 颜色一律走 `wb_*` 资源（`values` / `values-night` 各一套），不要写字面量色值。
+ * 颜色一律走 `tw_*` 资源（`values` / `values-night` 各一套），不要写字面量色值。
  */
 class MainActivity : Activity() {
     companion object {
@@ -67,6 +65,15 @@ class MainActivity : Activity() {
 
         /** 本地 API Key 打码占位（概览页默认显示它，避免截屏直接泄露）。 */
         private const val MASKED_KEY = "sk-••••••••••••••••••••••••"
+
+        // ---- 版权信息 ----
+        // 概览页与更多页各出现一次，**共用这一份常量**：改一处两边同步，
+        // 不会出现"概览页写了新邮箱、更多页还是旧的"。文案按「标签 + 值」成对给，
+        // 排版交给 `copyrightLine()`，页面里不再拼字符串。
+        private const val AUTHOR_NAME = "玖念"
+        private const val AUTHOR_EMAIL = "2820184772@qq.com"
+        private const val AUTHOR_LABEL = "作者"
+        private const val CONTACT_LABEL = "联系邮箱"
 
         /** 「使用引导」列出的端点（顺序即展示顺序）。复制时拼成完整 URL。 */
         private val ENDPOINTS = listOf(
@@ -108,7 +115,7 @@ class MainActivity : Activity() {
         ACCOUNT("账号", "当前 Trae 登录状态", R.drawable.ic_account),
         MODELS("模型", "本地可用的模型表", R.drawable.ic_models),
         RECORDS("记录", "调用用量与记录", R.drawable.ic_history),
-        MORE("更多", "说明与致谢", R.drawable.ic_more),
+        MORE("更多", "外观 · 说明 · 保活", R.drawable.ic_more),
     }
 
     private lateinit var contentHost: FrameLayout
@@ -129,8 +136,7 @@ class MainActivity : Activity() {
     private var showStyle = false
     private val apiKey: String by lazy { Gateway.apiKey(this) }
     /** 账号页积分/额度缓存（null=未拉到），展示用，不存凭据。 */
-    private var accountBalance: Long? = null   // 当前可用积分
-    private var accountCap: Long? = null       // 权益额度(上限)
+    private var accountBalance: Long? = null   // 当前可用积分（= total_amount − consumed_amount）
     private var accountCheckin: TraeUpstream.CheckinStatus? = null   // 签到状态（含 enable）
     /** 签到请求进行中（防连点：实测重复 claim 会白发请求）。 */
     private var checkinBusy = false
@@ -192,6 +198,8 @@ class MainActivity : Activity() {
         TraeAuthStore.selfCheck()
         // 续期判定边界自检：服务现在每个请求都靠它决定要不要续期，判错就是持续 401。
         TraeAuthApi.selfCheck()
+        // 批量签到纯计算自检：时刻/日期去重/结果往返判错会让用户白丢积分或多打上游。
+        BatchCheckin.selfCheck()
         // 国际服 plan_item 累积快照 → 增量的 diff 自检（错则客户端看到内容重复）
         TraeIntlUpstream.selfCheck()
         // 上游模型表解析自检：空 config_name 必须跳过、非聊天项必须过滤、name/context 回落规则
@@ -199,6 +207,9 @@ class MainActivity : Activity() {
         TraeUpstream.selfCheck()
         // 模型表自检：空表绝不允许生效 —— 那会让所有客户端看不到任何模型（本任务最贵的失败面）。
         ModelsRepo.selfCheck()
+        // 装入磁盘模型缓存（必须在 selfCheck 之后、任何 /v1/models 请求之前）：
+        // 客户端在 App 刚重启、还没手动刷模型时也能拉到上次刷到的清单。
+        ModelsRepo.init(this)
         // 恢复上次选择的区域：不恢复的话重启后会回落 CN，
         // 国际服 token 就会被发到国内服 host（实测 401/1001 或 4001）。
         TraeRegion.load(this)
@@ -212,7 +223,9 @@ class MainActivity : Activity() {
 
         // 网关由 Gateway（业务）+ GatewayService（保活）持有，**Activity 不再拥有它**：
         // 这样 Activity 被销毁时端口不会跟着断，用户才能"网关开着、切到别的客户端用"。
-        // ⚠️ 依然**不自动启动**：默认关闭，必须用户点「启动服务」（见 toggleService）。
+        // 0.4.8 起**进入 App 默认启动**（用户要求）：除非用户主动停止过（shouldRun=false），
+        // 否则一进 App 就把前台服务拉起来 —— 省掉每次手动点「启动服务」。
+        autoStartServiceIfWanted()
 
         val root = FrameLayout(this).apply {
             setBackgroundColor(color("background"))
@@ -292,6 +305,32 @@ class MainActivity : Activity() {
             SUB_STYLE -> openStylePage()
         }
         loadAndRefreshToken()
+        // 进 App 静默补新模型表：客户端拉 /v1/models 的数据源重启后来自磁盘缓存，
+        // 这里补一次刷新保证新鲜（不弹 toast，失败无感）。
+        maybeAutoRefreshModels()
+        // 定时签到开着时：闹钟自愈重挂 + 补签（今天没跑过或上轮有失败才真的打上游）。
+        maybeCatchUpCheckin()
+    }
+
+    /**
+     * 进 App 的签到兜底：补签 + 闹钟自愈（逻辑在 [BatchCheckin.maybeCatchUp]，后台线程）。
+     *
+     * 覆盖的场景：定时到了但进程被杀/手机重启/闹钟被 ROM 拦 —— 用户打开 App 的那一刻
+     * 全部补上。跑完后如果在账号页就原地刷新一次，让用户看到"补签完成"。
+     */
+    private fun maybeCatchUpCheckin() {
+        if (!BatchCheckin.isEnabled(this)) return
+        thread(name = "checkin-catchup") {
+            val ran = runCatching { BatchCheckin.maybeCatchUp(this@MainActivity) }.getOrDefault(false)
+            if (ran) {
+                runOnUiThread {
+                    if (isFinishing || isDestroyed) return@runOnUiThread
+                    toast("定时签到补签完成")
+                    // 账号页上每账号结果行是新数据，重绘一次（离开账号页时 render 也会拉到）
+                    if (currentPage == Page.ACCOUNT && !showKeepAlive && !showStyle) render(Page.ACCOUNT)
+                }
+            }
+        }
     }
 
     // ------------------------------------------------------------------
@@ -319,10 +358,10 @@ class MainActivity : Activity() {
         })
         // 账号页**自动拉一次**积分/额度：不拉的话三个数值位永远显示「—」，
         // 用户会以为功能坏了（实测就是这个现象），得先手动点「刷新」才有数据。
-        // `accountCheckin == null` 保证只在没数据时自动拉一次，不会每次切页都打上游。
-        if (page == Page.ACCOUNT && accountCheckin == null &&
-            accountBalance == null && accountCap == null
-        ) {
+        // 判据只看 accountCheckin：它是一份拉取里**最后一个**回填的字段，
+        // 拿它当"这个账号是否已经拉过"的单一标志（旧写法要求三个都为 null，
+        // 只要余额先回填成功就会整体跳过 → 签到状态可能一直是 null，按钮变"未登录"却可点）。
+        if (page == Page.ACCOUNT && accountCheckin == null && !quotaLoading) {
             contentHost.post { refreshQuota() }
         }
         navItems.forEach { (key, item) ->
@@ -404,13 +443,13 @@ class MainActivity : Activity() {
             running -> statusChip("服务运行中", "success", true)
             else -> statusChip("服务已停止", "error", false)
         })
-        // 服务默认是**关闭**的（见 onCreate：不自动 start）。关闭时先说清"为什么连不上、
-        // 该点哪里"，否则用户看到地址却连不上会以为坏了。
+        // 服务现在是**默认开启**的（进 App 自动拉起，0.4.8）。走到这个分支基本只有一种情况：
+        // 用户主动停过。文案说清"怎么再开"，别再写"本服务默认关闭"（那已经是过去式）。
         if (!running) {
             addView(card(tone = CardTone.SOFT) {
                 addView(text("服务未启动", FS_CARD_TITLE, true))
-                addView(caption("本服务默认关闭，需要你手动开启后才会监听本地端口。\n" +
-                    "点下面的「启动服务」即可；不开启时客户端连不上，也不会有任何端口在监听。"), top(8))
+                addView(caption("你（或通知栏）停止过服务，端口未在监听，客户端暂时连不上。\n" +
+                    "点下面的「启动服务」即可重新开启；下次进 App 也会保持关闭，直到你手动启动。"), top(8))
             }, top(GAP))
         } else {
             addView(card(tone = CardTone.SOFT) {
@@ -427,15 +466,27 @@ class MainActivity : Activity() {
                     full = true, outlined = pending == 0) { openKeepAlive() }, top(10))
             }, top(GAP))
         }
-        // 服务地址是本页核心信息：强调卡（有底色、无阴影）+ 等宽主色地址 + 一键复制
+        // 服务地址是本页核心信息：强调卡（有底色、无阴影）+ 等宽主色地址 + 一键复制。
+        // 两行分别是「本机用」与「局域网其它设备用」——都带 /v1（客户端 Base URL 的格式），
+        // 不带 /v1 的裸地址此前最容易踩：复制粘贴进客户端后拼接路径就错了。
         addView(card(tone = CardTone.EMPHASIS) {
-            addView(caption("服务地址"))
+            addView(caption("服务地址（本机使用）"))
             addView(row(8) {
-                addView(mono("http://127.0.0.1:${LocalFakeServer.PORT}", FS_BODY, true, "primary"), weighted())
+                addView(mono("http://127.0.0.1:${LocalFakeServer.PORT}/v1", FS_BODY, true, "primary"), weighted())
                 // 卡底本身就是 primary_container，按钮底要换成 surface 才看得见
                 addView(linkAction("复制", overContainer = true) { copyServerUrl() })
             }, top(6))
-            addView(caption("把它作为 base URL 填进任意 OpenAI 兼容客户端"), top(8))
+            // 局域网行：拿不到 IP（未连 WiFi、只连了蜂窝）时整行不出现，不显示一个假地址
+            lanAddress()?.let { lan ->
+                addView(caption("局域网其它设备使用"), top(12))
+                addView(row(8) {
+                    addView(mono(lan, FS_VALUE, true, "primary"), weighted())
+                    addView(linkAction("复制", overContainer = true) { copyLanUrl(lan) })
+                }, top(6))
+                addView(caption("同一 WiFi 下的电脑/平板/手机等设备，base URL 填这一条；" +
+                    "API Key 不变，用下面同一个。"), top(8))
+            } ?: addView(caption("（未检测到局域网 IP：连上 WiFi 后此处会显示可直接给其它设备用的地址）"), top(12))
+            addView(caption("base URL 填进任意 OpenAI 兼容客户端"), top(8))
         }, top(GAP))
         addView(action(busy ?: if (running) "停止服务" else "启动服务", full = true, outlined = running || busy != null) { toggleService() }
             .apply {
@@ -468,6 +519,7 @@ class MainActivity : Activity() {
             }
         })
         addView(action("登录 / 切换 Trae 账号", full = true) { openLogin() }, top(GAP))
+        addView(copyrightCard())
     }
 
     private fun LinearLayout.addTraeCard(includeLogin: Boolean) {
@@ -563,34 +615,194 @@ class MainActivity : Activity() {
             addView(action("粘贴回调链接完成登录", full = true) { promptPasteCallback() }, top(12))
         })
         addView(section("积分与用量"))
+        // 登录状态在这里算一次，供签到文案用（避免在文案函数里重复 KeyStore 解密）
+        val loggedIn = TraeAuthStore.activeUid(this@MainActivity) != null
         addView(card {
+            // 内边距加宽：linkAction 默认左右各 14dp，"刷新"两字只有 ~54dp 宽，
+            // 配 48dp 高就成了一个正圆。让它随文字自适应撑成胶囊（"刷新中…"也不会被截断）。
             val refreshLabel = linkAction(if (quotaLoading) "刷新中…" else "刷新") { refreshQuota() }
-            val checkinAction = action(checkinActionLabel()) { claimCheckin() }
+                .apply { setPadding(dp(24), 0, dp(24), 0) }
+            // 刻意**不用 action()（Button）**：Material Button 的默认 style 自带
+            // minHeight=48dp 与 inset 阴影，minimumHeight 压不下去 —— 已签时想把它缩成
+            // 一枚 32dp 小 chip 根本做不到（实测仍是 48dp 的砖）。TextView + 自绘背景
+            // 高度完全可控，也和项目里其它胶囊（linkAction / chip）同一套做法。
+            val checkinAction = TextView(this@MainActivity).apply {
+                gravity = Gravity.CENTER
+                setOnClickListener { claimCheckin() }
+            }
             // 未登录时 accountCheckin 为 null，quotaApply 不会被调用，所以这里先按初值同步一次状态
-            refreshCheckinButton(checkinAction)
+            refreshCheckinButton(checkinAction, loggedIn)
             val balanceView = text(quotaValue(accountBalance?.toString()), FS_METRIC, true, "primary")
-            val capView = text(quotaValue(accountCap?.toString()), FS_BODY, true)
-            val checkinView = text(quotaValue(checkinLabel()), FS_BODY, true)
+            // 奖励说明（补充信息）：按钮已经说了"今日已签到"，这里不再重复状态，只说能领多少
+            val rewardView = caption(quotaValue(checkinRewardLabel())).apply {
+                gravity = Gravity.CENTER_VERTICAL
+            }
             // 登记"怎么把最新数据刷进这几个控件"，刷新时直接调用（见 quotaApply 的注释）
             quotaApply = {
                 refreshLabel.text = if (quotaLoading) "刷新中…" else "刷新"
                 balanceView.text = quotaValue(accountBalance?.toString())
-                capView.text = quotaValue(accountCap?.toString())
-                checkinView.text = quotaValue(checkinLabel())
-                refreshCheckinButton(checkinAction)
+                rewardView.text = quotaValue(checkinRewardLabel())
+                refreshCheckinButton(checkinAction, loggedIn)
             }
             addView(row {
                 addView(caption("当前可用积分"), weighted())
-                addView(checkinAction, weighted(start = 12))
-                addView(refreshLabel, weighted(start = 12))
+                addView(refreshLabel, lp(-2, -2))
             })
-            // 主数值放大，一眼能读到；次要指标并排
+            // 主数值独占一行：原先它和两个胶囊挤在同一行，行高被 48dp 按钮撑开，数值反被压住
             addView(balanceView, top(2))
-            addView(row(12) {
-                addView(metricOf("权益额度(上限)", capView), weighted())
-                addView(metricOf("今日签到", checkinView), weighted(start = 12))
+            // 签到单独一行：按钮（仅在可签时是主色）+ 右侧奖励说明。
+            // 高度留给 refreshCheckinButton 用 minimumHeight 控制（已签时会缩成一枚小 chip），
+            // 这里不能写死 dp(48)，否则固定高度会盖掉它的收缩。
+            addView(row {
+                addView(checkinAction, lp(-2, -2))
+                addView(rewardView, lp(-2, -2, start = 12))
             }, top(14))
         })
+        addView(section("批量签到"))
+        addView(batchCheckinCard())
+        addView(section("每日定时签到"))
+        addView(scheduleCard())
+    }
+
+    /**
+     * 「批量签到」卡：一键签到全部账号 + 上轮每账号结果。
+     *
+     * 结果持久化在 [BatchCheckin]（跨进程存活），进账号页总是显示**上一次**批量的事实，
+     * 不是当前内存态 —— 所以"今天签没签"的权威判据是每行的状态文案（ok/already），
+     * 与单账号卡里的 accountCheckin 各自独立、互不污染。
+     */
+    private fun batchCheckinCard(): View = card {
+        val metas = TraeAuthStore.list(this@MainActivity)
+        val supported = metas.count { it.region.isSupported }
+        val skipped = metas.size - supported
+        val batchBtn = action(if (BatchCheckin.busy.get()) "签到中…" else "一键签到全部账号", full = true) {
+            runBatchCheckin()
+        }
+        if (metas.isEmpty()) {
+            addView(caption("还没有账号，先登录一个再说。"))
+        } else {
+            addView(caption(
+                "对全部 ${supported} 个国服账号逐个签到（不限于当前使用的那个）" +
+                    (if (skipped > 0) "；另有 $skipped 个国际服账号不支持签到，已跳过。" else "。")))
+            addView(batchBtn, top(10))
+            // 定时开关在卡片里只给入口级提示，完整设置在下面的定时卡
+            if (BatchCheckin.isEnabled(this@MainActivity) && BatchCheckin.lastRunToday(this@MainActivity)) {
+                addView(caption("今天已由定时/补签跑过一轮，重复点击也只会补漏（已签的账号自动跳过）。"), top(8))
+            }
+        }
+        // 上轮结果行（无结果时不显示这块，不编造）
+        val last = BatchCheckin.lastResults(this@MainActivity)
+        if (last != null && last.results.isNotEmpty()) {
+            addView(caption("上次批量（${last.date}${if (BatchCheckin.lastRunToday(this@MainActivity)) " · 今天" else ""}）："), top(12))
+            last.results.forEach { r ->
+                addView(row(6) {
+                    addView(text(r.nickname.ifBlank { r.uid }, FS_VALUE, true), weighted())
+                    addView(text(BatchCheckin.statusLabel(r), FS_CAPTION, false,
+                        if (r.ok || r.status == "already") "success" else "on_surface_variant"))
+                })
+            }
+        }
+    }
+
+    /**
+     * 「每日定时签到」设置卡。**默认关闭**（用户要求：需要手动开启）。
+     *
+     * 开启即挂次日 HH:mm 的精确闹钟（独立 receiver，见 [CheckinReceiver]）；
+     * 到点没执行成（进程被杀/重启/ROM 拦截）的场景由进 App 补签兜底 ——
+     * 文案里说清这条，用户才知道"关机重开后会不会漏签"（不会，打开就补）。
+     */
+    private fun scheduleCard(): View = card {
+        val enabled = BatchCheckin.isEnabled(this@MainActivity)
+        val time = BatchCheckin.timeText(this@MainActivity)
+        // 开关用 TextView 自绘胶囊（项目无 androidx Switch；且这风格与其它胶囊一致）。
+        // 点击 = 翻转开关 + 挂/取消闹钟 + 重绘本卡（重建本页即可，状态都从 BatchCheckin 读）。
+        val toggle = TextView(this@MainActivity).apply {
+            gravity = Gravity.CENTER
+            text = if (enabled) "已开启" else "已关闭"
+            textSize = FS_VALUE.toFloat()
+            setTypeface(Typeface.DEFAULT, Typeface.BOLD)
+            background = shape(if (enabled) "success_container" else "surface_variant", RADIUS_PILL)
+            setTextColor(color(if (enabled) "success" else "on_surface_variant"))
+            setPadding(dp(16), dp(6), dp(16), dp(6))
+            minimumHeight = dp(32)
+            setOnClickListener {
+                if (BatchCheckin.isEnabled(this@MainActivity)) {
+                    BatchCheckin.disable(this@MainActivity)
+                    toast("定时签到已关闭")
+                } else {
+                    BatchCheckin.enable(this@MainActivity, BatchCheckin.timeText(this@MainActivity))
+                    toast("定时签到已开启：每天 ${BatchCheckin.timeText(this@MainActivity)}")
+                }
+                render(currentPage)
+            }
+        }
+        addView(row {
+            addView(text("定时自动签到", FS_VALUE, true), weighted())
+            addView(toggle, lp(-2, -2))
+        })
+        addView(caption(
+            "开启后每天 $time 自动为全部国服账号签到。\n" +
+            "到点若 App 没在后台（手机重启/被系统清理），下次打开本 App 时会自动补签。\n" +
+            "手机重启后闹钟需要重新挂：打开一次本 App 即可恢复。"), top(8))
+        // 用户明确要的一句说明：定时签到签的是**全部**账号，不存在"只签某一个"的隐忧
+        addView(caption("签到范围：App 里已登录的全部国服账号，逐个都签一遍，不会只签当前使用的那个；" +
+            "国际服账号不支持签到，会跳过。"), top(6))
+        // 时刻选择：仅开启时显示（关着改时刻没意义，开启时也存了值）
+        if (enabled) {
+            addView(row(8) {
+                addView(caption("触发时刻：$time"), weighted())
+                addView(linkAction("修改时刻") { promptPickTime() })
+            }, top(4))
+        }
+    }
+
+    /** 选定时时刻：TimePickerDialog（系统组件，风格差异可接受；本地时区）。 */
+    private fun promptPickTime() {
+        val cur = BatchCheckin.timeText(this).split(":").map { it.toIntOrNull() ?: 0 }
+        val dlg = android.app.TimePickerDialog(this, { _, h, m ->
+            val t = String.format(Locale.US, "%02d:%02d", h, m)
+            BatchCheckin.setTime(this, t)
+            toast("定时时刻已设为 $t")
+            render(currentPage)
+        }, cur.getOrElse(0) { 8 }, cur.getOrElse(1) { 0 }, true)
+        dlg.show()
+    }
+
+    /**
+     * 「一键签到全部账号」：后台线程跑批量（[BatchCheckin.runAll] 是阻塞调用），
+     * 完成后重绘账号页。busy 互斥在 [BatchCheckin] 内部（手动/定时/补签三方共用）。
+     */
+    private fun runBatchCheckin() {
+        if (TraeAuthStore.activeUid(this) == null) { toast("未登录 Trae，请先登录"); return }
+        if (!BatchCheckin.busy.compareAndSet(false, true)) { toast("签到正在进行中…"); return }
+        toast("开始批量签到…")
+        thread(name = "checkin-batch") {
+            val result = try {
+                // busy 已在主线程占住：这里不再 compareAndSet，只负责释放。
+                // 不调 notifyIfScheduled：手动路径用户就在屏幕前，toast 已汇总，再弹通知是噪音。
+                BatchCheckin.runAll(this@MainActivity)
+            } catch (e: Exception) {
+                android.util.Log.w("MainActivity", "批量签到异常: ${e.javaClass.simpleName}: ${e.message}")
+                null
+            } finally {
+                BatchCheckin.busy.set(false)
+            }
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                if (result == null) { toast("批量签到异常，请重试"); render(currentPage); return@runOnUiThread }
+                val okCount = result.results.count { it.ok }
+                val alreadyCount = result.results.count { it.status == "already" }
+                val failCount = result.results.count { it.status == "fail" }
+                toast(when {
+                    okCount > 0 -> "批量签到完成：$okCount 成功" +
+                        (if (alreadyCount > 0) "、$alreadyCount 已签" else "") +
+                        (if (failCount > 0) "、$failCount 失败" else "")
+                    alreadyCount > 0 -> "全部账号今日已签到"
+                    else -> "批量签到未生效，详见账号页结果"
+                })
+                if (currentPage == Page.ACCOUNT && !showKeepAlive && !showStyle) render(Page.ACCOUNT)
+            }
+        }
     }
 
     /**
@@ -598,27 +810,90 @@ class MainActivity : Activity() {
      *
      * **必须置灰已签状态**：实测重复 claim 虽不扣积分，但会白发一次请求
      * （上游回 `code=9004`），所以从 UI 上就堵住。
+     *
+     * `accountCheckin == null` 分两种：真未登录、或已登录但还没拉到状态。
+     * 后者若也写「未登录」就是**文案撒谎**（用户明明登录着），故分开措辞。
+     * 登录状态由调用方传入（`accountPage()` 已经读过了），这里**不重复解密** KeyStore。
      */
-    private fun checkinActionLabel(): String = when {
+    private fun checkinActionLabel(loggedIn: Boolean): String = when {
         checkinBusy -> "签到中…"
-        accountCheckin == null -> "未登录"
+        accountCheckin == null -> if (loggedIn) "加载中…" else "未登录"
         accountCheckin?.checkedIn == true -> "今日已签到"
         accountCheckin?.enable == false -> "未开放"
         else -> "签到"
     }
 
-    private fun refreshCheckinButton(btn: android.widget.TextView) {
-        btn.text = checkinActionLabel()
-        btn.isEnabled = !checkinBusy && accountCheckin?.checkedIn != true &&
-            accountCheckin?.enable != false && accountCheckin != null
-        btn.alpha = if (btn.isEnabled) 1f else 0.5f
+    /**
+     * 同步签到按钮的文案与可用性。
+     *
+     * ⚠️ 可用性判据用**显式 null 判断**，不用 `x?.f != false`：后者在 `x == null` 时
+     * 求值为 null，`null != false` 为 true → 读起来像守卫、实际只在非 null 时生效，
+     * 后续改动一旦删掉 `!= null` 兜底就会静默放行。这里把判据收成一条显式 null 检查。
+     */
+    private fun refreshCheckinButton(btn: android.widget.TextView, loggedIn: Boolean) {
+        val st = accountCheckin
+        val actionable = !checkinBusy && st != null && !st.checkedIn && st.enable
+        val done = st?.checkedIn == true
+        btn.text = if (done) "\u2713 " + checkinActionLabel(loggedIn) else checkinActionLabel(loggedIn)
+        btn.isEnabled = actionable
+        btn.alpha = 1f
+        // 三态三种外观，**用颜色和尺寸一起表达语义**，而不是只靠一个 alpha：
+        //   可签  = 主色实心按钮（能点，最醒目）
+        //   已签  = 缩成 success 小胶囊（是**状态**不是操作，占位小、颜色是"已完成"）
+        //   其它  = 浅底灰字（加载中/未登录/未开放，弱化）
+        //
+        // 原先三种状态都是主色实心、只靠 alpha 0.5 区分，于是**不可点的「今日已签到」
+        // 比旁边可点的「刷新」还抢眼**（主次颠倒）。已签还额外占着 48dp 高、5 个字的宽度，
+        // 一个纯状态坨在那里像块砖。
+        btn.background = when {
+            actionable -> shape("primary", RADIUS_CONTROL)
+            done -> shape("success_container", RADIUS_PILL)
+            else -> shape("surface_variant", RADIUS_PILL)
+        }
+        btn.setTextColor(color(when {
+            actionable -> "on_primary"
+            done -> "success"
+            else -> "on_surface_variant"
+        }))
+        // 已签收成一枚小 chip（32dp 高、12sp 粗体）；可签/其它仍是 48dp 主按钮尺寸。
+        // 32dp 只用于**不可点**的状态展示 —— 可点时必须 ≥48dp 满足无障碍触控目标下限。
+        val h = if (done) 32 else 48
+        val pad = if (done) 14 else 18
+        btn.minimumHeight = dp(h)
+        btn.setPadding(dp(pad), 0, dp(pad), 0)
+        btn.textSize = (if (done) FS_CHIP else FS_BODY).toFloat()
+        btn.setTypeface(Typeface.DEFAULT, if (done) Typeface.BOLD else Typeface.NORMAL)
     }
 
-    private fun checkinLabel(): String? =
-        accountCheckin?.let { if (it.checkedIn) "已签 · +${it.credits}/日" else "未签" }
+    /**
+     * 签到按钮右侧的**奖励说明**。
+     *
+     * 只讲"能领多少"这类按钮文案装不下的补充信息，**不再重复签到状态** ——
+     * 按钮本身已经写着「今日已签到」/「签到」/「未开放」，再来一句「已签」就是同义反复。
+     *
+     * `accountCheckin == null` 返回 null 让调用方显示「—」（没数据就是没数据，不编）。
+     */
+    private fun checkinRewardLabel(): String? = accountCheckin?.let {
+        if (!it.enable) "该账号未开放签到" else "每日可领 +${it.credits}"
+    }
 
     /** 积分数值位：刷新中显示「…」，没拿到显示「—」。 */
     private fun quotaValue(v: String?): String = if (quotaLoading) "…" else v ?: "—"
+
+    /**
+     * 账号身份变化时**清掉按账号缓存**的积分/额度/签到状态。
+     *
+     * 这三个字段是"当前账号"的快照，跟账号走。不清的话切号/删除/登录新号后，
+     * 新账号会**继承上一个账号的签到状态** —— 表现就是"明明没签到却显示今日已签到"
+     * （同一个误报的另一个入口，与判据无关，是缓存没失效）。
+     *
+     * 只清缓存、不主动拉取：调用方在页面重建后会经 [render] 的自动加载逻辑补拉，
+     * 保持"一个动作只打一次上游"。
+     */
+    private fun invalidateAccountQuota() {
+        accountBalance = null
+        accountCheckin = null
+    }
 
     /** Token 是否需要续期：过期则需重新登录，临近则由后台自动用 refresh 续期。 */
     private fun tokenRenewLabel(expiresAt: Long): String {
@@ -812,12 +1087,13 @@ class MainActivity : Activity() {
             addView(labelValue("版本", versionName), top(12))
         })
         addView(card(tone = CardTone.SOFT) {
-            addView(text("致谢", FS_CARD_TITLE, true))
-            addView(caption("参考与致谢：\n• traework2api（本项目）\n• WorkBuddy2API-Android（UI 风格与组件写法参考）"), top(8))
-        })
-        addView(card(tone = CardTone.SOFT) {
             addView(text("版权与免责声明", FS_CARD_TITLE, true))
             addView(caption("仅供个人学习与研究使用。使用本项目与 Trae 账号存在风险，请自行评估并遵守相关服务条款。"), top(8))
+            // 与概览页同一份常量 + 同一个 [copyrightLine]，两处排版一致
+            addView(divider(), top(14))
+            addView(copyrightLine(AUTHOR_LABEL, AUTHOR_NAME), top(12))
+            addView(copyrightLine(CONTACT_LABEL, AUTHOR_EMAIL, monoValue = true,
+                onCopy = { copyEmail() }), top(6))
         })
         addView(section("保活"))
         addView(card {
@@ -928,7 +1204,11 @@ class MainActivity : Activity() {
             toast("这个页面在本机打不开，请按下方路径手动设置")
         }
         // 用户可能去系统页面勾选后返回，回来时重绘一次以便显示最新状态。
-        contentHost.postDelayed({ if (showKeepAlive) openKeepAlive() }, 800)
+        // 界面若已销毁就不要再重建视图树（用户此时在系统设置页，回来也不会看这个实例）。
+        contentHost.postDelayed({
+            if (isFinishing || isDestroyed) return@postDelayed
+            if (showKeepAlive) openKeepAlive()
+        }, 800)
     }
 
     // ------------------------------------------------------------------
@@ -1053,10 +1333,11 @@ class MainActivity : Activity() {
      * 而「浏览器 + 粘贴回调」是不依赖 WebView/页面 JS 的实测可用路径，所以现在只留它。
      */
     private fun openLogin(region: TraeRegion = TraeRegion.current) {
-        if (currentPage != Page.ACCOUNT) {
-            currentPage = Page.ACCOUNT
-            render(Page.ACCOUNT)
-        }
+        // **无条件重绘**：原先写成 `if (currentPage != Page.ACCOUNT)`，于是用户已经停在账号页时
+        // 点「立即登录」/「复制国服登录链接」什么都不会重建 —— 页面继续显示点之前那份
+        // 「未登录 / 加载中…」的快照，刚做完的动作在界面上没有回音。
+        currentPage = Page.ACCOUNT
+        render(Page.ACCOUNT)
         copyLoginUrl(region)
     }
 
@@ -1145,6 +1426,9 @@ class MainActivity : Activity() {
         TraeAuthStore.setActive(this, meta.uid)
         // 区域以账号为准并持久化（复用同一处逻辑，别在这里再抄一遍）
         TraeAuthStore.syncRegionToActiveAccount(this)
+        // 切号 = 换了身份：上一个账号的积分/签到状态必须作废，
+        // 否则新账号会继承"今日已签到"（这是误报的另一个入口）
+        invalidateAccountQuota()
         Toast.makeText(this, "已切换到 ${meta.nickname.ifBlank { meta.uid }}", Toast.LENGTH_SHORT).show()
         loadAndRefreshToken()
     }
@@ -1159,6 +1443,8 @@ class MainActivity : Activity() {
             danger = true,
         ) {
             TraeAuthStore.remove(this, meta.uid)
+            // 删掉的若是当前账号，缓存必须作废（下一个激活账号会不一样）
+            invalidateAccountQuota()
             toast("已删除")
             render(currentPage)
         }
@@ -1202,6 +1488,8 @@ class MainActivity : Activity() {
                 runOnUiThread {
                     result.onSuccess { cred ->
                         toast("登录成功：${cred.nickname.ifBlank { cred.uid }}")
+                        // 新登录的账号可能不是原来那个：缓存作废，否则会显示上一个账号的签到状态
+                        invalidateAccountQuota()
                         loadAndRefreshToken()
                     }.onFailure { e ->
                         toast("登录失败：${e.message}")
@@ -1214,6 +1502,41 @@ class MainActivity : Activity() {
 
     private fun copyApiKey() = copyToClipboard("apiKey", apiKey, "已复制 API Key")
 
+    /**
+     * 本机在局域网里的 IPv4 地址（如 `http://192.168.1.5:8787/v1`）；拿不到返回 null。
+     *
+     * 为什么不用 `WifiManager`：API 31+ 的 `getConnectionInfo` 需要定位权限（用户还得授权位置），
+     * 而 `NetworkInterface` 遍历纯属标准库能力、无权限、无需读系统状态 —— 服务本来就监听
+     * 0.0.0.0（见 LocalFakeServer），任何一块网卡的地址都会响应。
+     *
+     * 筛选：`isUp` + 非回环 + 非 `dummy*`（部分 ROM 的虚拟网卡，不是真能连的接口），
+     * 地址取 **IPv4**（`Inet4Address`，Android 会把 IPv6 也列出来）且**可用的**——
+     * 即 `siteLocal`（192.168/10/172.16 私网）**或** `linkLocal`（169.254 自分配）。
+     *
+     * 为什么要放行 linkLocal：DHCP 拿不到地址时手机会自分配 169.254.x.x，**同一链路上的
+     * 设备照样能连**（实测过）。只认 siteLocal 会让这种情况整行隐藏，用户以为功能坏了。
+     *
+     * ⚠️ 多块网卡（WiFi + 热点同开）时取**第一个命中的**，顺序 Java 不保证 —— 两个地址
+     * 都能连（服务听 0.0.0.0），但显示的可能是另一个。用户反馈过"设置里是 .6、软件里是 .12"
+     * 的情况，就是这个原因；两个都对，绑路由器 DHCP 才是根治。不主动列全部地址：
+     * 那是给少数多网卡场景的额外复杂度，用户没要。
+     */
+    private fun lanAddress(): String? {
+        val ip = runCatching {
+            java.util.Collections.list(java.net.NetworkInterface.getNetworkInterfaces())
+                .asSequence()
+                .filter { it.isUp && !it.isLoopback && it.name?.startsWith("dummy") != true }
+                .flatMap { java.util.Collections.list(it.inetAddresses).asSequence() }
+                .filterIsInstance<java.net.Inet4Address>()
+                .firstOrNull { it.isSiteLocalAddress || it.isLinkLocalAddress }
+                ?.hostAddress
+        }.getOrNull() ?: return null
+        // hostAddress 在极少数栈上会带 "%wlan0" 这类 scope 后缀，URL 里必须去掉
+        return "http://${ip.substringBefore('%')}:${LocalFakeServer.PORT}/v1"
+    }
+
+    private fun copyLanUrl(url: String) = copyToClipboard("lanUrl", url, "已复制局域网地址 $url")
+
     /** 复制某个端点的完整地址（提示里把完整 URL 也念出来，用户才知道复制到了什么）。 */
     private fun copyEndpoint(path: String) {
         val url = "http://127.0.0.1:${LocalFakeServer.PORT}$path"
@@ -1221,7 +1544,26 @@ class MainActivity : Activity() {
     }
 
     private fun copyServerUrl() =
-        copyToClipboard("serverUrl", "http://127.0.0.1:${LocalFakeServer.PORT}", "已复制服务地址")
+        copyToClipboard("serverUrl", "http://127.0.0.1:${LocalFakeServer.PORT}/v1", "已复制本机服务地址")
+
+    /**
+     * 版权信息行：`标签 | 值`，标签列与「版本」等 labelValue 统一走 `minWidth 96dp`，
+     * 所以「作者 / 联系邮箱」两行的值**左边界严格对齐** —— 这正是"两行字"和
+     * "一张排版工整的小表"的区别。邮箱用等宽体：字母数字对齐、`@` 与 `.` 不会被
+     * 比例字体挤在一起，读串的概率低一截。
+     */
+    private fun copyrightLine(label: String, value: String, monoValue: Boolean = false, onCopy: (() -> Unit)? = null): View =
+        labelValue(label, value, monoValue) { v -> onCopy?.let { v.setOnClickListener { it() } } }
+
+    /** 概览页底部的版权卡：整页最后一个元素，用 SOFT 退到背景层，不与业务卡抢注意力。
+     *  详情小表只在「更多」页排（copyrightLine），这里一行 caption 带过，信息不重复。 */
+    private fun copyrightCard(): View = card(tone = CardTone.SOFT) {
+        addView(text("版权信息", FS_CARD_TITLE, true))
+        addView(caption("$AUTHOR_LABEL：$AUTHOR_NAME · $CONTACT_LABEL：$AUTHOR_EMAIL"), top(8))
+    }
+
+    /** 邮箱复制：手打 11 位数字容易错，点一下拿完整的比让用户自己抄靠谱。 */
+    private fun copyEmail() = copyToClipboard("authorEmail", AUTHOR_EMAIL, "已复制邮箱 $AUTHOR_EMAIL")
 
     /** 复制到剪贴板 + 提示。原先三处各写一遍 getSystemService/setPrimaryClip，收口到这一处。 */
     private fun copyToClipboard(label: String, value: String, tip: String) {
@@ -1240,12 +1582,20 @@ class MainActivity : Activity() {
         quotaLoading = true
         quotaApply?.invoke()
         thread(name = "trae-fetch-quota") {
-            val u = TraeUpstream.fetchUsage(cred.accessToken)
-            val c = TraeUpstream.fetchCheckin(cred.accessToken)
+            // runCatching 同 refreshModels：抛异常会让线程在复位前死掉，`quotaLoading`
+            // 卡 true → 按钮永远「刷新中…」且不再响应点击。
+            val pair = runCatching {
+                TraeUpstream.fetchUsage(cred.accessToken, cred.uid) to
+                    TraeUpstream.fetchCheckin(cred.accessToken, cred.uid)
+            }.getOrNull()
+            val u = pair?.first
+            val c = pair?.second
             runOnUiThread {
-                accountBalance = u?.second
-                accountCap = u?.first
-                accountCheckin = c
+                if (isFinishing || isDestroyed) { quotaLoading = false; return@runOnUiThread }
+                // 拉失败时**保留旧值**（与 claimCheckin 一致）：网络抖一下就把已显示的
+                // 积分/签到状态擦回「—」是净损失，用户会以为数据丢了。
+                accountBalance = u ?: accountBalance
+                accountCheckin = c ?: accountCheckin
                 quotaLoading = false
                 toast(if (u == null) "未获取到额度" else "已更新")
                 quotaApply?.invoke()
@@ -1259,10 +1609,17 @@ class MainActivity : Activity() {
      * 流程照 reference `scheduler.go:100` 的顺序：**先看状态再决定发不发 claim** ——
      * 已签 / 账号未开放签到时不发请求（实测重复 claim 会白发一次并回 `code=9004`）。
      *
-     * 上游业务码（实测，见 [TraeUpstream.claimCheckin]）：
-     *  - `0`：成功
-     *  - `9004`：已签或参数问题，上游 message 是英文且含糊，**不直接展示**，映射成「今日已签到」
-     *  - 其它：把 code 报出来，方便排查
+     * ⚠️ **成功判据是"成功码 AND 状态跃迁"的合取**（见 [TraeUpstream.checkinSucceeded]）。
+     * 两个单一判据都会被骗，别退回任一个：
+     *  - 旧写法 `when (code) { 0 -> "签到成功" }`：`ug()` 在 HTTP 200 + 业务拒绝时
+     *    也会返回带 `code` 的 JSON，于是被拒也报成功 —— 这就是"没签到却提示签到成功"。
+     *  - 只看状态跃迁：卡片状态陈旧时（显示"未签"、今天其实早已签过），
+     *    `code=9004` + 重查已签会被误报成本次成功，而积分并不会变。
+     * 合取之后 `code=9004` 正确落到「今日已签到」，不再冒充本次成功。
+     *
+     * ⚠️ **状态未知时必须先查再决定**：旧守卫写的是 `accountCheckin?.enable == false`，
+     * 而 `?.` 在 null 时求值为 null，`null == false` 是 false → **守卫被静默绕过**，
+     * 于是"状态未知"也会直接打 claim。这里用 [known] 显式补查一次堵掉。
      *
      * 签到成功后**重查一次**积分：用户最想看的就是"签完变成多少"。
      */
@@ -1270,26 +1627,56 @@ class MainActivity : Activity() {
         val cred = TraeAuthStore.load(this)
         if (cred == null || cred.accessToken.isBlank()) { toast("未登录 Trae，请先登录"); return }
         if (checkinBusy) return
-        if (accountCheckin?.checkedIn == true) { toast("今日已签到"); return }
-        if (accountCheckin?.enable == false) { toast("该账号未开放签到"); return }
+        val before = accountCheckin
+        if (before?.checkedIn == true) { toast("今日已签到"); return }
+        if (before?.enable == false) { toast("该账号未开放签到"); return }
         checkinBusy = true
         quotaApply?.invoke()          // 按钮立刻变「签到中…」
         thread(name = "trae-checkin") {
-            val code = TraeUpstream.claimCheckin(cred.accessToken)
-            // 签到后重查积分与状态：拿到最新余额，同时把按钮切成「今日已签到」
-            val u = TraeUpstream.fetchUsage(cred.accessToken)
-            val c = TraeUpstream.fetchCheckin(cred.accessToken)
+            // 整段包 try/finally：`checkinBusy` 只在主线程复位，若中途抛异常（KeyStore 解密、
+            // 网络层），线程死掉后标志永远为 true → 签到按钮永久卡在「签到中…」。
+            val result = try {
+                // 状态未知（before == null）先补查：不能在不知道 enable/checkedIn 的情况下打 claim
+                val known = before ?: TraeUpstream.fetchCheckin(cred.accessToken, cred.uid)
+                if (known?.checkedIn == true) {
+                    Triple(known, null, null as Long?)
+                } else if (known?.enable == false) {
+                    Triple(known, null, null as Long?)
+                } else {
+                    val code = TraeUpstream.claimCheckin(cred.accessToken, cred.uid)
+                    // 签到后重查积分与状态：拿到最新余额，同时把按钮切成「今日已签到」
+                    val u = TraeUpstream.fetchUsage(cred.accessToken, cred.uid)
+                    val after = TraeUpstream.fetchCheckin(cred.accessToken, cred.uid)
+                    Triple(known, Triple(code, after, u), null)
+                }
+            } catch (e: Exception) {
+                android.util.Log.w("MainActivity", "签到异常: ${e.javaClass.simpleName}: ${e.message}")
+                Triple(before, null, null as Long?)
+            }
+            val known = result.first
+            val tail = result.second
             runOnUiThread {
                 checkinBusy = false
-                accountBalance = u?.second ?: accountBalance
-                accountCap = u?.first ?: accountCap
-                accountCheckin = c ?: accountCheckin
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                if (tail == null) {
+                    accountCheckin = known ?: accountCheckin
+                    toast(if (known?.enable == false) "该账号未开放签到" else "今日已签到")
+                    quotaApply?.invoke()
+                    return@runOnUiThread
+                }
+                val (code, after, u) = tail
+                accountBalance = u ?: accountBalance
+                accountCheckin = after ?: accountCheckin
                 toast(
-                    when (code) {
-                        0 -> "签到成功"
-                        9004 -> "今日已签到"
-                        null -> "签到失败：网络不通，请稍后重试"
-                        else -> "签到失败（code=$code）"
+                    when {
+                        TraeUpstream.checkinSucceeded(known, after, code) -> "签到成功"
+                        after?.checkedIn == true -> "今日已签到"
+                        code == null -> "签到失败：网络不通，请稍后重试"
+                        // 9074 = 上游判"操作太过频繁"。参考 trae-mate（trae_instance.rs:111）：
+                        // **多账号共用同一设备 id 领取**就会撞上它。走到这里说明重查后仍未签
+                        // （重查已签会被上面 after.checkedIn 分支拦下并报「今日已签到」）。
+                        code == 9074 -> "签到未生效：上游判定操作过于频繁（code=9074），请稍后再试"
+                        else -> "签到未生效（code=$code），今日未签到"
                     }
                 )
                 quotaApply?.invoke()
@@ -1304,30 +1691,84 @@ class MainActivity : Activity() {
      *  - **原地更新**，不 `render()`/`redraw()` —— 那会丢搜索框内容与滚动位置；
      *  - 网络在后台线程，回主线程改 UI（项目无协程库，用 `Thread{}` + `runOnUiThread`）；
      *  - **禁止静默失败**：拉不到要 toast 说人话（失败时保持空状态，不伪造清单）。
+     *
+     * [quiet] = 静默模式（进 App 自动补新用）：不 toast、不改按钮态。
+     * 失败在静默模式下是**正常边界**（离线启动很常见）—— 磁盘缓存还在顶着，
+     * 客户端拿到的仍是上次刷到的清单，所以只打日志，绝不能打扰用户。
      */
-    private fun refreshModels() {
+    private fun refreshModels(quiet: Boolean = false) {
         val cred = TraeAuthStore.load(this)
-        if (cred == null || cred.accessToken.isBlank()) { toast("未登录 Trae，请先登录"); return }
+        if (cred == null || cred.accessToken.isBlank()) {
+            if (!quiet) toast("未登录 Trae，请先登录")
+            return
+        }
         if (modelsLoading) return
         modelsLoading = true
-        // 立刻切「刷新中…」：网络往返有几百毫秒，不给反馈用户会连点
-        modelsRefreshApply?.invoke()
-        toast("正在加载模型目录…")
+        if (!quiet) {
+            // 立刻切「刷新中…」：网络往返有几百毫秒，不给反馈用户会连点
+            modelsRefreshApply?.invoke()
+            toast("正在加载模型目录…")
+        }
         thread(name = "trae-refresh-models") {
-            val arr = TraeUpstream.fetchModels(cred.accessToken, cred.uid)
+            // ⚠️ 必须 runCatching：`fetchModels` 走真实 OkHttp + JSON 解析，任何 RuntimeException
+            // 都会让线程在 `runOnUiThread` **之前**死掉 → `modelsLoading` 永远为 true →
+            // `refreshModels()` 在开头直接 return、按钮永久 disabled + 文案卡在「刷新中…」。
+            // 这是"唯一会让用户可见控件永久失效"的失败面，所以失败也要把标志捎回来复位。
+            val arr = runCatching { TraeUpstream.fetchModels(cred.accessToken, cred.uid) }.getOrNull()
             runOnUiThread {
+                if (isFinishing || isDestroyed) { modelsLoading = false; return@runOnUiThread }
                 modelsLoading = false
                 val before = ModelsRepo.current().length()
                 if (arr == null) {
-                    // 拉不到：**保持空状态**（不拿旧清单冒充），但必须明确告诉用户
-                    toast("拉取失败，请检查网络后重试")
+                    // 拉不到：**保持现有状态**（磁盘缓存继续顶），但必须明确告诉用户
+                    if (!quiet) toast("拉取失败，请检查网络后重试")
                 } else {
                     ModelsRepo.applyFetched(arr)
                     val after = ModelsRepo.current().length()
-                    toast(if (after > before) "已更新：$before → $after 个模型" else "已是最新（$after 个模型）")
+                    if (!quiet) toast(if (after > before) "已更新：$before → $after 个模型" else "已是最新（$after 个模型）")
                 }
                 modelsRefreshApply?.invoke()
             }
+        }
+    }
+
+    /**
+     * 进 App 自动补新：模型 Tab / 客户端 `/v1/models` 的数据源重启后来自磁盘缓存，
+     * 可能落后于上游 —— 静默刷一次，让用户无感拿到最新表。
+     *
+     * 判据**不能**用 `ModelsRepo.isDynamic`（init 装过磁盘缓存后它恒为 true，
+     * 有缓存的设备将永远补不到新表），用进程级一次性标志：每个冷启动恰好刷一次，
+     * recreate（转屏/切主题）不重刷。
+     */
+    private var autoModelsTried = false
+
+    private fun maybeAutoRefreshModels() {
+        if (autoModelsTried || modelsLoading) return
+        autoModelsTried = true
+        contentHost.post { refreshModels(quiet = true) }
+    }
+
+    /**
+     * 进入 App 默认拉起网关服务（0.4.8 起）。
+     *
+     * 以前默认关闭、必须手动点「启动服务」，用户嫌麻烦 —— 现在改成：只要用户**没有主动停过**，
+     * 打开 App 就当他在用客户端、需要端口在听。[GatewayService.shouldRun] 持久化了用户意图：
+     * 用户点过「停止服务」或通知栏「停止」后 it 为 false，这里就不拉 ——
+     * 「除非用户手动停止」的承诺靠它兑现，不会出现"关了又自己开"。
+     * 已经在跑（前台服务被系统重建、屏幕旋转重建 Activity 等）则直接跳过。
+     */
+    private fun autoStartServiceIfWanted() {
+        if (GatewayService.running || Gateway.isRunning) return
+        // 启动条件：用户表达过意图且希望运行（shouldRun=true），或从未表达过（全新安装，默认开）。
+        // 唯一不启动的情形 = 用户**主动停止过**（shouldRun=false 且意图存在）。
+        if (GatewayService.hasUserIntent(this) && !GatewayService.shouldRun(this)) return
+        GatewayService.start(this)
+        // Android 13+ 通知要运行时授权。被拒也能跑（前台服务照常），
+        // 只是通知栏看不到"正在运行" —— 那是保活体验的一部分，所以该问就问。
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQ_NOTIF)
         }
     }
 
@@ -1358,7 +1799,12 @@ class MainActivity : Activity() {
             }
         }
         // 等异步动作落地再重绘，否则会画成旧状态；顺便把结果用 toast 说清楚。
+        // ⚠️ 复位**不能只挂在这个 postDelayed 上**：它绑在 `contentHost` 这个视图上，
+        // 若 500ms 内界面被销毁（返回/划掉），runnable 不再执行 → `serviceBusy` 残留
+        // → 概览按钮停在 disabled 的「启动中…」，且 `toggleService()` 因开头守卫拒绝再进入。
+        // 所以真正的兜底是 onDestroy 里的复位（见该处），这里只是正常路径。
         contentHost.postDelayed({
+            if (isFinishing || isDestroyed) return@postDelayed
             serviceBusy = null
             toast(if (stopping) "服务已停止" else "服务已启动")
             redraw()
@@ -1387,6 +1833,14 @@ class MainActivity : Activity() {
         // 系统回收界面）不该把正在服务别的客户端的端口一起掐掉。停止只有两条路 ——
         // 用户在概览页点「停止服务」，或点通知栏的「停止」。
         // （不要补 Gateway.stop()：那会退回"退出界面即断线"，保活就白做了。）
+        //
+        // 但**进行中的 UI 标志必须清掉**：`serviceBusy` 的正常复位挂在 `contentHost.postDelayed`
+        // 上，界面在此被销毁时那个 runnable 永不执行，残留值会让下次进来的概览页显示一个
+        // 永远禁用、且 `toggleService()` 拒绝再进入的「启动中…」按钮。
+        serviceBusy = null
+        quotaLoading = false
+        modelsLoading = false
+        checkinBusy = false
         super.onDestroy()
     }
 
@@ -1526,22 +1980,24 @@ class MainActivity : Activity() {
     private fun chipWarn(value: String) = chip(value, "warning_container", "warning")
     private fun chipInfo(value: String) = chip(value, "primary_container", "primary")
 
-    /** 键值行：标签列只给最小宽度（不再是死 96dp，长标签能撑开），值可长按复制。 */
-    private fun labelValue(label: String, value: String): View = row {
-        addView(caption(label).apply { minWidth = dp(96) }, lp(-2, -2))
-        addView(text(value, FS_VALUE).apply { setTextIsSelectable(true) }, weighted(start = 12))
-    }
-
     /**
-     * 指标块：小标签在上、数值在下，并排展示两个次要指标用。
+     * 键值行：标签列只给最小宽度（不再是死 96dp，长标签能撑开），值可长按复制。
      *
-     * 值控件由调用方给（而不是这里现造）—— 这样"刷新数据"可以**原地改文字**而不重建页面
-     * （重建会把滚动位置弹回页首，见 `quotaApply`）。
+     * [monoValue] 给邮箱这类"标识符型"的值用（见 [copyrightLine]）；
+     * [decorate] 让调用方在**不重写这个布局**的前提下附加行为（如整行可点复制）——
+     * 比再写一个几乎一样、只多一行 setOnClickListener 的行构建器省事且不会走样。
      */
-    private fun metricOf(label: String, valueView: TextView): LinearLayout = LinearLayout(this).apply {
-        orientation = LinearLayout.VERTICAL
-        addView(caption(label))
-        addView(valueView, top(2))
+    private fun labelValue(
+        label: String,
+        value: String,
+        monoValue: Boolean = false,
+        decorate: ((TextView) -> Unit)? = null,
+    ): View = row {
+        addView(caption(label).apply { minWidth = dp(96) }, lp(-2, -2))
+        val v = if (monoValue) mono(value, FS_VALUE) else text(value, FS_VALUE)
+        v.setTextIsSelectable(true)
+        decorate?.invoke(v)
+        addView(v, weighted(start = 12))
     }
 
     /**
@@ -1618,7 +2074,7 @@ class MainActivity : Activity() {
     /**
      * 按语义名取色 —— 风格与亮暗在**运行期**决定。
      *
-     * ⚠️ 这里**不能**改回 `getColor(R.color.wb_*)`：资源 id 是编译期常量，
+     * ⚠️ 这里**不能**改回 `getColor(R.color.tw_*)`：资源 id 是编译期常量，
      * 只有 `values/` 与 `values-night/` 两份，换不了风格。
      */
     private fun color(name: String) = AppStyle.color(name)

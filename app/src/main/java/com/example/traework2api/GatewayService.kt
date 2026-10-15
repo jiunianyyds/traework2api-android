@@ -42,6 +42,10 @@ import android.util.Log
  *
  * ⚠️ 刻意**不做开机自启**：用户明确要求"重启手机后必须自己重新打开 App 手动开"。
  * 因此 manifest 里**没有** `RECEIVE_BOOT_COMPLETED` / BootReceiver —— 别"顺手加上"。
+ *
+ * 0.4.8 更新：用户意图语义变了 —— "进入 App 就默认开启，除非手动停止过"。
+ * shouldRun 默认值仍为 false，但 MainActivity 的 autoStartServiceIfWanted 用
+ * hasUserIntent 区分"从没碰过"（默认开）与"主动停了"（尊重关闭）。
  */
 class GatewayService : Service() {
 
@@ -90,10 +94,17 @@ class GatewayService : Service() {
             ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
                 .edit().putBoolean(KEY_SHOULD_RUN, value).apply()
         }
-
         /** 用户意图。默认 false —— 装上就是关的（用户要求服务默认不开启）。 */
         fun shouldRun(ctx: Context): Boolean =
             ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_SHOULD_RUN, false)
+
+        /**
+         * 用户是否**表达过**意图（点过启动或停止）。没表达过 = 全新安装：
+         * 进 App 默认启动的判据用它 + [shouldRun] 组合 —— shouldRun=false 有两种含义
+         * （"从没碰过"与"主动停了"），只有后者才该拦住自动启动。
+         */
+        fun hasUserIntent(ctx: Context): Boolean =
+            ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).contains(KEY_SHOULD_RUN)
 
         fun start(ctx: Context) {
             val i = Intent(ctx, GatewayService::class.java)
@@ -131,6 +142,15 @@ class GatewayService : Service() {
         if (intent?.action == ACTION_STOP) {
             stopNow()
             // 用户主动停止 → 不允许系统再拉起来（否则会"关了又自己开"）。
+            return START_NOT_STICKY
+        }
+        // 看门狗/兜底闹钟唤醒时，用户可能已经主动停止（cancelWatchdog 只能取消**还没发**的
+        // 闹钟，已经离开 AlarmManager 在投递路上的 Intent 拦不住）—— 此时必须拒绝重启，
+        // 否则 onStartCommand 末尾的 markShouldRun(true) 会把用户刚写入的 should_run=false
+        // 又翻回 true，出现"手动停止后重开 App 服务自己又开了"。
+        if (intent?.action == ACTION_WATCHDOG && !shouldRun(applicationContext)) {
+            Log.i(TAG, "看门狗唤醒，但用户已停止服务 → 不拉起")
+            cancelWatchdog()
             return START_NOT_STICKY
         }
         // 只要服务被启动（用户点按 / 看门狗兜底 / 划掉后拉回），就记为"用户希望它运行"，

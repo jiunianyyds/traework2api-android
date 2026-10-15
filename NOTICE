@@ -1,0 +1,39 @@
+本仓库包含的代码参考/改编自以下项目，在此保留相应的版权与出处声明：
+
+-------------------------------------------------------------------------------
+1. WorkBuddy2API-Android（本项目 UI 资源骨架：主题/色板结构/图标/Manifest 改编自它）
+
+  上游：https://github.com/jilin0105/WorkBuddy2API-Android
+  许可：MIT License
+
+  Copyright (c) 2026 WorkBuddy2API Android Contributors
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+
+-------------------------------------------------------------------------------
+2. traework2api（Go 版，本项目上游协议与业务逻辑的参考实现）
+
+  上游：https://github.com/Sliverkiss/traework2api
+  上游协议与业务逻辑的参考实现。
+
+-------------------------------------------------------------------------------
+3. 本项目的其余部分（业务代码、UI 实现、文档）
+
+  Copyright (c) 2026 玖念 (2820184772@qq.com)
+  以 MIT License 发布（见 LICENSE）。

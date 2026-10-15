@@ -7,7 +7,7 @@ import android.graphics.Color
 /**
  * 外观风格表 + 亮暗模式（本轮新增）。
  *
- * **为什么必须有这个文件**：原先全站用 `getColor(R.color.wb_xxx)` 取色，而 `R.color.*` 是
+ * **为什么必须有这个文件**：原先全站用 `getColor(R.color.tw_xxx)` 取色，而 `R.color.*` 是
  * **编译期常量 id** —— 它只能区分 `values/` 与 `values-night/`（系统级亮暗），
  * **无法区分"风格"**。所以颜色改成「语义名 → 运行期查表」：
  * 布局代码只写 `color("primary")`，具体色值由"当前风格 + 当前亮暗"决定。
@@ -99,7 +99,7 @@ object AppStyle {
         fun palette(night: Boolean): Map<String, String> = if (night) dark else light
     }
 
-    /** 靛蓝：原 `wb_*` 色板，中圆角 + 标准间距 —— 默认风格，视觉与上一轮保持一致。 */
+    /** 靛蓝：原 `tw_*` 色板，中圆角 + 标准间距 —— 默认风格，视觉与上一轮保持一致。 */
     private val INDIGO = Style(
         id = "indigo",
         label = "靛蓝",

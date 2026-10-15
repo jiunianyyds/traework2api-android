@@ -6,13 +6,14 @@ plugins {
 android {
     namespace = "com.example.traework2api"
     compileSdk = 36
+    buildToolsVersion = "36.0.0"
 
     defaultConfig {
         applicationId = "com.example.traework2api"
         minSdk = 24
         targetSdk = 36
-        versionCode = 7
-        versionName = "0.4.3"
+        versionCode = 16
+        versionName = "0.4.12"
     }
 
     buildTypes {

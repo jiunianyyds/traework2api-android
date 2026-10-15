@@ -7,9 +7,9 @@
         <item name="android:windowDrawsSystemBarBackgrounds">true</item>
         <item name="android:statusBarColor">@android:color/transparent</item>
         <item name="android:navigationBarColor">@android:color/transparent</item>
-        <item name="android:windowBackground">@color/wb_background</item>
-        <item name="android:colorAccent">@color/wb_primary</item>
-        <item name="android:colorControlHighlight">@color/wb_primary_container</item>
+        <item name="android:windowBackground">@color/tw_background</item>
+        <item name="android:colorAccent">@color/tw_primary</item>
+        <item name="android:colorControlHighlight">@color/tw_primary_container</item>
         <item name="android:windowActionModeOverlay">true</item>
     </style>
 </resources>
