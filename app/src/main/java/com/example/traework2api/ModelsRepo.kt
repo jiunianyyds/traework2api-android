@@ -1,5 +1,6 @@
 package com.example.traework2api
 
+import android.content.Context
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -16,17 +17,41 @@ import org.json.JSONObject
  *
  * LocalFakeServer.staticModels()（`/v1/models` 输出）与"模型"Tab 都读 [current]。
  *
- * **刻意不持久化**：重启就回空状态，必须重新刷。用户要的是"刷最新"，
- * 不是"离线缓存"——存盘会让旧表冒充新表，正是本次要消灭的错觉。
+ * **持久化（0.4.8）**：曾经"刻意不持久化"，但外部客户端（Chatbox 等）在 App 重启后
+ * 拉 `/v1/models` 只会拿到空列表 —— 用户报的正是"接入其他 APP 无法获取模型"。
+ * 现在刷到的表存盘，进程重启后先恢复缓存（客户端立刻有可用清单），进入 App 后
+ * 再由 UI 静默刷新一次保证新鲜（见 MainActivity.maybeAutoRefreshModels）。
+ * 存盘只发生在**非空**表上：缓存坏了/空了就当没存过，绝不拿空表冒充清单。
  */
 object ModelsRepo {
+
+    private const val PREFS = "traework2api_models"
+    private const val KEY_MODELS = "models_json"
 
     /** 未刷新时对外返回的空表（复用同一个实例，避免每次调用都 new）。 */
     private val EMPTY = JSONArray()
 
-    /** 上游拉回来的表；null = 还没刷过。 */
+    /** 上游拉回来的表；null = 还没刷过（内存里），但可能仍有磁盘缓存。 */
     @Volatile
     private var dynamic: JSONArray? = null
+
+    @Volatile
+    private var appContext: Context? = null
+
+    /**
+     * 装入磁盘缓存。只在 App 冷启动调一次（MainActivity.onCreate），
+     * 必须在任何 `/v1/models` 请求可能到达之前完成。
+     */
+    fun init(ctx: Context) {
+        appContext = ctx.applicationContext
+        if (dynamic != null) return
+        val json = runCatching {
+            ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY_MODELS, null)
+        }.getOrNull() ?: return
+        // 缓存损坏就丢弃：空表/解析失败都当没存过，回空状态，等下次刷新覆盖。
+        val arr = runCatching { JSONArray(json) }.getOrNull() ?: return
+        if (arr.length() > 0) dynamic = arr
+    }
 
     /**
      * 当前生效的模型表。**未刷新时是空数组**（不是 null，调用方直接 `.length()` 就行）。
@@ -41,10 +66,17 @@ object ModelsRepo {
 
     /**
      * 装入上游拉回的表。**空表一律拒绝覆盖**（那道 `length() > 0` 闸）——
-     * 已经刷出表之后再刷一次失败，不能把好好的清单清空。
+     * 已经刷出表之后再刷一次失败，不能把好好的清单清空。非空表同时落盘。
      */
     fun applyFetched(arr: JSONArray) {
-        if (arr.length() > 0) dynamic = arr
+        if (arr.length() > 0) {
+            dynamic = arr
+            val ctx = appContext ?: return
+            runCatching {
+                ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                    .edit().putString(KEY_MODELS, arr.toString()).apply()
+            }
+        }
     }
 
     /**
@@ -52,6 +84,7 @@ object ModelsRepo {
      *
      * ⚠️ 自检必须**自行还原**（把 dynamic 复位成 null），否则会把测试数据留在真实仓库里，
      * 让 App 一起来就显示一个假模型。
+     * ⚠️ 必须在 [init] **之前**跑：init 会装入磁盘缓存，跑在后面"初始为空"的前提就不成立了。
      */
     fun selfCheck() {
         // 初始必须是空的：这是"未刷新 = 空状态"的前提

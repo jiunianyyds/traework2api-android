@@ -1,10 +1,689 @@
 # 变更记录（CHANGELOG）
 
 本文件**只追加**，记「改了哪个文件 / 改了什么 / 为什么」。
-项目全貌看 `交接文档.md`，UI 规范看 `docs/UI现状清单.md`，本文件只是改动流水。
+UI 规范看 `docs/UI现状清单.md`，本文件只是改动流水。（原引的 `交接文档.md` 已于 0.4.7 清理删除）
 
 格式：[Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号跟 `app/build.gradle.kts` 的 `versionName`。
+
+---
+
+## [0.4.12] - 2026-10-14
+
+**新增多账号批量签到与每日定时签到；概览页服务地址改为带 `/v1` 并给出局域网地址。**
+`versionName` 0.4.11 → **0.4.12**、`versionCode` 15 → **16**。
+
+### Added
+
+1. **一键签到全部账号**（`BatchCheckin.kt`）——账号页「批量签到」卡：
+   遍历**全部已保存的国服账号**逐个签到（不是只签当前使用的那个），单线程 + 账号间 800ms 间隔。
+   每账号流程照抄单账号路径的纪律：先查 `status`，未签且 `enable` 才发 claim，
+   成功判据仍是 `checkinSucceeded`（成功码 ∧ 状态跃迁）的合取。
+   结果持久化到独立 prefs（`traework2api_checkin`），账号页逐行显示「✓ 签到成功 +N / 今日已签到 /
+   未开放签到 / 失败：原因 / 该区域未支持签到」。国际服账号**跳过**（签到协议未实测），
+   不硬打上游。
+2. **每日定时签到**（`CheckinReceiver.kt` + manifest 声明）——账号页「每日定时签到」卡，
+   **默认关闭**，用户手动开启并可选时刻（默认 08:00）。到点用 `setExactAndAllowWhileIdle`
+   唤醒独立 `BroadcastReceiver`（`goAsync` + 自持 2 分钟 `PARTIAL_WAKE_LOCK`），
+   在后台线程跑同一套批量编排。
+   **为什么不复用 `GatewayService` 的服务 intent**：其 `onStartCommand` 对非
+   `STOP`/`WATCHDOG` intent 会无条件 `markShouldRun(true)`，会把用户手动停掉的网关
+   悄悄复活（v0.4.8 踩过同类坑）；且 Android 12+ 从闹钟拉前台服务受后台启动限制。
+3. **签到成功通知**——定时/补签路径签到成功时发一条通知（独立渠道「签到结果」，
+   只对「真的新签上」发，「今日已签到」不弹，避免每天白响）。手动路径不发（用户就在屏幕前）。
+4. **进 App 自动补签**——定时开关开着时，每次打开 App 会：自愈重挂闹钟（重启/被 ROM 清掉的
+   闹钟在这里恢复）+ 当天没跑过或上轮有失败则补跑一轮。补签以**上游 status 为事实源**，
+   天然幂等；当天已全部签上则不重复打上游。
+5. **概览页局域网地址行**——除本机 `http://127.0.0.1:8787/v1` 外，自动检测并显示
+   `http://<本机局域网IP>:8787/v1`，供**同一 WiFi 下的其它设备**填写（API Key 不变）。
+   检测用 `NetworkInterface` 遍历（无权限），不用 `WifiManager.getConnectionInfo`
+   （API 31+ 需定位权限）。
+
+### Changed
+
+- **服务地址补上 `/v1`**：概览页两行地址与复制按钮都给完整 Base URL。旧版复制的是裸地址
+  `http://127.0.0.1:8787`，粘进客户端后拼接路径会错——这是实测踩过的坑。
+- `TraeUpstream.fetchCheckin` / `claimCheckin` / `fetchUsage`、`TraeAuthApi.exchangeToken`
+  新增 `region` 参数（缺省 `TraeRegion.current`，**旧调用路径行为不变**）：
+  批量签到按**每个账号自己的区域**显式传参，不必为了换 token 翻改全局区域。
+- `TraeAuthStore.updateTokens()`（新增）：只更新指定账号的 token，**不碰活跃账号**。
+  批量给非当前账号续期若走 `save()`，用户的当前账号会被偷偷切走。
+- 定时签到卡与批量签到卡都写明「签到范围 = 全部国服账号，不只当前使用的那个」。
+
+### Fixed
+
+- **【中】批量续期会与网关续期并发** —— `refresh token` 是**轮换**的，同一账号被两条路径
+  并发续期时先换到的会被作废（`Gateway.kt` 的 credProvider 注释即此纪律）。
+  `BatchCheckin.runAll` 改为全程持 `Gateway.locked`。
+- **【中】续期后索引 `expiresAt` 不同步** —— 到期时间存在账号索引（元数据）里，
+  只写 token 密文会让下次批量又按陈旧时间"续期"一次，白耗一个轮换 refresh token。
+  已补 `updateMeta`。
+- **【低】`lanAddress()` 只认 site-local** —— DHCP 失败时手机自分配的 `169.254.x.x`
+  同一链路其实可连，却被过滤掉导致整行隐藏（用户会以为功能坏了）。已放行 link-local。
+- **【低】IPv4 的 `hostAddress` 可能带 `%wlan0` scope 后缀**，拼进 URL 就是废地址。已剥离。
+- 手动「一键签到」不再误发通知（设计上手动路径只 toast）。
+
+### Verified（模拟器 API 31 实测）
+
+- 启动自检全过（`BatchCheckin.selfCheck()` 钉住时刻解析/结果 JSON 往返/补签去重判据/
+  `expiredWithin` 边界），冷启无崩溃。
+- 账号页两张新卡渲染正常；实点「一键签到全部账号」→ 已签账号正确归「今日已签到」，
+  结果落盘（prefs 内容已核对）。
+- 打开定时开关 → `dumpsys alarm` 确认挂上 `RTC_WAKEUP … CHECKIN_ALARM`，
+  `origWhen` 为次日 08:00、`exactAllowReason=permission`。
+- `am force-stop` 后重开 → 闹钟自愈重挂成功，且当天已全签**不重复打上游**（去重生效）。
+- 概览页 `curl` 实测：回环 `127.0.0.1:8787/healthz` 与局域网 `10.0.2.15:8787/healthz`
+  **均 200**，`/v1/models` 能拉到模型表（证明显示的两个地址都可用）。
+- 产物 `out/TraeWork2API-0.4.12-debug.apk`，1773748 字节（1.69 MB），
+  SHA256 `02151E594A59230DC5B22F90027EA581F4620246DAB4A193283F2E306D807FCD`。
+- ✅ **「一键签到全部账号」真机验证通过**（用户 2026-10-15 反馈"测试完毕，功能正常"）。
+  本条目下的"待补"已闭环，无需追加 Fixed。
+
+### Docs（0.4.12 发布后补完，仅文档，无代码改动）
+
+- 使用说明手册（`traework2api使用说明.md`）同步到 v0.4.12：安装包指向 Releases 最新
+  （原写死 `0.4.8`）、版本脚注 `0.4.8/12` → `0.4.12/16`、新增 Q10（定时签到没反应/没通知
+  排查）、Q11（一键签到单账号失败说明）、Q12（多设备同时用）、第八节补"服务开关 vs 定时签到"
+  的区别（签到自己有闹钟，不受服务启停影响）、第九节补保活与签到关系、第六节补"批量/定时
+  签到不受账号切换影响"、第五节修正"手机开热点不行"为可用说法、去掉指向仓库外 `docs/` 的引用。
+
+---
+
+## [0.4.11] - 2026-10-12
+
+**全面复查 v0.4.10 的改动，修掉 2 处问题（其中 1 处是 v0.4.10 自己引入的）。**
+`versionName` 0.4.10 → **0.4.11**、`versionCode` 14 → **15**。
+
+复查方式：逐行审 v0.4.10 的 diff → 查仓库/Release 一致性 → 模拟器跑 12 项实测矩阵。
+
+### Fixed
+
+1. **【中】访问日志会把 API Key 写进 logcat** —— v0.4.10 新加的访问日志打的是**整条 path**，
+   而 path 含查询串；部分客户端把密钥放在 `?key=` / `?api_key=` 里，
+   于是凭据被原样记入日志（讽刺的是这行日志本是为排查而加）。
+   修法：日志与 404 的报错体都只带**去掉查询串**的路径；`auth=` 本来就只记布尔值不记值。
+   实测：带 `?key=SUPERSECRET123` 的请求，日志里只有 `GET /v1/models`。
+2. **【低】v0.4.9 Release 说明里的使用说明链接 404** —— 上一轮改名后链接**文字**改了、
+   **URL** 仍指向旧文件名。已修正为 `traework2api使用说明.md`（只改 Release 正文，不涉及代码）。
+
+### Changed
+
+- 项目 `.gitignore` 补 `.workbuddy/`（其他 AI 工具的本地记忆目录），与仓库版**完全一致**，
+  避免本地误提交。已核对：两版 `.gitignore` 哈希相同。
+
+### Verified（模拟器实测，本轮 12 项矩阵）
+
+- **接口**：`/healthz` 200 · `OPTIONS` 预检 204 · `/v1/models` 200 · `/models` 别名 200 ·
+  未知路径 404 · 错 key 401 · 非流式聊天 200（content=测试）· `/chat/completions` 别名 200 ·
+  流式 200（17 帧 + `[DONE]`，**响应头含 CORS**）· **chunked 请求体 200**（Chatbox 风格发体）。
+- **边界**：9MB 请求体 → **413**（带鉴权头后命中，是明确的状态码而非连接重置）。
+- **日志隐私**：带 `?key=SUPERSECRET123` 的请求，logcat 中**不含**该串（修复前会原样记录）。
+- **UI 四页核对**：概览（服务运行中 / `http://127.0.0.1:8787`）· 模型（已加载 · 19 个模型）·
+  更多（版本 0.4.11 / 版权与免责声明卡）· 账号（登录态 / 积分卡）。
+- **Chatbox 端到端**：界面正常列出模型（v0.4.10 修的 CORS 预检在 0.4.11 上仍然有效）。
+- 冷启无崩溃（本项目自检失败即崩的惯例下 = 启动自检全过）。
+- 产物 `out/TraeWork2API-0.4.11-debug.apk`，SHA256 `676647BE…E0DE`。
+
+---
+
+## [0.4.10] - 2026-10-12
+
+**修「Chatbox 获取模型失败」：服务端缺 CORS 预检应答。**
+`versionName` 0.4.9 → **0.4.10**、`versionCode` 13 → **14**。
+
+用户报"用 Chatbox 获取失败"。**没有靠猜**：先给服务端补访问日志（见 Added），
+再在模拟器上装好 Chatbox 真实复现，日志一眼看出根因。
+
+### Fixed
+
+1. **【高】Chatbox（及所有 WebView 系客户端）"获取模型失败"** —— 实测日志：
+   Chatbox 拉模型前先发 **`OPTIONS /v1/models`** 预检，服务端虽然回了 200 + 完整模型表，
+   但**没有任何 `Access-Control-*` 头** → 预检不通过 → 客户端判定请求失败
+   （且它会每 500ms 重试，日志里连打 4 次 `OPTIONS`，与用户看到的"获取失败"完全对应）。
+   修法三处，缺一处都会留残：
+   ① `OPTIONS` **任何路径**一律最先应答 `204 No Content` + CORS 头（预检只看状态码和那几个头，不看 body）；
+   ② `writeRaw` 给**所有**响应补 `Access-Control-Allow-Origin/Methods/Headers/Max-Age`；
+   ③ **流式响应头是手写的、不走 `writeRaw`**，单独补一份 —— 否则模型能拉到、对话仍然发不出去。
+2. **【中】路径别名**：部分客户端请求的是不带 `/v1` 的 `/models`、`/chat/completions`，
+   原来直接落 404。现在两套路径都收。
+
+### Added
+
+- **服务端访问日志**：`→ METHOD path auth=… len=… chunked=…` 与 `← 状态码`，
+  未知端点另打一条 warn。**这次排查卡住就是因为没有它** —— 客户端是 Flutter 应用、
+  自身日志看不到 HTTP 细节，只能靠服务端说话。以后"连不上/用不了"先看这条日志，
+  就能区分是路径没对上、没带 key，还是根本没连进来。
+
+### Verified（模拟器实测，非推断）
+
+- **Chatbox 真机复现 → 修复确认**：修复前日志为连续 `OPTIONS /v1/models`（预检失败、重试 4 次），
+  界面"没有可用模型"；修复后日志 `OPTIONS` → `GET /v1/models` 200，
+  Chatbox 界面**列出全部 19 个模型**（Seed-Evolving … Qwen3.7-Plus）。
+- curl 逐项验证：`OPTIONS` → `204` 带全套 CORS 头；`GET /v1/models` → `200` 带 CORS；
+  **流式响应头含 `Access-Control-Allow-Origin`**；非流式聊天 `200` 正常回复；
+  错 key / 空 body → `401`（鉴权未受影响）。
+
+### 权衡说明
+
+- 本次修复的回归闸是**端到端实测**（起真服务 + 真客户端），没有做成启动自检：
+  项目现有自检全是纯函数，而要验证预检必须开真 socket；在 `onCreate` 里开监听端口一旦
+  卡住就是启动挂死（比崩更糟）。故如实标注为"实测覆盖"，非自检覆盖。
+
+---
+
+## [0.4.9] - 2026-10-12
+
+**开源准备：许可证三件套 + 资源命名去上游痕迹 + 版本号。**
+`versionName` 0.4.8 → **0.4.9**、`versionCode` 12 → **13**。
+
+本轮任务：确认可以开源（全历史扫密钥 clean、UI 参考上游 WorkBuddy2API-Android 为 MIT 许可）
+之后，完成开源前置改造。
+
+### Added
+
+- **LICENSE**（MIT）：本项目整体以 MIT 发布，版权行含 WorkBuddy2API Contributors
+  （res 资源骨架部分）。
+- **NOTICE**：依 MIT 义务保留 WorkBuddy2API-Android 的版权与许可文本；记录
+  traework2api（Go 版）的二次创作授权与署名约定；列明本项目自有部分版权。
+- **README.md**（开源版）：功能一览、架构图、快速开始、构建方法、双上游致谢、免责声明。
+- **使用说明.md**（上一轮已完成，随本轮一并入仓）：面向最终用户的手把手教程 12 节。
+
+### Changed
+
+- **资源命名去上游痕迹**：`wb_*` 资源前缀全部更名 `tw_*`（colors/styles 亮暗两套 +
+  5 个 Tab 图标 drawable，共 9 个文件 47 处；Kotlin 侧本就零引用 `@color/wb_`，
+  仅 3 处注释同步更新）。功能中性改动，色值与视觉不变。
+- 版本号 0.4.8 → 0.4.9、versionCode 12 → 13。
+
+### Verified（模拟器实测，非推断）
+
+- `assembleDebug --offline` + `build-apk.ps1` 两套构建通过；改名后全量编译无资源断裂。
+- 装机冷启无崩溃（crash buffer 无 traework2api 记录）；重启自启正常（「服务运行中」）。
+- **UI 视觉不变**：概览页服务卡/地址卡、页尾版权卡（一行式）、更多页版权小表（两行对齐）、
+  模型页缓存加载、账号页积分/签到（3367 / ✓ 今日已签到）逐一核过。
+- 接口端到端：`/healthz` 200；`/v1/models` 200 · 19 个模型；非流式聊天 200 正常回复；
+  流式 SSE 18 帧 + `[DONE]`；错 key / 空 body → 401（鉴权生效）。
+- 产物 `out/TraeWork2API-0.4.9-debug.apk`，SHA256 `EFED4178…A6213`。
+
+### 开源完成（2026-10-12 当晚）
+
+- 仓库已创建并推送：**https://github.com/jiunianyyds/traework2api-android**（public，main 分支，45 个文件）。
+- 上传采用**白名单全新导出**（单独一次提交，不带本地 git 历史），因此下列内容**不在仓库里**：
+  `.workbuddy/`（其他 AI 工具的本地记忆）、`交接文档.md`、`AGENTS.md`、
+  `traework2api-android-requirements.md`、`docs/`（7 份内部过程文档）、
+  `local.properties`、`reference/`、`out/`、构建产物。
+- 上传前修掉一处真实泄漏：`gradle-wrapper.properties` 的 `distributionUrl` 原指向**本机绝对路径**
+  （`file:///C:/Users/<本机用户名>/.gradle/...`），既暴露本机用户名又会让别人构建失败；
+  已改为官方 `https://services.gradle.org/distributions/gradle-9.3.1-all.zip`
+  （**只改仓库副本，本机离线构建配置未动**）。
+- README/NOTICE 里上游链接已核实为真实地址 `https://github.com/Sliverkiss/traework2api`
+  （初稿那条是占位 URL，已修）。
+
+---
+
+## [0.4.8] - 2026-10-12
+
+**修「接入其他 APP 无法获取模型」+ 服务进 App 默认开启 + 端口换号。**
+`versionName` 0.4.7 → **0.4.8**、`versionCode` 11 → **12**。
+
+本轮用户三项要求：① 接其他 APP 拉不到模型、无法正常使用；② 服务启动模式太麻烦，
+改成"进入 App 就默认开启，除非用户手动停止"；③ 端口 8788 太常见，优先 84772，
+不行则 4772，再不行 8787。写入本条目前按用户要求**全量复查了一遍本轮 diff**，
+复查又抓出 1 处判据缺陷（见 Fixed 4），连同装机实测抓到的 2 处（Fixed 2/3）一并修掉并复测。
+
+### Fixed（按严重度）
+
+1. **【高】外部客户端重启 App 后拉不到模型（`/v1/models` 返回空表）** —— 根因是 0.4.3 把
+   `ModelsRepo` 改成「刻意不持久化」（当时为了消灭"静态兜底表冒充上游清单"的错觉），
+   副作用是进程一死表就没了：Chatbox 这类客户端在 App 重启后拉到的永远是空列表。
+   修法（`ModelsRepo.kt`）：刷到的**非空**表落盘（SharedPreferences `traework2api_models` /
+   `models_json`）；`init()` 冷启动装载（在 selfCheck 之后、任何 `/v1/models` 请求可能到达之前）；
+   空表/解析失败一律丢弃——缓存永不冒充清单、也不会被一次失败的刷新清空（沿用 `length() > 0` 闸）。
+   0.4.3 注释里"旧表冒充新表"的顾虑由"进 App 静默补新"对冲（见 Added）。
+
+2. **【高】手动停止后服务"自己又开了"** —— 装机实测抓到，两个独立 bug 叠加：
+   a) `autoStartServiceIfWanted()` 第一版把条件写反（`!shouldRun && !hasUserIntent` 才跳过）——
+      恰好放行了"用户明确停止"（shouldRun=false 且有意图）、只拦"从没碰过"，语义完全颠倒；
+   b) 用户点停止时，15 分钟看门狗闹钟可能**已经离开 AlarmManager 在投递路上**，`cancelWatchdog()`
+      拦不住它；该 Intent 到达 `onStartCommand` 后走正常路径把 `should_run` 翻回 true，停止作废。
+   修法：a) 启动条件改为 `hasUserIntent && !shouldRun` 才不启动（唯一不启动 = 主动停过）；
+   b) `GatewayService.onStartCommand` 对 `ACTION_WATCHDOG` 前置校验 `shouldRun`，
+   用户已停就拒绝拉起并顺手取消看门狗。
+
+3. **【高】首选端口 84772 越界，服务起不来即崩** —— 84772 > TCP 端口上限 65535，
+   `ServerSocket` 构造直接抛 `IllegalArgumentException: Port value out of range: 84772`
+   （在 `GatewayService` 里炸，进入 App 即崩屏）。装机实测抓到后按用户给定的备选顺序落地 8787（见 Changed）。
+
+4. **【中】静默补新判据失效 —— 有缓存的设备永远补不到新表**（全量复查抓到）——
+   `maybeAutoRefreshModels` 原用 `ModelsRepo.isDynamic` 当"没刷过才拉"的守卫，但 `init()`
+   装载磁盘缓存后 `isDynamic` 恒为 true，于是恰恰是**有缓存的设备**（绝大多数）静默补新永不执行，
+   "保证新鲜"落空。修法：进程级一次性标志 `autoModelsTried`（每冷启动恰好一次，recreate 不重刷）。
+
+### Added
+
+- **服务进 App 默认启动**（用户要求 ②）：`MainActivity.autoStartServiceIfWanted()`——`onCreate`
+  里在"用户没有主动停止过"时拉起 `GatewayService`；首装（从无用户意图）也默认开。
+  `GatewayService` 新增 `hasUserIntent()` 区分 `shouldRun=false` 的两种含义
+  （"从没碰过" vs "主动停了"），只有后者拦自启。
+- **模型表进 App 静默补新**：`refreshModels(quiet)` 静默模式（不 toast、不动按钮态；
+  失败是正常边界——离线启动时磁盘缓存继续顶，绝不打扰用户）；`maybeAutoRefreshModels()`
+  在 `onCreate` 末尾触发。
+
+### Changed
+
+- **端口 8788 → 8787**（用户要求 ③，按给定优先级落地）：84772 超 TCP 上限（见 Fixed 3）；
+  4772 是特权端口（<1024）绑定受限；落到 8787。`LocalFakeServer.PORT` 是唯一来源，
+  界面/复制/通知全部引用常量。**外部客户端的 base URL 需从 8788 改到 8787**。
+- **概览页版权卡去重**（用户要求）：`copyrightCard()` 原先一行 caption + 一张「作者/联系邮箱」
+  小表同卡重复；删小表只留 caption，详情小表只在「更多」页保留（邮箱可点复制不受影响）。
+- 概览页「服务未启动」说明文案同步新语义（"你停止过服务…下次进 App 也会保持关闭，直到你手动启动"）。
+- 版本号 0.4.7 → 0.4.8、versionCode 11 → 12（`app/build.gradle.kts`）。
+
+### Verified（模拟器实测，非推断）
+
+- `assembleDebug --offline` 通过；装机冷启无崩溃（本项目自检失败即崩的惯例下 = 启动自检全过），
+  `logcat -b crash` 无 traework2api 记录。
+- **模型持久化端到端**：冷启不点任何刷新 → `adb forward` + curl 拉 `/v1/models` = **19 个模型**
+  （来自磁盘缓存，prefs 里 `models_json` 实存）；静默补刷后再查仍 200 / 19。
+- **端到端聊天**：非流式 `DeepSeek-V4-Flash` 带本地 key POST `/v1/chat/completions` → 200、
+  正常回复（真实上游转发）。
+- **自启/停止语义**：停止 → `force-stop` → 重开 App = 「服务已停止」且 `should_run=false` 保持；
+  启动 → 重开 App = 「服务运行中」自动恢复；无用户意图首启 = 自动启动。
+- 产物 `out/TraeWork2API-0.4.8-debug.apk`，SHA256 `D6AB9E9F…34C77`。
+
+### 仍未验证
+
+- 真机 ROM（ColorOS/MIUI）上"进 App 自启"的实际表现：模拟器是原生 Android 行为，
+  厂商省电策略可能仍需保活页那几项授权配合。
+- 静默补新的离线失败路径只做了代码层确认（quiet 模式不弹不扰、失败不影响下次手动刷新），未断网复测。
+
+---
+
+## [0.4.7] - 2026-10-11
+
+**全量检查一遍后修掉 7 处真缺陷（含 2 处会让控件永久失效 / 账号串号）+ 加版权信息 + 清死文件。**
+`versionName` 0.4.6 → **0.4.7**、`versionCode` 10 → **11**。
+
+本轮用户要求「全面检查整个项目查找漏洞 bug、清理无用文件、更新版本号、更新项目记忆」。
+检查方式：两个子代理各审一层（网络/凭证层、UI/生命周期层），**报告里的每条我都回到源码逐行核对过**
+（子代理报的 13 条里有 3 条经核不成立或不可达，已丢弃，见下）。
+
+### Fixed（按严重度）
+
+1. **【高】长流程中途区域翻面 → CN token 发往 SG host（账号串号）** —— `TraeUpstream.kt`
+   `region` / `AGENT_HOST` / `UG_HOST` 是**每次读都重算**的 getter，而 `TraeRegion.current`
+   会被 UI 线程改写（切账号 → `syncRegionToActiveAccount`、复制登录链接 → `TraeRegion.set`），
+   本文件的方法却跑在服务连接线程上、单次请求可达 180s。`chatStream` 原先在 :614 判协议分支、
+   :619 又取一次 host，**两次独立读取之间夹着整个流式窗口** —— 用户此时切账号，一次已按 CN
+   协议发出的请求就会把 CN 的 token 发到 SG host。
+   修法：**每个对外方法入口把区域快照成局部值**（`val reg = TraeRegion.current`），
+   之后 host / 协议分支 / header 全部用 `reg`；`solo()` / `ug()` / `fetchModels` /
+   `fetchUsage` / `fetchCheckin` / `claimCheckin` 相应改为**接收 region 参数**而不是自己读全局。
+   这是本轮唯一的"数据发错地方"级缺陷，也是唯一需要贯穿改签名的。
+   （国际服侧无此问题：`TraeIntlUpstream` 的 host 是硬编码常量 `core-normal.trae.ai`。）
+
+2. **【高】`modelsLoading` 卡死 → 模型页「刷新」永久失效** —— `MainActivity.refreshModels()`
+   `fetchModels` 抛异常时线程在 `runOnUiThread` **之前**死掉，`modelsLoading` 永远为 `true`，
+   于是下次进来 `if (modelsLoading) return` 直接返回、按钮永久 disabled + 文案卡在「刷新中…」。
+   这是唯一会让用户可见控件**永久**失效的失败面。
+   修法：`runCatching{...}.getOrNull()`，失败也把标志捎回来复位。
+   **同一形态的另外两处一并加固**（`refreshQuota` / `claimCheckin`，后者还把整段包了 try/finally）
+   —— 它们当前靠底层 `?: return null` 吞异常而侥幸不触发，但守卫形态本身不安全。
+
+3. **【高】`serviceBusy` 复位挂在视图上 → 概览「启动服务」永久卡在禁用态** ——
+   `serviceBusy` 原先只在 `contentHost.postDelayed(…, 500)` 里清零；500ms 内界面被销毁
+   （返回 / 划掉最近任务）则 runnable 永不执行、标志残留，概览页显示一个 disabled 的
+   「启动中…」按钮且 `toggleService()` 因开头守卫拒绝再进入。
+   修法：`onDestroy()` 里复位 `serviceBusy` / `quotaLoading` / `modelsLoading` / `checkinBusy`
+   四个 UI 标志（**不是**在这里停网关 —— 那会退回"退出界面即断线"，见该处注释）。
+
+4. **【中】转发异常时客户端收到零字节（表现为"连接被重置"）** —— `LocalFakeServer.handle()`
+   `streamingChat` 调用没有任何 try：`prepareBody` 会抛 `JSONException`（`messages` 存在但不是
+   数组）、OkHttp 会抛 `IOException`。异常穿到连接线程后只会 `Log.w` 并关 socket，而**流式响应头
+   是在 `prepareBody` 之后才写的**，所以客户端已发出请求却连状态行都收不到。
+   修法：兜住并回 502 + 可诊断的错误体。
+
+5. **【中】请求体无上界 + socket 无读超时（OOM / Slowloris）** —— `LocalFakeServer`
+   `contentLength` 直接来自客户端写的 `Content-Length` 头，`ByteArray(contentLength)` 照着它分配：
+   一个 `Content-Length: 2147483647` 就是 2GB 分配，抛的是 **`OutOfMemoryError`（不是 `Exception`，
+   `catch (e: Exception)` 抓不到）**，直接杀进程。另 socket 无 `soTimeout`，而请求行/头是逐字节读的，
+   建连后慢慢发包即可永久占住一个连接线程（每连接一线程、无上限）。
+   修法：`MAX_BODY_BYTES = 8MB` 上界 + 超限回 **413**（不是让它冒泡成重置）、
+   `sock.soTimeout = 15_000`。
+
+6. **【中】模型名未校验即进入出站 JSON** —— `TraeUpstream.prepareBody`
+   `model` 来自**客户端请求体**，原先只做 trim 就写进 `config_name`/`model` 发往上游。
+   `"model":"a\" ,\"x\":\"…"` 这类值能篡改出站 JSON 结构，控制字符还会污染日志。
+   修法：按形状收紧 `^[A-Za-z0-9._-]{1,64}$`，不合法**回落默认模型**（不是报错，保持客户端可用）。
+   新增自检 10 条钉住该边界（含"注入型 model 必须真的变成默认模型"的真跑断言）。
+
+7. **【中】已在账号页时点「立即登录」界面无回音** —— `openLogin()` 原写
+   `if (currentPage != Page.ACCOUNT)`，于是用户**已经**停在账号页时点「立即登录」/「复制国服
+   登录链接」什么都不重建，页面继续显示点之前那份「未登录 / 加载中…」快照。
+   修法：无条件 `render(Page.ACCOUNT)`。
+
+8. **【低】生命周期卫生** —— 六处 `runOnUiThread` / `postDelayed` 均未查 `isFinishing`/`isDestroyed`：
+   刷新中途返回会在已销毁的 Activity 上弹 Toast；`openAutoItem` 会在用户已跳到系统设置页后
+   800ms 重建视图树。修法：回调开头加守卫（`contentHost` 未持有静态引用，故无泄漏，只是正确性）。
+
+### Added
+- **版权信息**（用户要求）：概览页页尾新增 SOFT 层级「版权信息」卡；「更多」页「版权与免责声明」卡
+  内用分隔线追加同样两行。作者 **玖念** / 联系邮箱 **2820184772@qq.com**，邮箱可点复制。
+  文案抽成 4 个常量两页共用；排版复用既有 `labelValue`（标签列 `minWidth 96dp`），
+  只给它扩了 `monoValue`（邮箱走等宽体）与 `decorate`（整行点击复制）两个可选参数 ——
+  **两页走同一个实现，不会走样**。模拟器实测：两页标签左边界均 x=1117、值均 x=1347，严格对齐。
+
+### Changed
+- **「更多」页删除「致谢」卡**（用户要求），连带删掉 `Page.MORE` 的副标题「说明与致谢」
+  → 改为「外观 · 说明 · 保活」（致谢没了之后原名不副实，正好对应该页现有三块内容）。
+- `MainActivity`：删两个**未使用** import（`android.content.Intent`、`android.view.ViewGroup`）。
+
+### Removed（清理无用文件）
+- 仓库根目录 3 张我自己的验证截图（`scr_*.png`）—— 属过程产物，且**放错位置**（根目录未 ignore）。
+  项目既有的 UI 截图约定位置是 `docs/ui-shots/`（已被 `.gitignore` 忽略）。
+- 构建中间产物目录（`.gradle/`、`app/build/`、`build/`、`out/`）经查**均已在 `.gitignore` 中**，
+  属正常忽略、**不是垃圾**，未动。
+
+### Discarded（子代理报告经核不成立，如实记录）
+- **"`fetchModels` 无 try/catch 会抛出来"**：已核 `TraeUpstream.fetchModels` **自带 try/catch**
+  （`catch (e: Exception)` 返回 null）。所以缺陷 2 的真实触发面比报告说的窄，
+  但 `runCatching` 仍是正确防御（未来改动可能引入新抛点），故保留。
+- **"`gzip` 未处理会导致 SSE 解析失败"**：请求未发 `Accept-Encoding`，OkHttp 因此不会自动加
+  gzip，也就不会收到压缩体 —— **当前不可达**。属防御缺口，未改。
+- **"`migrated` 非 volatile / `repairMislabeledRegions` 有竞争"**：`TraeAuthStore` 的所有写入口
+  （`save`/`switchTo`/`remove`）本就在 `synchronized` 内，且迁移在 `TraeAuthStore.load` 首次调用时
+  由主线程串行完成。**未证实可并发触发**，未改。
+
+### Verified（模拟器实测，非推断）
+- `assembleDebug --offline` + **`assembleRelease` 两套构建均通过**（release 带 R8 + resource shrink，
+  debug 走不到的代码路径，值得单独跑）。
+- 装机冷启：`logcat -b crash` **空**、`AndroidRuntime:E` **空** —— 10 个启动自检全过
+  （含本轮新增的 10 条模型名边界断言）。
+- **端到端**：点「启动服务」→ `/healthz` = `ok`、`/v1/models` = 合法空表；
+  无 key 请求 → **401**（鉴权生效）；**非法 model** 非流式请求 → 真的回落成
+  `DeepSeek-V4-Flash` 并拿到上游正常回答（`收到`）；合法模型流式 → 正常 `data:` 帧；
+  **9MB 请求体 → 413**（修复前是 OOM / 连接重置）。
+- 版权信息两页排版用 `uiautomator` bounds 逐项量过（见 Added）。
+
+### 仍未验证
+- 本轮生命周期修复（`isFinishing` 守卫、`onDestroy` 复位）**只能靠代码审**：要在"刷新中途
+  恰好 500ms 内销毁界面"的时序下才触发，模拟器上无法稳定复现。逻辑是显式早退，风险极低，
+  但如实标注**未经运行时实证**。
+- 上一轮遗留的 `actionable = true`（未签且可点）按钮外观，仍等次日签到前才能看到。
+
+---
+
+## [0.4.6] - 2026-10-10
+
+**`9074` 的真根因不是「限流」：是设备身份不独立；顺带查清了「权益额度」到底是什么。**
+`versionName` 0.4.5 → **0.4.6**、`versionCode` 9 → **10**。
+
+0.4.5 修掉了 `9004`（补 `X-Device-Id`），却把随之而来的 `9074` 判成"上游限流、客户端无解"——
+**同一类错误犯了第二次：又把一个业务码读成了状态。** 对照两个已跑通的参考实现后定位到真因。
+
+### 根因
+
+上游按**设备维度**限制签到。参考实现 `luckymiaow/trae-mate` 的 `src-tauri/src/trae_instance.rs:111`
+原话：**"多个账号共用同一设备 id 领取会被判『操作太过频繁』(code 9074)"**。
+
+本项目当时只发一个 `X-Device-Id`（且是 32 位 hex），**没有配套的 `X-Market-User-Id` /
+`Vscode-Sessionid`** → 上游无从区分设备，等价于"所有请求共用同一个设备身份" → `9074`。
+
+### 改了什么
+
+- `TraeUpstream.kt`
+  - `ug(token, url)` → `ug(token, url, uid)`，**头集合逐条对齐参考实现**
+    （`checkin.rs::build_headers`）：`User-Agent: VSCode 1.107.1 (TRAE SOLO CN)`、
+    `X-Market-Client-Id`、`X-Lgw-Req-Sdk-Type`、`Package-Type: stable_cn`、`X-Lscbd-Aid: 787976`、
+    `X-Lscbd-Platform: windows`、`App-Version: 0.1.45`、`X-Tt-Trace-Id`、`X-Request-Id`、
+    `Sec-Fetch-Dest/Mode/Site`。旧的 `Trae/<ver>` 那套全部去掉 —— 参考的是实测能签到的一套。
+  - 新增**从 uid 稳定派生**的三个设备标识（`deviceIdFor` 15 位数字 / `sessionIdFor` 64 位 hex /
+    `marketUserIdFor` UUID v4），算法对齐 `device_map.rs`（SHA-256 计数器流）。
+    **同一账号永远同一套（不漂移）、不同账号天然隔离（不互撞）。**
+  - 删除 `initDevice` / `deviceId` / `currentDeviceId` / SharedPreferences 持久化 ——
+    设备身份改成**纯函数**从 uid 算，不再读盘，也不会跨账号串号。
+  - `fetchUsage` / `fetchCheckin` / `claimCheckin` 均加 `uid` 参数。
+  - `selfCheck()` 加 6 条断言，**用参考实现的测试向量钉死派生结果**（逐位一致才放行）。
+- `TraeAuthApi.kt`：`buildLoginUrl()` 回退成每次随机 `hexStr(16)`（上一版"复用持久化设备号"的
+  改动基于已被证伪的假设，一并撤销）。
+- `MainActivity.kt`：删 `TraeUpstream.initDevice(this)`；调用点全部改传 `cred.uid`；
+  `9074` 文案由"上游限流（参与用户太多）"改为"上游判定操作过于频繁"（原解释是错的）。
+- `app/build.gradle.kts`：`buildToolsVersion = "36.0.0"`（本机只装了这个版本，否则 AGP 找不到 35.0.0）。
+
+### 验证
+
+- 派生算法：用 .NET SHA-256 独立复算，与 `device_map.rs` 的 Python 对标向量**逐位相同**
+  （`devid15 = 413174708280782`、`sess64 = fbabf7aa…76eae`）。
+- `selfCheck()` 在真机启动时全部通过（无 `AndroidRuntime:E`）。
+- 上游状态：修复后 status 返回 `checked_in=true`，UI 显示「今日已签到」且按钮置灰。
+
+### Known boundary
+
+`9074` 若在"重查后仍未签"时出现，说明这次真没领到（通常是同设备当天已领或撞车），
+由用户稍后再点；**不做自动重试**（简单重试只会徒增请求）。
+
+### 附：查清「权益额度(上限)」是什么，然后把它删了（用户提问，实测回答）
+
+之前 UI 写「权益额度(上限)」，但没人说得清它指什么，且与实际行为对不上
+（实测见过 8350 → 5100 —— 一个"上限"不该会掉）。dump 上游原始返回后确认：
+
+```
+usage_summary = { consumed_amount: 1931.46, consumption_ratio: 0.37871764705882355, total_amount: 5100 }
+user_entitlement_pack_list = [ { display_desc: "下载 TraeWork 桌面端奖励",
+                                 quota.credits_limit: 500, expire_time: 1792490544, ... }, ... ]
+```
+
+- **`total_amount` = 当前所有未过期积分包的 `credits_limit` 之和**，即**额度池总量**，
+  **不是固定上限** —— 会随积分包过期/新增而变（这就是 8350 → 5100 的原因）。
+- 交叉验证：`consumed_amount / total_amount` = 1931.46 / 5100 = **0.37871764705882355**，
+  与上游自己给的 `consumption_ratio` **逐位相同**，确认这两个字段就是"池内已用 / 池总量"。
+- **可用积分 = `total_amount − consumed_amount`** = 3168.54（UI 取整显示 3168）。
+- 每个包的明细在 `user_entitlement_pack_list[]`（`quota.credits_limit` + `expire_time`）。
+
+**结论：这个数对用户没用，删掉。** 它既不是"还能用多久"也不是"上限"，只是个会自己跳的
+池子总量；用户真正关心的"我还有多少能用"已经由可用积分回答了。所以：
+
+- `MainActivity.kt`：删掉「权益额度」指标块、`accountCap` 字段与两处赋值；
+  积分卡现在是「当前可用积分」(大号主数值) +「今日签到」两行，不再并排两块。
+- `TraeUpstream.fetchUsage`：返回值由 `Pair<Long, Long>`（池总量, 可用）**收窄为 `Long?`**
+  （只取可用积分），KDoc 保留这套实测语义，免得后人再把 `total_amount` 当成"上限度"。
+
+（排查用的临时 `USAGE_DIAG` 日志已删除，未进最终产物。）
+
+### 附：积分卡排版重做（用户："这 UI 你觉得好看吗"）
+
+旧版卡片把「标签 + 签到按钮 + 刷新」挤在同一行，后果是：
+
+1. **主次颠倒** —— 不可点的「今日已签到」和可点的「刷新」都是主色实心，只靠 `alpha 0.5`
+   区分，于是**点了没反应的砖块反而最抢眼**，真能点的刷新退到一边。
+2. **主数值被压住** —— 那一行被 48dp 高的按钮撑开，左边的「当前可用积分」小标签
+   孤零零缩在左上角，和数值 3168 断开。
+3. **信息重复** —— 按钮已经写「今日已签到」，下面指标块又写「已签 · +100/日」。
+
+重排为三段：
+
+```
+当前可用积分                              [刷新]
+3168
+[✓ 今日已签到]  每日可领 +100
+```
+
+- **刷新**：留在标签行右侧，次要操作。`linkAction` 默认左右内边距只有 14dp，「刷新」两字
+  撑出来仅 ~54dp、配 48dp 高就是个正圆，不像按钮 —— 加宽到 24dp 后随文字自适应成胶囊
+  （「刷新中…」也不会被截断）。
+- **签到三态三种外观**，颜色和尺寸一起表达语义，不再只靠一个 alpha：
+  可签 = 主色实心 48dp 按钮；已签 = **success 色 32dp 小 chip（带 ✓）**；其它 = 浅底灰字。
+- **签到控件从 `Button` 换成 `TextView` 自绘**：Material Button 的默认 style 自带
+  minHeight=48dp 与 inset 阴影，`minimumHeight` 压不下去（实测设了 32dp 出来还是 48dp 的砖），
+  换成 TextView + 自绘背景（与 `linkAction` / `chip` 同一套做法）高度才真正可控。
+- **奖励说明与状态解耦**：`checkinLabel()` → `checkinRewardLabel()`，只说「每日可领 +100」/
+  「该账号未开放签到」，不再重复按钮已经说过的签到状态。
+
+对齐已用 `uiautomator` 的 bounds 逐项核过（平板 3440 宽下）：
+左边界统一 1117、右边界统一 2323、已签 chip 与奖励文字垂直中心同为 1055 —— 无错位。
+`row` 容器本身是 `Gravity.CENTER_VERTICAL`，所以余下状态（未签 48dp 按钮 + 说明）同样居中。
+
+### 附：产物核验与死代码清理
+
+「权益额度」块删掉后，`metricOf()` 这个专门"小标签在上、数值在下并排展示两个指标"的 helper
+就再没有任何调用点了 —— 一并删除（它存在的唯一理由就是那个并排布局）。
+
+对 `out\TraeWork2API-0.4.6-debug.apk` 做了 dex 级核验（解包 `classes*.dex` 扫字符串）：
+
+| 项 | 结果 |
+|---|---|
+| `versionCode` / `versionName` | `10` / `0.4.6` |
+| `X-Device-Id` `X-Market-User-Id` `Vscode-Sessionid` | 均在 |
+| `deviceIdFor` `sessionIdFor` `marketUserIdFor` | 均在 |
+| `User-Agent: VSCode 1.107.1 (TRAE SOLO CN)` | 在 |
+| `checkinRewardLabel` / 「每日可领」/「该账号未开放签到」 | 均在 |
+| `metricOf` / `accountCap` /「权益额度」 | 已清除 |
+| `USAGE_DIAG` / `TEMP-DIAG` / `initDevice` / `currentDeviceId` | 已清除 |
+
+装机复测：启动无 `AndroidRuntime:E`、`selfCheck()` 全通过。
+
+⚠️ 核验中文时注意：dex 里的字符串是 **MUTF-8**，用 ASCII 读字节流会**假阴性**
+（「每日可领」第一次就被误判成"缺失"，改用 `UTF8.GetString` 后才对）。别被这个坑到。
+
+### 附：全量复核（用户要求"再全面检查一遍"）
+
+逐文件审了 diff、补了三处**契约级**断言、并做了**运行时实证**（不只看编译通过）：
+
+1. **派生格式契约**（新增自检）：之前只钉了"值"（与参考实现逐位一致），没钉"形状"。
+   上游其实是**按格式认**这三个标识的，格式错了等于没带。现在用真实 uid 形状的种子
+   （16 位 CN 号）断言：`x-device-id` 必须 15 位纯数字、`sessionid` 必须 64 位小写 hex、
+   `market` 必须是合法 UUID v4（第 13 位 = `4`、第 17 位 ∈ `89ab`、4 个连字符），
+   外加"三者互不相同""换 uid 后三者都必须变"（防某个 salt 忘了拼进种子）。
+
+2. **`uid` 不可能为空**：核过 `TraeAuthStore` 的读写两侧都卡了 `isNotBlank`
+   （读取 `takeIf { it.isNotBlank() } ?: return@mapNotNull null`），所以 `cred.uid` 不会空。
+   这点很关键 —— 若 uid 为空，`deviceIdFor("")` 会给所有账号派生**同一个**设备身份，
+   正好就是触发 9074 的成因。
+
+3. **运行时实证**：临时加诊断日志打印**实际发出的请求头**与响应（token 只打长度，不落值），
+   跑真实刷新后确认 —— 19 个头全部到位（`X-Device-Id` / `X-Market-User-Id` /
+   `Vscode-Sessionid` / `X-Lscbd-Aid` / `X-Tt-Trace-Id` / `X-Request-Id` 等），
+   `dev=398959912212659` 与 .NET 独立复算**完全一致**，两个接口均 `http=200`，
+   `status` 返回 `{"checked_in":true,"code":0,"credits":100,"did_checked_in":true,"enable":true}`。
+   **验完即删**，dex 级复扫确认 `UG_DIAG`/`USAGE_DIAG`/`TEMP-DIAG` 均已清除。
+
+4. **修掉一段过时注释**：`TraeAuthApi.buildLoginUrl()` 的 KDoc 还写着"device_id 复用
+   `TraeUpstream` 持久化的那个……"，而代码早已回退成随机 `hexStr(16)`，且
+   `initDevice`/`currentDeviceId` 都已删除 —— 注释引用的是不存在的机制，纯误导。
+   改为说清"登录参数（随机，此时还没有 uid）"与"ug 的设备身份（从 uid 派生）"是两件事。
+
+5. 顺带清掉删块后失去调用点的 `metricOf()`。
+
+**仍未验证的唯一路径**：`actionable = true`（未签且可点）时的按钮外观。今天账号已签，
+真机上跑不到那个分支；代码路径已审（主色实心 + `on_primary` 字 + 48dp ≥ 无障碍 48dp 下限），
+但要等明天签到前才能看到实际效果。
+
+---
+
+## [0.4.5] - 2026-09-26
+
+**找到「签到根本签不上」的真根因：`ug()` 从不发 `X-Device-Id`。**
+`versionName` 0.4.4 → **0.4.5**、`versionCode` 8 → **9**。
+
+### 决定性实测（真账号 + 模拟器，逐项对照）
+
+| 请求 | HTTP | 返回 |
+|---|---|---|
+| claim **不带** `X-Device-Id`（空体、`req_source` 都一样） | 200 | `{"code":9004,"message":"The submitted order parameters are incorrect..."}` |
+| claim **带上** `X-Device-Id` | 200 | `{"code":9074,"message":"当前参与用户太多，请稍后再试"}` |
+| claim 带 `X-Device-Id`，10 秒内连试 5 次 | 200 | **5 次全为 `9074`** |
+| status（带/不带设备头） | 200 | 均为 `{"checked_in":false,...,"enable":true}` |
+
+**结论：`9004` 是「设备头缺失 → 参数校验失败」，不是「今日已签到」。**
+
+### 为什么这个 bug 活了这么久
+
+旧注释写着"body 用 `{}` 还是 `{"req_source":1}`、带不带设备头，**返回一字不差**"，据此
+**决定不加设备头**。但那次的对照实验是在**账号恰好已签**的状态下做的 —— 三种请求确实都返回
+`9004`（一字不差），于是 `9004` 被读成了"已签"，两个错误互相印证：
+
+- 因为当它是"已签"，就不觉得缺参数，于是**不补设备头**；
+- 因为不补设备头，claim 永远卡在参数校验（9004），**永远签不上**；
+- 而 UI 把 9004 映射成「今日已签到」→ **"没签到却提示签到成功"**。
+
+参考实现说的"空体会被拒成 `9074`"之所以对不上，是因为**它带了设备头**，才能进到业务层；
+本项目当时连参数校验都没过。**两份证据其实是同一个真相的两半。**
+
+### Fixed
+- **`TraeUpstream.initDevice(context)`（新增）**：启动时读回/首次生成**稳定**的设备号并持久化
+  （key `trae_device_id`）。不能每次随机 —— 签到是风控敏感操作，设备号漂移更易被限流。
+- **`ug()` 补发 `X-Device-Id` + `X-Machine-Id`**：值为空时**不发该头**（不伪造值去试探上游）。
+- **`TraeAuthApi.buildLoginUrl()`**：device_id 改为**复用**上面那个持久化值，
+  使登录与后续 ug/claim 用**同一个**设备（原先每次随机、用完即弃）。
+- **`MainActivity`**：`onCreate` 里调 `TraeUpstream.initDevice(this)`（必须在任何 ug 请求之前）；
+  新增 `9074` 的专用文案「签到失败：上游限流（参与用户太多），请稍后再试」。
+
+### Verified
+- 模拟器实机端到端：修复前点签到 → `9004`；修复后同一点击 → **`9074`**（跃迁即设备头生效的铁证）。
+- `device id 就绪（len=32）` 出现在启动日志；`AndroidRuntime:E` 为空（自检全过、无崩溃）；
+  toast 与卡片状态**一致**（不再自相矛盾）。
+- 临时诊断代码（`CR_DIAG`）已整段删除，日志中不再出现。
+
+### Known boundary（未解决，且不在客户端可控范围）
+- **补上设备头后仍返回 `9074`「参与用户太多」**：这是上游**服务端限流**。
+  实测间隔 3 分钟、10 秒内 5 次连试**全部失败**，简单重试无效，故**不做重试**
+  （徒增请求；由用户稍后再点）。**签到功能当前在高峰时段仍然签不上，但错误原因已如实呈现。**
+- **`9074` 与"设备号是否与登录时一致"无关 —— 已证伪（2026-09-26 复测）**：
+  统一登录设备号并**重新登录**（新 token，UID 与到期时间均刷新）后复测，
+  claim **仍返回 `9074`**「当前参与用户太多」。故限流是上游服务端的确定性行为，
+  与客户端设备号、请求体内容、重试频率**均无关**。
+  设备号一致仍是**正确语义**（该修复保留），但它**不是**限流的成因。
+
+---
+
+## [0.4.4] - 2026-09-26
+
+**修掉「没签到却提示签到成功」的两个入口 + 切号串状态的缓存 bug。**
+`versionName` 0.4.3 → **0.4.4**、`versionCode` 7 → **8**。
+
+### 症状与根因（用户截图：toast「今日已签到」+ 卡片「未签」+ 按钮仍可点）
+
+同一张卡上自相矛盾。根因是**判据与显示读了两个不同数据源**：
+
+- **入口一：拿 `claim` 的业务 `code` 当成功判据。** 旧 `claimCheckin()` 写的是
+  `when (code) { 0 -> "签到成功"; 9004 -> "今日已签到" }`。而 `ug()` **只在 HTTP 非 2xx /
+  解析失败时返回 null** —— 上游在业务被拒时习惯性返回 **HTTP 200 + 业务体**
+  （对照 reference `client.go` 的 `doJSON`：只有 `>=400` 才算错）。于是被拒也带着 `code`
+  回来 → 报成功。`code=9004`（"今天已签过"）也被直接说成「今日已签到」，
+  而卡片/按钮读的是 `status.checked_in`，重查失败或未更新时仍是「未签」→ 矛盾。
+- **入口二：切号不清缓存。** `accountBalance/accountCap/accountCheckin` 是"当前账号"的
+  快照，但切号 / 删号 / 粘贴登录三处只换 token，不清这三个字段 → 新账号直接继承
+  上一个账号的 `checkedIn=true`，即"明明没签到却显示今日已签到"的第二个入口。
+
+### Fixed
+- **`TraeUpstream.checkinSucceeded(before, after, code)`（新增）**：成功判据改为
+  **合取** —— `code==0` **且** 状态从未签跃迁到已签。两个单一判据都会被骗：
+  只看 `code` 会被"业务拒绝 + 200"骗；只看状态跃迁会在**本地状态陈旧**时
+  （卡片显示"未签"、其实今天早已签过）把 `code=9004` 的"发现已签"误报成
+  "刚签到成功"——而积分并不会变。合取后 `9004` 正确归到「今日已签到」。
+- **`MainActivity.claimCheckin()` 重写**：`before` 显式取快照；状态未知时
+  **先补查一次 `status` 再决定发不发 claim**（旧守卫 `accountCheckin?.enable == false`
+  在 null 时求值为 `null == false` = false，**守卫被静默绕过**）；失败文案区分
+  「签到未生效（code=N），今日未签到」与「网络不通」。
+- **`invalidateAccountQuota()`（新增）**：切号 / 删号 / 登录成功三处统一清缓存。
+- **`refreshCheckinButton()`**：可用性判据收成一条显式 null 检查，不再用
+  `x?.f != false`（读起来像守卫、实际只在非 null 时生效，且依赖末尾 `!= null` 兜底）。
+- **`refreshQuota()`**：拉失败时**保留旧值**（`?:`），不再把已显示的积分/签到擦回「—」。
+- **账号页自动加载门**：判据由「三个字段都为 null」改为只看 `accountCheckin == null`。
+  旧写法只要余额先回填成功就整体跳过 → 签到状态可能一直是 null。
+- **`checkinActionLabel(loggedIn)` / `checkinLabel()` 文案**：已登录但未拉到状态时
+  显示「加载中…」而非误称「未登录」；未开放账号显式显示「未开放」而非「未签」。
+
+### Verified
+- 把判据逐字抽出、用工程同款 Kotlin 2.2.20 编译成 JVM 程序实跑，**24 项断言全通过**：
+  含"旧版在 `code=9004` + 重查未跟进时确实矛盾"**复现截图**、
+  含"中间版本（只看状态跃迁）在缓存陈旧时确实误报'签到成功'"的**证伪**。
+- 断言已并入 `TraeUpstream.selfCheck()`（随 App 启动跑）。
+
+### Known boundary
+- 上游若在 claim 成功后 `status` 仍返回 `checked_in=false`（接口延迟），
+  合取判据会报「签到未生效（code=0）」而非"成功"。**宁可不报喜，不假报成功**；
+  用户点「刷新」可复查。未做轮询重试（不引入没要求的复杂度）。
 
 ---
 

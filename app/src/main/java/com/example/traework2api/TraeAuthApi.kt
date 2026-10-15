@@ -86,10 +86,18 @@ object TraeAuthApi {
         return cred
     }
 
-    /** 构造登录指引 URL。machine/device id 每次生成，兼容上游 cookie/设备绑定。 */
+    /**
+     * 构造登录指引 URL。`device`/`machine` 每次生成，兼容上游 cookie/设备绑定。
+     *
+     * ⚠️ **别把它跟 ug 接口那三个设备标识**（[TraeUpstream.deviceIdFor] /
+     * [TraeUpstream.sessionIdFor] / [TraeUpstream.marketUserIdFor]）**混为一谈**：
+     * 那三个是从 uid 派生、签到时必须配套携带的身份，而这里是**登录**参数 ——
+     * 登录时压根还没有 uid，也就无从派生，只能随机。
+     * 曾经试图让两者复用同一个值（把两件事搞混），已回退。
+     */
     fun buildLoginUrl(): String {
-        val machine = hexStr(16)
         val device = hexStr(16)
+        val machine = hexStr(16)
         val params = linkedMapOf(
             "login_version" to "1",
             "auth_from" to "solo",
@@ -158,8 +166,15 @@ object TraeAuthApi {
         val expiresAt: Long?,       // unix 秒；null=未返回有效期
     )
 
-    /** refresh token 换 access token（refreshToken 轮换）。网络/结构错误抛异常。 */
-    fun exchangeToken(refreshToken: String): ExchangeResult {
+    /**
+     * refresh token 换 access token（refreshToken 轮换）。网络/结构错误抛异常。
+     *
+     * [region] 缺省沿用全局（旧路径不变）；批量签到按**账号自己的区域**显式传入，
+     * 不为换 token 去翻改 [TraeRegion.current] 全局状态。
+     */
+    fun exchangeToken(refreshToken: String, region: TraeRegion = TraeRegion.current): ExchangeResult {
+        val OAUTH_HOST = region.oauthHost
+        val CLIENT_ID = region.clientId
         val body = JSONObject()
             .put("ClientID", CLIENT_ID)
             .put("RefreshToken", refreshToken)

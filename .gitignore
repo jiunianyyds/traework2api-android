@@ -28,3 +28,7 @@ docs/ui-shots/
 
 # 打包产物（build-apk.ps1 产出，APK 是编译结果，不该进版本库）
 out/
+
+# 其他 AI 工具的本地记忆目录（含个人上下文，不入库）
+.workbuddy/
+

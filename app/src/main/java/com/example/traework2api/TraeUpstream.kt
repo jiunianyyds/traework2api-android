@@ -27,6 +27,12 @@ object TraeUpstream {
     private const val TAG = "TraeUpstream"
 
     // host 随区域变化，统一从 TraeRegion 取（见该文件；国内版为已实测值）。
+    //
+    // ⚠️ **不要在长流程里反复读这些 getter**：`TraeRegion.current` 会被 UI 线程改写
+    // （切账号 → `syncRegionToActiveAccount`、复制登录链接 → `TraeRegion.set`），
+    // 而本文件的方法跑在服务连接线程上、单次请求可长达 180s。中途翻面 = 一次 CN 分支
+    // 的请求把 CN token 发往 SG host（区域串号，见 [chatStream] 的快照写法）。
+    // 规则：**每个对外方法入口快照一次区域，之后全程用局部值**。
     private val region: TraeRegion get() = TraeRegion.current
     private val AGENT_HOST: String get() = region.agentHost
     private val UG_HOST: String get() = region.ugHost
@@ -60,6 +66,9 @@ object TraeUpstream {
      * 想用更强的模型由客户端在请求里显式指定，不在这里替用户决定。
      */
     const val DEFAULT_MODE = "DeepSeek-V4-Flash"
+
+    /** 合法模型 id 形状（上游 `config_name` 就是这套字符集，含 `o4-mini` 这类名字）。 */
+    private val MODEL_ID_RE = Regex("^[A-Za-z0-9._-]{1,64}$")
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(20, TimeUnit.SECONDS)
@@ -98,6 +107,14 @@ object TraeUpstream {
 
         var model = raw.optString("model", "").trim()
         if (model.isEmpty()) model = DEFAULT_MODE
+        // **模型名是信任边界**：它来自客户端请求体，会被原样写进 `config_name`/`model` 后
+        // POST 到上游。不校验的话，`"model":"a\" ,\"x\":\"…"` 这类值能直接篡改出站 JSON 结构，
+        // 控制字符还能污染日志。上游模型名本来就是 `[A-Za-z0-9._-]` 形状（见 ModelsRepo 的 id），
+        // 所以按形状收紧，不合法就直接回落默认模型而不是把垃圾发出去。
+        if (!MODEL_ID_RE.matches(model)) {
+            android.util.Log.w(TAG, "模型名非法，回落默认: ${model.take(40)}")
+            model = DEFAULT_MODE
+        }
         raw.put("config_name", model)
         raw.put("model", model)
 
@@ -146,8 +163,13 @@ object TraeUpstream {
         if (out.length() == 0) obj.remove("tools") else obj.put("tools", out)
     }
 
-    /** SOLO 请求头（chat / fetchModels 共用；token 只进内存，不落盘日志）。 */
-    private fun Builder.solo(token: String, stream: Boolean, uid: String = ""): Builder {
+    /**
+     * SOLO 请求头（chat / fetchModels 共用；token 只进内存，不落盘日志）。
+     *
+     * [region] 必须由调用方**在入口快照好再传进来**，不能在这里读全局 —— 见文件头
+     * 关于 `region` getter 的说明（长流程中途翻面会把 token 发到错误区域）。
+     */
+    private fun Builder.solo(token: String, stream: Boolean, uid: String = "", region: TraeRegion = TraeRegion.current): Builder {
         if (stream) header("Accept", "text/event-stream") else header("Accept", "application/json")
         val b = header("Content-Type", "application/json")
             .header("User-Agent", "Trae/$IDE_VERSION")
@@ -170,15 +192,34 @@ object TraeUpstream {
             .header("Request-Traffic-Type", "prod")
     }
 
-    /** ug 接口 headers + 出参 JSON；token 只进内存。非 2xx/解析失败/区域未配置返回 null。 */
-    private fun ug(token: String, url: String): JSONObject? {
+    /** ug 接口（usage / checkin status / claim）headers + 出参 JSON；token 只进内存。
+     *
+     * 头集合逐条对齐参考实现 `luckymiaow/trae-mate`（`checkin.rs::build_headers`，
+     * 源头 `inlayin/trae-check` + `device_proxy`）—— 那是**实测能签到成功**的一套。
+     * 关键：三个配套设备标识都必须带，缺任一个上游仍判为"共用设备"→ 9074。
+     */
+    private fun ug(token: String, url: String, uid: String, region: TraeRegion = TraeRegion.current): JSONObject? {
         val b = Request.Builder().url(url)
             .post("{}".toRequestBody("application/json".toMediaType()))
-            .header("Accept", "application/json")
-            .header("User-Agent", "Trae/$IDE_VERSION")
             .header("Authorization", "Cloud-IDE-JWT $token")
-        // X-User-Region 随区域变化；SG 未实测时为空 → 不发该头
-        if (region.userRegionHeader.isNotBlank()) b.header("X-User-Region", region.userRegionHeader)
+            .header("Accept", "*/*")
+            .header("Content-Type", "application/json")
+            .header("User-Agent", "VSCode 1.107.1 (TRAE SOLO CN)")
+            .header("X-Market-Client-Id", "VSCode 1.107.1")
+            .header("X-Market-User-Id", marketUserIdFor(uid))
+            .header("X-Device-Id", deviceIdFor(uid))
+            .header("Vscode-Sessionid", sessionIdFor(uid))
+            .header("X-Lgw-Req-Sdk-Type", "3")
+            .header("Package-Type", "stable_cn")
+            .header("X-Lscbd-Aid", "787976")
+            .header("X-Lscbd-Platform", "windows")
+            .header("App-Version", "0.1.45")
+            .header("X-Tt-Trace-Id", "00-" + uuidNoDash().substring(0, 16) + "-01")
+            .header("X-Request-Id", java.util.UUID.randomUUID().toString())
+            .header("Sec-Fetch-Dest", "empty")
+            .header("Sec-Fetch-Mode", "no-cors")
+            .header("Sec-Fetch-Site", "none")
+            .header("X-User-Region", region.userRegionHeader.ifBlank { "CN" })
         val req = b.build()
         return try {
             client.newCall(req).execute().use { r ->
@@ -187,15 +228,77 @@ object TraeUpstream {
         } catch (_: Exception) { null }
     }
 
-    /** 权益额度上限 + 当前可用积分。来源于 ide_user_ent_usage.usage_summary：
-     * 额度(上限)=total_amount；可用=total_amount-consumed_amount。失败/区域未配置返回 null。 */
-    fun fetchUsage(tok: String): Pair<Long, Long>? {
-        if (!region.canQueryQuota) return null
-        val sum = ug(tok, UG_HOST + EP_ENT_USAGE)?.optJSONObject("usage_summary") ?: return null
+    private fun uuidNoDash(): String = java.util.UUID.randomUUID().toString().replace("-", "")
+
+    // ===== 设备身份：从 uid 稳定派生（对齐 device_proxy / device_map.rs 算法）=====
+    //
+    // 上游按**设备维度**限制签到（同一设备每天只能领一次）。多个账号共用同一设备 id
+    // 会被判「操作太过频繁」(code 9074) —— 参考项目 trae_instance.rs:111 原话。
+    // 所以每个账号必须有**自己的、稳定的**设备身份：以 uid 为种子确定性派生，
+    // 同一账号永远得到同一套（不漂移），不同账号天然隔离（不互撞）。
+
+    /** 确定性字节流：反复取 SHA-256(salt:seed || 计数器大端4字节)，直到够长。 */
+    private fun seededStream(seed: String, salt: String, nbytes: Int): ByteArray {
+        val data = "$salt:$seed".toByteArray(Charsets.UTF_8)
+        val out = java.io.ByteArrayOutputStream()
+        var i = 0
+        while (out.size() < nbytes) {
+            val md = java.security.MessageDigest.getInstance("SHA-256")
+            md.update(data)
+            md.update(byteArrayOf(
+                (i ushr 24).toByte(), (i ushr 16).toByte(), (i ushr 8).toByte(), i.toByte()
+            ))
+            out.write(md.digest())
+            i++
+        }
+        return out.toByteArray().copyOf(nbytes)
+    }
+
+    /** `x-device-id`：15 位纯数字（**不是** hex —— 格式错了上游不认这套设备身份）。 */
+    internal fun deviceIdFor(uid: String): String {
+        val bs = seededStream(uid, "devid", 16)
+        val sb = StringBuilder(15)
+        for (i in 0 until 15) sb.append(((bs[i].toInt() and 0xFF) % 10).toString())
+        return sb.toString()
+    }
+
+    /** `vscode-sessionid`：64 位 hex。 */
+    internal fun sessionIdFor(uid: String): String {
+        val bs = seededStream(uid, "sess", 32)
+        val sb = StringBuilder(64)
+        for (b in bs) sb.append(String.format("%02x", b.toInt() and 0xFF))
+        return sb.toString().substring(0, 64)
+    }
+
+    /** `x-market-user-id`：标准 UUID v4（确定性派生，修正 version/variant 位）。 */
+    internal fun marketUserIdFor(uid: String): String {
+        val bs = seededStream(uid, "market", 16)
+        bs[6] = ((bs[6].toInt() and 0x0F) or 0x40).toByte()
+        bs[8] = ((bs[8].toInt() and 0x3F) or 0x80).toByte()
+        val hex = StringBuilder(32)
+        for (b in bs) hex.append(String.format("%02x", b.toInt() and 0xFF))
+        val h = hex.toString()
+        return h.substring(0, 8) + "-" + h.substring(8, 12) + "-" + h.substring(12, 16) + "-" +
+            h.substring(16, 20) + "-" + h.substring(20, 32)
+    }
+
+    /** 当前可用积分。来源于 ide_user_ent_usage.usage_summary。失败/区域未配置返回 null。
+     *
+     * 可用 = `total_amount − consumed_amount`（实测 5100 − 1931.46 = 3168.54，UI 取整 3168）。
+     *
+     * 实测（2026-10-10 dump 过原始返回）：`total_amount` 是**当前所有未过期积分包的
+     * `credits_limit` 之和**，即"额度池总量"——**不是固定上限**，会随积分包过期/新增而变
+     * （见过 8350 → 5100），所以它不适合当"当前可用"以外的对外指标，已不再展示。
+     * 校验：`consumed_amount / total_amount` 与上游给的 `consumption_ratio` 逐位吻合
+     * （1931.46 / 5100 = 0.37871764705882355），确认这两个字段就是"池内已用 / 池总量"。
+     */
+    fun fetchUsage(tok: String, uid: String, region: TraeRegion = TraeRegion.current): Long? {
+        val reg = region   // 批量签到按账号传区域；单账号调用不传=沿用全局（旧路径不变）
+        if (!reg.canQueryQuota) return null
+        val sum = ug(tok, reg.ugHost + EP_ENT_USAGE, uid, reg)?.optJSONObject("usage_summary") ?: return null
         val total = sum.optDouble("total_amount", -1.0)
         if (total < 0) return null
-        val consumed = sum.optDouble("consumed_amount", 0.0)
-        return (total.toLong()) to (total - consumed).toLong()
+        return (total - sum.optDouble("consumed_amount", 0.0)).toLong()
     }
 
     /**
@@ -211,30 +314,58 @@ object TraeUpstream {
      */
     data class CheckinStatus(val checkedIn: Boolean, val credits: Long, val enable: Boolean)
 
-    fun fetchCheckin(tok: String): CheckinStatus? {
-        if (!region.canQueryQuota) return null
-        val root = ug(tok, UG_HOST + EP_CHECKIN_STATUS) ?: return null
+    fun fetchCheckin(tok: String, uid: String, region: TraeRegion = TraeRegion.current): CheckinStatus? {
+        val reg = region   // 同 fetchUsage：批量按账号传，缺省沿用全局
+        if (!reg.canQueryQuota) return null
+        val root = ug(tok, reg.ugHost + EP_CHECKIN_STATUS, uid, reg) ?: return null
         return parseCheckin(root)
     }
 
     /**
      * 执行签到（`checkin_credits/claim`）。返回业务 code，网络失败返回 null。
      *
-     * ⚠️ **实测（2026-09-25，真账号，今天已签状态下试发）**：返回
-     * `{"code":9004,"message":"The submitted order parameters are incorrect..."}` ——
-     * 注意**不是** GitHub `L0NE-6/Trae-AutoCheckin` 里写的 `9095`，那份参考在这里对不上。
-     * 上游 message 是英文且很含糊，**不要直接展示给用户**，由调用方映射成人话。
+     * ⚠️ **这里曾连着错两次，两次都是"把一个业务码读成了状态"**，别再退回旧写法：
      *
-     * ⚠️ 同样实测：body 用 `{}` 还是 `{"req_source":1}`、带不带设备头，**返回一字不差** ——
-     * 参考实现说的"空体会被拒成 9074"在本账号上不成立，所以**不额外加设备头/设备号**。
+     * 1. 最初 `9004 -> "今日已签到"`。实测（2026-09-26）证明 `9004` 是
+     *    **缺设备头 → 参数校验失败**（`The submitted order parameters are incorrect`），
+     *    不是"已签"——那正是"没签到却提示签到成功"的源头。
+     * 2. 上一版补了 `X-Device-Id` 后仍回 `9074`，便下结论"上游限流、客户端无解"。
+     *    **也错了**。`9074`（"操作太过频繁"）的真正成因是**设备身份不独立**：
+     *    上游按**设备维度**限制领取，只发一个设备 id（尤其格式不对时）会被判成
+     *    "多个账号共用同一设备" → 9074。参考实现 `luckymiaow/trae-mate` 的
+     *    `trae_instance.rs:111` 原话："多个账号共用同一设备 id 领取会被判
+     *    操作太过频繁(code 9074)"。修法是补齐 [deviceIdFor] / [sessionIdFor] /
+     *    [marketUserIdFor] 三个**配套**标识（缺一不可）。
      *
      * ⚠️ 幂等性：重复领取**不会**扣积分或改坏状态（已复测 `checked_in`/`credits` 不变），
-     * 但会产生一次无谓请求 —— UI 仍应在 `checkedIn=true` 时禁止点击。
+     * 但会产生无谓请求 —— UI 仍应在 `checkedIn=true` 时禁止点击。
+     *
+     * ⚠️ `code` **不能单独当成功判据**：`ug()` 只在 HTTP 非 2xx / 解析失败时返回 null，
+     * 而上游业务失败时也回 **HTTP 200 + 业务体**，所以被拒也可能带 `code` 回来。
+     * 成功与否由 [checkinSucceeded]（"成功码 AND 状态跃迁"的合取）判定，`code` 只用于文案。
      */
-    fun claimCheckin(tok: String): Int? {
-        if (!region.canQueryQuota) return null
-        return ug(tok, UG_HOST + EP_CLAIM)?.optInt("code", -1)
+    fun claimCheckin(tok: String, uid: String, region: TraeRegion = TraeRegion.current): Int? {
+        val reg = region   // 同 fetchUsage：批量按账号传，缺省沿用全局
+        if (!reg.canQueryQuota) return null
+        return ug(tok, reg.ugHost + EP_CLAIM, uid, reg)?.optInt("code", -1)
     }
+
+    /**
+     * 本次签到是否**真的**刚签上。判据是**合取**：成功码 + 状态跃迁，两者缺一不可。
+     *
+     * - 只看 `code`：会被"HTTP 200 + 业务拒绝"骗 —— `ug()` 只在非 2xx 返回 null。
+     * - 只看状态跃迁：本地状态陈旧时（卡片显示"未签"、其实今天早已签过）会误报
+     *   —— `code=9004` 是"今天已签过"，不是"这次签上了"，而积分也不会变。
+     *
+     * 合取之后 `code=9004` 不再被算成本次成功，由调用方走 `after.checkedIn` 分支
+     * 正确归到「今日已签到」。这才是"没签到就不许说成功"的完整实现。
+     *
+     * - 查不到状态（[after] 为 null）一律判**未成功**：宁可不报喜，也不能重演误报。
+     * - 计划前就已签（[before] 已 true）不算本次成功。
+     * - [code] 为 null（网络失败）或 `-1`（字段缺失）都不算成功。
+     */
+    internal fun checkinSucceeded(before: CheckinStatus?, after: CheckinStatus?, code: Int?): Boolean =
+        code == 0 && after != null && after.checkedIn && before?.checkedIn != true
 
     /**
      * 把上游 status 的 JSON 解析成 [CheckinStatus]。
@@ -258,7 +389,8 @@ object TraeUpstream {
      */
     fun fetchModels(tok: String, uid: String = ""): JSONArray? {
         // 区域分派交给调用方判断？不 —— 表也走同一个 SOLO 端点，只有 CN 实测过。
-        if (!region.canQueryQuota) return null
+        val reg = TraeRegion.current   // 快照：见文件头 region 说明
+        if (!reg.canQueryQuota) return null
         val body = JSONObject()
             .put("function", FUNCTION)
             .put("config_names", JSONObject.NULL)
@@ -268,9 +400,9 @@ object TraeUpstream {
             .put("mode_type", JSONObject.NULL)
             .put("agent_type", JSONObject.NULL)
         val req = Request.Builder()
-            .url(AGENT_HOST + EP_MODELS)
+            .url(reg.agentHost + EP_MODELS)
             .post(body.toString().toRequestBody("application/json".toMediaType()))
-            .solo(tok, stream = false, uid = uid)
+            .solo(tok, stream = false, uid = uid, region = reg)
             .build()
         return try {
             client.newCall(req).execute().use { r ->
@@ -373,6 +505,39 @@ object TraeUpstream {
      * 每个 check 对应一个真实踩过/差点踩到的坑。
      */
     fun selfCheck() {
+        // 设备身份派生必须与参考实现（trae-mate `device_map.rs` 的 Python 对标向量）**逐位一致**：
+        // 派生错了设备身份就不独立，领取会被判"共用设备"→ 9074。改派生逻辑必先过这里。
+        check(deviceIdFor("1234567890123456") == "413174708280782") { "自检失败：device_id 派生不符" }
+        check(sessionIdFor("1234567890123456") ==
+            "fbabf7aa1e173b90385c623e1ec49157860cc07a4b01f53f7ca141b17d876eae") { "自检失败：sessionid 派生不符" }
+        check(marketUserIdFor("1234567890123456") == "746608f9-7f37-4960-b4c7-8553cec6d366") {
+            "自检失败：market uuid 派生不符"
+        }
+        check(deviceIdFor("9876543210") == "630512735296035") { "自检失败：device_id 派生不符(第二组)" }
+        // 同 uid 必须稳定（不漂移）、不同 uid 必须隔离（不互撞）—— 这是"设备身份独立"的全部要求
+        check(deviceIdFor("a") == deviceIdFor("a")) { "自检失败：同 uid 派生必须稳定" }
+        check(deviceIdFor("a") != deviceIdFor("b")) { "自检失败：不同 uid 必须派生不同设备" }
+
+        // **格式契约**：上游是按格式认这三个标识的，格式错了就等于没带（会被判"共用设备"→9074）。
+        // 上面钉的是"值"，这里钉"形状"，两者都要 —— 换实现方式时值可能不变而形状会变。
+        // 用一个真实 uid 形状的种子（16 位 CN 号）验证，别用 "a"/"b" 这类短种子蒙混过去。
+        run {
+            val real = "3695871032827027"
+            val dev = deviceIdFor(real)
+            val sess = sessionIdFor(real)
+            val mkt = marketUserIdFor(real)
+            check(dev.length == 15 && dev.all { it.isDigit() }) { "自检失败：device_id 必须是 15 位纯数字" }
+            check(sess.length == 64 && sess.all { it in "0123456789abcdef" }) { "自检失败：sessionid 必须是 64 位小写 hex" }
+            check(mkt.length == 36 && mkt[14] == '4' && mkt[19] in "89ab" &&
+                mkt.count { it == '-' } == 4) { "自检失败：market id 必须是合法 UUID v4" }
+            // 三个标识之间也必须互不相同（同一 uid 派生出三份一样的就算串了）
+            check(dev != sess && sess != mkt && dev != mkt) { "自检失败：三个设备标识不许互相相同" }
+            // 换一个 uid 后三个都要变（防"某个 salt 忘了拼进种子"这类错误）
+            val other = "7687189514112844821"
+            check(deviceIdFor(other) != dev && sessionIdFor(other) != sess &&
+                marketUserIdFor(other) != mkt) { "自检失败：换 uid 后三个标识都必须变" }
+        }
+
         /** 造一条上游条目：[src]=config_source、[invisible]/[custom] 是上游自己的标记。 */
         fun entry(id: String, name: String = "", src: Int = 1, invisible: Boolean = false,
                   custom: Boolean = false, ctx: Long = 0L, withDc: Boolean = true): JSONObject {
@@ -449,6 +614,32 @@ object TraeUpstream {
         // 字段缺失不许崩（上游加字段/少字段都要活）
         val empty = parseCheckin(JSONObject("{}"))
         check(!empty.checkedIn && !empty.enable && empty.credits == 0L) { "自检失败：字段缺失应回落而非抛异常" }
+
+        // 签到成功的判据是「成功码 AND 状态跃迁」的**合取**，两个方向都要钉住：
+        // 只会 code → 被"HTTP 200 + 业务拒绝"骗；只看跃迁 → 把 code=9004 的
+        // "今天早已签过"误报成"这次签上了"（积分并不会变，这就是误报的残留形态）
+        check(checkinSucceeded(fresh, real, 0)) { "自检失败：成功码+未签→已签应判成功" }
+        check(!checkinSucceeded(fresh, fresh, 0)) { "自检失败：状态没变不许报成功（误报根因）" }
+        check(!checkinSucceeded(fresh, real, 9004)) { "自检失败：9004 是已签过，不算本次刚签上" }
+        check(!checkinSucceeded(fresh, real, null)) { "自检失败：网络失败不许报成功" }
+        check(!checkinSucceeded(fresh, real, -1)) { "自检失败：码缺失（-1）不许报成功" }
+        check(!checkinSucceeded(real, real, 0)) { "自检失败：本来就已签不算本次成功" }
+        check(!checkinSucceeded(null, null, 0)) { "自检失败：查不到状态不许报成功" }
+        check(!checkinSucceeded(fresh, null, 0)) { "自检失败：重查失败不许报成功" }
+
+        // 模型名信任边界：合法名原样透传，非法名（JSON 注入/控制字符/超长/空）回落默认。
+        // 这钉的是"客户端不能靠 model 字段篡改出站 JSON"。
+        check(MODEL_ID_RE.matches("DeepSeek-V4-Flash")) { "自检失败：正常模型名被判非法" }
+        check(MODEL_ID_RE.matches("glm-5.3")) { "自检失败：带点的模型名被判非法" }
+        check(MODEL_ID_RE.matches("o4-mini")) { "自检失败：带连字符的模型名被判非法" }
+        check(!MODEL_ID_RE.matches("a\",\"x\":\"1")) { "自检失败：注入型 model 必须被拒" }
+        check(!MODEL_ID_RE.matches("a\nb")) { "自检失败：含换行的 model 必须被拒" }
+        check(!MODEL_ID_RE.matches("")) { "自检失败：空 model 必须被拒（走默认回落）" }
+        check(!MODEL_ID_RE.matches("a".repeat(65))) { "自检失败：超长 model 必须被拒" }
+        // 真跑一遍查表路径：非法名必须真的变成默认模型，而不只是正则判负。
+        val ghost = prepareBody(JSONObject().put("model", "bad\"name").put("messages", JSONArray()))
+        check(ghost.getString("config_name") == DEFAULT_MODE) { "自检失败：非法 model 未回落到默认" }
+        check(ghost.getString("model") == DEFAULT_MODE) { "自检失败：非法 model 未同步回落到默认" }
     }
 
     /**
@@ -457,17 +648,22 @@ object TraeUpstream {
      * 上游 HTTP 出错时也通过 [out] 输出 error 事件 + [DONE]。
      */
     fun chatStream(prepared: JSONObject, traeToken: String, uid: String = "", out: (String) -> Unit, onResult: (JSONObject?, String?) -> Unit) {
+        // **区域只在此处快照一次**，后续 host/header/协议分支全部用局部值。
+        // 不这么做的话：:614 判定与 :619 取 host 是两次独立读取，中间夹着可达 180s 的
+        // 流式窗口；用户在此期间切账号就会让 `current` 翻面 —— 一次已按 CN 协议发出的请求
+        // 会把 CN 的 token 发到 SG host，属**账号区域串号**，不只是显示问题。
+        val reg = TraeRegion.current
         // 区域分派：两个区域都已支持聊天，但协议完全不同 ——
         //   CN：单次 POST llm_utils_chat
         //   SG：建会话 → commit → 订阅 events 三段式（见 TraeIntlUpstream）
-        if (TraeRegion.current != TraeRegion.CN) {
+        if (reg != TraeRegion.CN) {
             TraeIntlUpstream.chatStream(prepared, traeToken, uid, out, onResult)
             return
         }
         val req = Request.Builder()
-            .url(AGENT_HOST + EP_CHAT)
+            .url(reg.agentHost + EP_CHAT)
             .post(prepared.toString().toRequestBody("application/json".toMediaType()))
-            .solo(traeToken, stream = true, uid = uid)
+            .solo(traeToken, stream = true, uid = uid, region = reg)
             .build()
 
         client.newCall(req).execute().use { resp ->
