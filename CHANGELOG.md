@@ -8,6 +8,79 @@ UI 规范看 `docs/UI现状清单.md`，本文件只是改动流水。（原引�
 
 ---
 
+## [0.4.12] - 2026-10-14
+
+**新增多账号批量签到与每日定时签到；概览页服务地址改为带 `/v1` 并给出局域网地址。**
+`versionName` 0.4.11 → **0.4.12**、`versionCode` 15 → **16**。
+
+### Added
+
+1. **一键签到全部账号**（`BatchCheckin.kt`）——账号页「批量签到」卡：
+   遍历**全部已保存的国服账号**逐个签到（不是只签当前使用的那个），单线程 + 账号间 800ms 间隔。
+   每账号流程照抄单账号路径的纪律：先查 `status`，未签且 `enable` 才发 claim，
+   成功判据仍是 `checkinSucceeded`（成功码 ∧ 状态跃迁）的合取。
+   结果持久化到独立 prefs（`traework2api_checkin`），账号页逐行显示「✓ 签到成功 +N / 今日已签到 /
+   未开放签到 / 失败：原因 / 该区域未支持签到」。国际服账号**跳过**（签到协议未实测），
+   不硬打上游。
+2. **每日定时签到**（`CheckinReceiver.kt` + manifest 声明）——账号页「每日定时签到」卡，
+   **默认关闭**，用户手动开启并可选时刻（默认 08:00）。到点用 `setExactAndAllowWhileIdle`
+   唤醒独立 `BroadcastReceiver`（`goAsync` + 自持 2 分钟 `PARTIAL_WAKE_LOCK`），
+   在后台线程跑同一套批量编排。
+   **为什么不复用 `GatewayService` 的服务 intent**：其 `onStartCommand` 对非
+   `STOP`/`WATCHDOG` intent 会无条件 `markShouldRun(true)`，会把用户手动停掉的网关
+   悄悄复活（v0.4.8 踩过同类坑）；且 Android 12+ 从闹钟拉前台服务受后台启动限制。
+3. **签到成功通知**——定时/补签路径签到成功时发一条通知（独立渠道「签到结果」，
+   只对「真的新签上」发，「今日已签到」不弹，避免每天白响）。手动路径不发（用户就在屏幕前）。
+4. **进 App 自动补签**——定时开关开着时，每次打开 App 会：自愈重挂闹钟（重启/被 ROM 清掉的
+   闹钟在这里恢复）+ 当天没跑过或上轮有失败则补跑一轮。补签以**上游 status 为事实源**，
+   天然幂等；当天已全部签上则不重复打上游。
+5. **概览页局域网地址行**——除本机 `http://127.0.0.1:8787/v1` 外，自动检测并显示
+   `http://<本机局域网IP>:8787/v1`，供**同一 WiFi 下的其它设备**填写（API Key 不变）。
+   检测用 `NetworkInterface` 遍历（无权限），不用 `WifiManager.getConnectionInfo`
+   （API 31+ 需定位权限）。
+
+### Changed
+
+- **服务地址补上 `/v1`**：概览页两行地址与复制按钮都给完整 Base URL。旧版复制的是裸地址
+  `http://127.0.0.1:8787`，粘进客户端后拼接路径会错——这是实测踩过的坑。
+- `TraeUpstream.fetchCheckin` / `claimCheckin` / `fetchUsage`、`TraeAuthApi.exchangeToken`
+  新增 `region` 参数（缺省 `TraeRegion.current`，**旧调用路径行为不变**）：
+  批量签到按**每个账号自己的区域**显式传参，不必为了换 token 翻改全局区域。
+- `TraeAuthStore.updateTokens()`（新增）：只更新指定账号的 token，**不碰活跃账号**。
+  批量给非当前账号续期若走 `save()`，用户的当前账号会被偷偷切走。
+- 定时签到卡与批量签到卡都写明「签到范围 = 全部国服账号，不只当前使用的那个」。
+
+### Fixed
+
+- **【中】批量续期会与网关续期并发** —— `refresh token` 是**轮换**的，同一账号被两条路径
+  并发续期时先换到的会被作废（`Gateway.kt` 的 credProvider 注释即此纪律）。
+  `BatchCheckin.runAll` 改为全程持 `Gateway.locked`。
+- **【中】续期后索引 `expiresAt` 不同步** —— 到期时间存在账号索引（元数据）里，
+  只写 token 密文会让下次批量又按陈旧时间"续期"一次，白耗一个轮换 refresh token。
+  已补 `updateMeta`。
+- **【低】`lanAddress()` 只认 site-local** —— DHCP 失败时手机自分配的 `169.254.x.x`
+  同一链路其实可连，却被过滤掉导致整行隐藏（用户会以为功能坏了）。已放行 link-local。
+- **【低】IPv4 的 `hostAddress` 可能带 `%wlan0` scope 后缀**，拼进 URL 就是废地址。已剥离。
+- 手动「一键签到」不再误发通知（设计上手动路径只 toast）。
+
+### Verified（模拟器 API 31 实测）
+
+- 启动自检全过（`BatchCheckin.selfCheck()` 钉住时刻解析/结果 JSON 往返/补签去重判据/
+  `expiredWithin` 边界），冷启无崩溃。
+- 账号页两张新卡渲染正常；实点「一键签到全部账号」→ 已签账号正确归「今日已签到」，
+  结果落盘（prefs 内容已核对）。
+- 打开定时开关 → `dumpsys alarm` 确认挂上 `RTC_WAKEUP … CHECKIN_ALARM`，
+  `origWhen` 为次日 08:00、`exactAllowReason=permission`。
+- `am force-stop` 后重开 → 闹钟自愈重挂成功，且当天已全签**不重复打上游**（去重生效）。
+- 概览页 `curl` 实测：回环 `127.0.0.1:8787/healthz` 与局域网 `10.0.2.15:8787/healthz`
+  **均 200**，`/v1/models` 能拉到模型表（证明显示的两个地址都可用）。
+- 产物 `out/TraeWork2API-0.4.12-debug.apk`，1773748 字节（1.69 MB），
+  SHA256 `02151E594A59230DC5B22F90027EA581F4620246DAB4A193283F2E306D807FCD`。
+- ⚠️ **「一键签到全部账号」的真机多账号验证待补**（用户定时签到已自测通过，
+  一键签到次日验证）；若发现问题在本条目下追加 Fixed。
+
+---
+
 ## [0.4.11] - 2026-10-12
 
 **全面复查 v0.4.10 的改动，修掉 2 处问题（其中 1 处是 v0.4.10 自己引入的）。**
