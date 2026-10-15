@@ -42,6 +42,13 @@
         <!-- 保活服务。stopWithTask=false：用户划掉最近任务时不随任务栈一起销毁。
              specialUse 类型：本服务不属于 dataSync 等既有类别（API 35+ 的 dataSync 还有 6 小时上限），
              且本项目是自装自用、不上架，用 specialUse 语义最准。 -->
+        <!-- 每日定时签到的闹钟接收器。
+             刻意是独立 receiver 而非 GatewayService 的服务 intent：
+             后者 onStartCommand 对非 WATCHDOG/STOP intent 无条件 markShouldRun(true)，
+             会把用户手动停掉的网关复活；且 Android 12+ 从闹钟拉前台服务受限。 -->
+        <receiver
+            android:name=".CheckinReceiver"
+            android:exported="false" />
         <service
             android:name=".GatewayService"
             android:exported="false"
