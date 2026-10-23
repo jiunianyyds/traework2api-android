@@ -8,6 +8,112 @@ UI 规范看 `docs/UI现状清单.md`，本文件只是改动流水。（原引�
 
 ---
 
+## [0.4.14] - 2026-10-23
+
+**账号备份改成多选：导出前勾选要带走的账号，导入前先看预览再勾。去掉剪贴板入口。**
+`versionName` 0.4.13 → **0.4.14**、`versionCode` 17 → **18**。
+
+### Changed
+
+1. **删掉「复制 JSON」与「从剪贴板导入」**（`MainActivity.exportToClipboard` / `importFromClipboard`）。
+   理由：剪贴板是跨 App 可读的，里面是明文 token；且一段几千字符的文本在聊天工具里容易截断/转义。
+   换设备只有一个可靠载体：文件。
+
+2. **导出改成先勾选账号**（`promptExportAccounts` → `promptPickAccounts`）：
+   每行 = 勾选框 + 昵称 + `UID · 区域 · 到期` + 区域胶囊；顶部「已选 N 个」+ 全选/清空。
+   **1 个账号也弹**（行为一致比省一次点击重要）。一个都没选时按「导出」不关窗，
+   计数行变警告色「已选 0 个 · 至少选 1 个」（`confirmDialog` 新增 `okGuard`）。
+
+3. **文件名带账号数**：`traework2api-{N}accounts-yyyyMMdd-HHmm.json`。
+   N 取**文件里的真实条数**（`TraeAuthStore.countAccounts`），不是勾选个数 ——
+   解不开 token 的账号会被 `exportJson` 跳过，写错数字会让导入端汇总对不上。
+
+4. **导入改成先预览再勾选**（`promptImportPreview`）：
+   选完文件先列「文件里 N 个：新增 A，更新 B，跳过 C」，每行标状态胶囊并说明原因
+   （新增="新账号 · 到期X"、更新="覆盖本地 · 旧→新"、跳过="本地凭据更新，已跳过"）。
+   **「跳过」项不可勾**：它会被合并规则再判一次跳过，让用户"明确要求导入却什么都没发生"是最差的体验。
+   全是跳过时不弹选择框，改弹说明框并告诉用户想强导该怎么操作。
+
+### Added
+
+- `TraeAuthStore.exportJson(context, uids)` —— 支持导出子集（默认全量，老调用点零改动）；
+  子集里不含当前账号时 `activeUid` 写空串，不写出一个文件里不存在的号。
+- `TraeAuthStore.previewImport(context, json): List<ImportPreview>` —— 只读索引，不加密不写盘，UI 线程可调。
+- `TraeAuthStore.ImportStatus{ADD,UPDATE,SKIP}` + `decideImportStatus()` ——
+  **预览与导入共用同一份合并判据**，避免"预览说会更新、导入却跳过"。
+- `TraeAuthStore.importJson(context, json, onlyUids)` —— 只导入勾选的账号；
+  被用户取消勾选的**不计入 skipped**（skipped 的语义是"合并规则跳过"）。
+- `MainActivity` 自绘多选弹窗（`promptPickAccounts` / `pickRow` / `paintCheckBox`）：
+  无 androidx 依赖，勾选框走 AppStyle 取色；列表限高滚动（否则按钮被长列表顶出屏幕）；
+  点一行只重绘该行与计数行，不 `render()`（那会把整页滚回页首）。
+
+### Fixed
+
+- `confirmDialog` 的确定按钮「先 dismiss 再 onOk」，导致"一个都没选"无法拦截 —— 新增 `okGuard`。
+- `pendingExportJson` 与新的 `pendingExportNote` 成对管理（`clearPendingExport`）：
+  取消 SAF、`startActivityForResult` 抛异常、Activity 重建三条路径都会清干净，不会挂到下一次导出。
+
+### 已知限制
+
+- 不做"N 个文件分别导出"（一个文件装 N 个账号，换机只传一次）。
+- 没有"强制覆盖"开关：本地凭据更新时跳过是保护；想强导就先在账号页删掉那个号。
+
+---
+
+## [0.4.13] - 2026-10-23
+
+**新增积分监测（低于阈值自动换号）与账号 JSON 导入导出。**
+`versionName` 0.4.12 → **0.4.13**、`versionCode` 16 → **17**。
+
+### Added
+
+1. **积分监测 · 自动换号**（新增 `CreditMonitor.kt`）——账号页「积分监测 · 自动换号」卡：
+   网关服务运行中每 30 秒查一次当前账号剩余积分；`余额 ≤ 阈值` 时在其它国服账号里找余额
+   最高的一个，切过去（`setActive` + `syncRegionToActiveAccount`）。阈值可填任意非负整数
+   （默认 5，0 = 用完才切），总开关默认开。
+
+   三个实现要点：
+
+   - **锁边界**：`Gateway.locked{}` 内绝不发网络请求。`LocalFakeServer` 在写出任何响应字节
+     之前同步调 `credProvider`，而它整个包在 `tokenLock` 里 —— 持锁做一次 `fetchUsage`
+     （最坏 200s）等于所有 `/v1/chat/completions` 零字节挂死。tick 拆成
+     「锁内只读本地 → 锁外续期 → 锁外查余额」，唯一进锁的网络是 token 真过期时的续期。
+   - **余额未知 ≠ 0**：`fetchUsage` 在任何失败路径都返回 null。把它当 0 会让一次网络抖动
+     把好好的账号切走。缓存只存成功值 + 时间戳，超过 60 秒的值不参与决策。
+   - **与 failover 不打架**：被自动切走的账号进 10 分钟冷却（`isDemoted`），
+     `failoverProvider` 选人时跳过、`failoverRollback` 不回滚到它 —— 否则会出现
+     「monitor 切走 → 请求失败 → rollback 切回 → 30 秒后又切走」的死循环。
+
+2. **账号导出 / 导入（JSON）**（`TraeAuthStore.exportJson/importJson` + 账号页「账号备份」卡）：
+   导出全部账号为单个 JSON（`复制 JSON` / `导出为文件`），换设备后在新机导入即可，不用重新登录。
+
+   - **为什么是明文 token**：现有密文由 AndroidKeyStore 加密，主密钥绑死本机，搬到别的设备
+     解不开。导出内容等价于账号钥匙，所以只走本地文件 / 剪贴板，不联网、不写日志；剪贴板标了
+     `IS_SENSITIVE`，Android 13+ 不在浮层里预览。
+   - **导入是事务**：先全解析 + 全加密，最后一次 `commit()` 落盘。中途失败 prefs 一个字节都不写，
+     不会留下「索引里有、token 没有」的废号。
+   - **按 uid 合并，不整表替换**：同 uid 且本地那条还明确没过期、并且比文件里的更新时**跳过** ——
+     refresh token 是轮换的，用旧备份覆盖等于把还能用的凭据换成死值。
+   - 走 SAF（`ACTION_CREATE_DOCUMENT` / `ACTION_OPEN_DOCUMENT`），**不需要任何存储权限**，
+     也不需要 FileProvider。写文件用 `"wt"` 模式：默认 `"w"` 不截断，覆盖更短内容会残留旧字节。
+
+### Changed
+
+1. `TraeAuthApi.expiredWithin` 由 private 提为 internal（监测器要按同一判据决定是否先续期）。
+2. `TraeAuthStore.migrated` 加 `@Volatile`：新增的后台线程与 UI 线程并发首读时迁移会跑两遍，
+   而它是整表覆盖 `trae_accounts`。
+3. `Gateway.failoverProvider` 候选过滤冷却账号 + `failoverRollback` 跳过冷却账号。
+4. 账号页在「积分与用量」与「批量签到」之间插入两张卡（积分监测、账号备份）。
+
+### 已知限制
+
+1. 只有一个账号时无法换号，只记日志。
+2. 30 秒窗口内仍可能撞上余额耗尽，此时靠既有的 401/429/5xx failover 兜底。
+3. 上游「额度耗尽」的真实业务码未实测，**没有**加进 `retryableUpstreamError` 白名单。
+4. 其它账号的余额只在触发换号扫描时刷新，平时状态行只显示当前账号。
+
+---
+
 ## [0.4.12] - 2026-10-14
 
 **新增多账号批量签到与每日定时签到；概览页服务地址改为带 `/v1` 并给出局域网地址。**

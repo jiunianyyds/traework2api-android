@@ -193,6 +193,237 @@ object TraeAuthStore {
     }
 
     // ------------------------------------------------------------------
+    // 导出 / 导入（JSON 明文，换设备一键登录用）
+    // ------------------------------------------------------------------
+
+    /** 导出文件的格式标识，导入时用来确认"这是本 App 导出的账号表"。 */
+    const val EXPORT_FORMAT = "traework2api-accounts"
+
+    /** uid 会被直接拼进 prefs key（`trae_acc_<uid>_access`），必须收窄成纯数字。 */
+    private val UID_PATTERN = Regex("^\\d{5,25}$")
+
+    /**
+     * 把选中的账号导出成 JSON 字符串。⚠️ 含**明文** access / refresh token。
+     *
+     * 为什么只能是明文：token 平时用 AndroidKeyStore（AES-GCM）加密落盘，而 KeyStore
+     * 主密钥**绑死这台设备** —— 导出的密文换机后根本解不开。要"换设备不用重新登录"，
+     * 导出的就只能是明文，导入方再用自己设备的 KeyStore 重新加密。
+     * 因此导出内容等价于账号钥匙：只走本地文件，不联网、不写日志。
+     *
+     * 结构：
+     * `{format, version, exportedAt, activeUid, accounts:[{uid,nickname,region,expiresAt,accessToken,refreshToken}]}`
+     *
+     * @param uids 只导出这些 uid（null = 全部）。解不开 token 的账号**仍会跳过**，
+     *   所以文件里的实际条数可能少于 `uids.size` —— 用来起文件名时请用 [countAccounts]。
+     */
+    fun exportJson(context: Context, uids: Set<String>? = null): String {
+        val arr = JSONArray()
+        for (m in list(context).filter { uids == null || it.uid in uids }) {
+            // 解不开的账号跳过，不导出半个条目（否则导入端只会得到一个空 token 的废号）
+            val cred = loadByUid(context, m.uid) ?: continue
+            arr.put(JSONObject()
+                .put("uid", cred.uid)
+                .put("nickname", cred.nickname)
+                .put("region", cred.regionId)
+                .put("expiresAt", cred.expiresAt)
+                .put("accessToken", cred.accessToken)
+                .put("refreshToken", cred.refreshToken))
+        }
+        // 只导子集时，当前账号很可能不在里面 —— 别写出一个文件里根本不存在的 activeUid
+        val active = activeUid(context).orEmpty()
+        return JSONObject()
+            .put("format", EXPORT_FORMAT)
+            .put("version", 1)
+            .put("exportedAt", System.currentTimeMillis() / 1000)
+            .put("activeUid", if (uids == null || active in uids) active else "")
+            .put("accounts", arr)
+            .toString(2)
+    }
+
+    /**
+     * [json] 里实际有几个账号。
+     *
+     * 文件名要写真实条数而不是用户勾了几个：[exportJson] 会把解不开 token 的账号静默跳过，
+     * 勾了 3 个只写出 2 条的文件如果叫 "3accounts"，导入端汇总数对不上，用户会以为文件坏了。
+     */
+    fun countAccounts(json: String): Int =
+        runCatching { JSONObject(json).optJSONArray("accounts")?.length() ?: 0 }.getOrDefault(0)
+
+    /** 导入结果，UI 原样报给用户（"新增 1，更新 2，跳过 1"）。 */
+    data class ImportReport(val added: Int, val updated: Int, val skipped: Int) {
+        val total: Int get() = added + updated
+    }
+
+    /** 导入时单个账号会走哪条路。 */
+    enum class ImportStatus { ADD, UPDATE, SKIP }
+
+    /**
+     * 导入预览的一行。UI 只读它，**不自己重算合并规则**（规则在 [decideImportStatus]）。
+     */
+    data class ImportPreview(
+        val uid: String,
+        val nickname: String,
+        val regionId: String,
+        val status: ImportStatus,
+        val fileExpiresAt: Long,  // unix 秒；0=未知
+        val localExpiresAt: Long, // unix 秒；0=本地没有这个账号
+    )
+
+    /**
+     * 合并规则的**唯一**判据 —— [importJson] 与 [previewImport] 都走它。
+     *
+     * 规则一旦分成两份，就会出现"预览说会更新、导入却跳过"，而用户完全没有办法判断哪个是对的。
+     *
+     * refresh token 是轮换的：本地那条明确没过期、而且比文件里的新时跳过，
+     * 因为用旧备份覆盖等于把一个还能用的凭据换成死值（这个方向错一次就得重新扫码登录）。
+     * 反过来本地那条已过期/未知（`expiresAt=0`）时照常覆盖 —— 它反正也用不了了。
+     */
+    internal fun decideImportStatus(old: AccountMeta?, fileExpiresAt: Long, nowSec: Long): ImportStatus =
+        when {
+            old != null && old.expiresAt > nowSec && old.expiresAt >= fileExpiresAt -> ImportStatus.SKIP
+            old != null -> ImportStatus.UPDATE
+            else -> ImportStatus.ADD
+        }
+
+    /**
+     * 解析 + 校验（纯内存，任何非法条目跳过，不中断整批）。
+     *
+     * 抽出来给 [importJson] / [previewImport] 共用：两边解析口径分叉的话，
+     * 预览答应"新增 2 个"、导入只进来 1 个，用户会以为丢账号。
+     *
+     * 这里**不读本地索引、不加密、不写盘**。
+     *
+     * @return 原始根对象（还要取 activeUid）+ uid→Cred（保持文件里的顺序）
+     * @throws IllegalArgumentException 不是 JSON / 没有 accounts 数组 / 没有可导入条目
+     */
+    private fun parseAccounts(json: String): Pair<JSONObject, LinkedHashMap<String, Cred>> {
+        val root = try {
+            JSONObject(json)
+        } catch (_: Exception) {
+            // 兼容"顶层直接是数组"的裸格式
+            val arr = try {
+                JSONArray(json)
+            } catch (_: Exception) {
+                throw IllegalArgumentException("不是有效的账号 JSON")
+            }
+            JSONObject().put("accounts", arr)
+        }
+        val accounts = root.optJSONArray("accounts")
+            ?: throw IllegalArgumentException("JSON 里没有 accounts 数组")
+
+        val parsed = LinkedHashMap<String, Cred>()
+        for (i in 0 until accounts.length()) {
+            val o = accounts.optJSONObject(i) ?: continue
+            val uid = o.optString("uid", "").trim()
+            if (!uid.matches(UID_PATTERN)) continue
+            val access = o.optString("accessToken", "")
+            if (access.isBlank()) continue
+            parsed[uid] = Cred(
+                accessToken = access,
+                refreshToken = o.optString("refreshToken", ""),
+                expiresAt = o.optLong("expiresAt", 0L),
+                uid = uid,
+                nickname = o.optString("nickname", ""),
+                // region 一律按 uid 长度重算，不采信文件（见 importJson 的历史注释）
+                regionId = inferRegionFromUid(uid).id,
+            )
+        }
+        if (parsed.isEmpty()) {
+            throw IllegalArgumentException("JSON 里没有可导入的账号（缺 uid 或 accessToken）")
+        }
+        return root to parsed
+    }
+
+    /** 给文件中每条账号打标。只读索引，不碰 KeyStore —— UI 线程直接调。 */
+    private fun classify(context: Context, parsed: Map<String, Cred>): List<ImportPreview> {
+        val nowSec = System.currentTimeMillis() / 1000
+        val local = readIndex(context).associateBy { it.uid }
+        return parsed.values.map { cred ->
+            val old = local[cred.uid]
+            ImportPreview(
+                uid = cred.uid,
+                nickname = cred.nickname,
+                regionId = cred.regionId,
+                status = decideImportStatus(old, cred.expiresAt, nowSec),
+                fileExpiresAt = cred.expiresAt,
+                localExpiresAt = old?.expiresAt ?: 0L,
+            )
+        }
+    }
+
+    /**
+     * 预览 [importJson] 会发生什么：不加密、不写盘、不改任何状态。
+     * 用于导入前的确认弹窗（用户能看到"新增几个、跳过几个"，而不是导完才知道）。
+     *
+     * @throws IllegalArgumentException JSON 非法或没有可导入的条目
+     */
+    fun previewImport(context: Context, json: String): List<ImportPreview> =
+        classify(context, parseAccounts(json).second)
+
+    /**
+     * 导入 [exportJson] 那种 JSON，按 uid **合并**（不做整表替换）。
+     *
+     * 事务纪律：**先全解析 + 全加密，最后一次 commit**。中途加密失败时 prefs 一个字节都不写 ——
+     * 否则会留下"索引里有、token 没有"的账号（[loadByUid] 返回 null，既用不了也删不掉）。
+     *
+     * 合并规则见 [decideImportStatus]（与预览共用同一份判据）。
+     * region 一律用 [inferRegionFromUid] 重算：`fromId` 对未知值静默回落 CN，
+     * 而 [list] 每次都会按 uid 长度修补区域，采信文件只会造成前后不一致。
+     *
+     * @param onlyUids 只导入这些 uid（null = 文件里的全部）。**被剔除的账号不计入 skipped** ——
+     *   skipped 的语义是"合并规则跳过了"，把用户没勾的算进去，"新增+更新+跳过"就和文件条数对不上了。
+     * @throws IllegalArgumentException JSON 非法或没有可导入的条目
+     */
+    fun importJson(context: Context, json: String, onlyUids: Set<String>? = null): ImportReport {
+        val (root, all) = parseAccounts(json)
+        val parsed = if (onlyUids == null) all else
+            LinkedHashMap(all.filterKeys { it in onlyUids })
+        if (parsed.isEmpty()) return ImportReport(0, 0, 0)
+
+        // 分类 + **先把密文全部算出来**（encrypt 会抛，抛了此时还什么都没写）
+        var added = 0
+        var updated = 0
+        var skipped = 0
+        val toWrite = mutableListOf<Pair<Cred, Pair<String, String>>>()
+        for (p in classify(context, parsed)) {
+            when (p.status) {
+                ImportStatus.SKIP -> {
+                    skipped++
+                    continue
+                }
+                ImportStatus.ADD -> added++
+                ImportStatus.UPDATE -> updated++
+            }
+            val cred = parsed.getValue(p.uid)
+            toWrite += cred to (encrypt(cred.accessToken) to encrypt(cred.refreshToken))
+        }
+
+        // 一次性落盘：全部密文 + 合并后的索引 + 当前账号
+        val merged = readIndex(context).toMutableList()
+        for ((cred, _) in toWrite) {
+            val i = merged.indexOfFirst { it.uid == cred.uid }
+            if (i >= 0) merged[i] = cred.toMeta() else merged.add(cred.toMeta())
+        }
+        // 一条都没写时别顺手改活跃账号：选的全是"跳过"、或用户取消了全部勾选
+        val wantedActive = if (toWrite.isEmpty()) null else
+            root.optString("activeUid", "").takeIf { it.isNotBlank() }
+                ?.takeIf { uid -> merged.any { it.uid == uid } }
+        val editor = prefs(context).edit()
+        for ((cred, enc) in toWrite) {
+            editor.putString(accessKey(cred.uid), enc.first)
+            editor.putString(refreshKey(cred.uid), enc.second)
+        }
+        editor.putString(KEY_INDEX, toJson(merged).toString())
+        wantedActive?.let { editor.putString(KEY_ACTIVE, it) }
+        // commit 而不是 apply：用户点完就期待结果，必须拿到确定的成败
+        if (!editor.commit()) throw IllegalStateException("写入失败（存储空间不足？）")
+
+        // 区域跟上。不 sync 的话 trae_region 还停在导入前的值，转发会拿新号 token 打旧 host
+        syncRegionToActiveAccount(context)
+        return ImportReport(added, updated, skipped)
+    }
+
+    // ------------------------------------------------------------------
     // 索引读写
     // ------------------------------------------------------------------
 
@@ -241,6 +472,11 @@ object TraeAuthStore {
     // 旧版单账号 → 多账号 迁移
     // ------------------------------------------------------------------
 
+    /**
+     * @Volatile：新增的 CreditMonitor 会在后台线程调 [list]，与 UI 线程并发的
+     * "首读判定未迁移" 会让 [migrateLegacyIfNeeded] 跑两遍，而它是**整表覆盖** KEY_INDEX。
+     */
+    @Volatile
     private var migrated = false
 
     /**
@@ -400,6 +636,28 @@ object TraeAuthStore {
         val cn2 = AccountMeta("3695871032827028", "cn2", TraeRegion.CN.id, 0L)
         check(pickFailoverCandidate(listOf(cn, cn2, sg), cn.uid) == cn2) {
             "自检失败：有另一个国服账号时应优先换它，而不是国际服"
+        }
+
+        // 导入合并规则（decideImportStatus）是**预览与导入共用**的判据：
+        // 判错的方向不对称 —— 把"本地更新"判成覆盖，会把一个还能用的 refresh token 换成死值；
+        // 把"本地已过期"判成跳过，用户导了却什么都没发生。
+        val nowSec = 1_000L
+        val fresh = AccountMeta("3695871032827027", "local-new", TraeRegion.CN.id, nowSec + 100)
+        val stale = AccountMeta("3695871032827028", "local-old", TraeRegion.CN.id, nowSec - 100)
+        check(decideImportStatus(null, nowSec + 50, nowSec) == ImportStatus.ADD) {
+            "自检失败：本地没有该账号应判新增"
+        }
+        check(decideImportStatus(fresh, nowSec + 50, nowSec) == ImportStatus.SKIP) {
+            "自检失败：本地凭据更新且未过期应判跳过"
+        }
+        check(decideImportStatus(fresh, nowSec + 200, nowSec) == ImportStatus.UPDATE) {
+            "自检失败：文件里的凭据更新时应判覆盖"
+        }
+        check(decideImportStatus(stale, nowSec + 50, nowSec) == ImportStatus.UPDATE) {
+            "自检失败：本地凭据已过期时应判覆盖（旧备份不能把能用的号换死，但过期的必须能覆盖）"
+        }
+        check(decideImportStatus(stale, 0L, nowSec) == ImportStatus.UPDATE) {
+            "自检失败：本地已过期时，文件里到期未知也应覆盖"
         }
     }
 }

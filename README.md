@@ -4,7 +4,7 @@
 > 纯原生 Android 实现（Kotlin），**无需 Python、无需 Docker、无需电脑**——装到手机上就能跑。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Release](https://img.shields.io/badge/version-0.4.9-green.svg)](CHANGELOG.md)
+[![Release](https://img.shields.io/badge/version-0.4.14-green.svg)](CHANGELOG.md)
 
 ---
 
@@ -41,6 +41,10 @@
 - **Token 自动续期**：refresh token 轮换续期，长期使用不需要反复登录
 - **签到与积分**：一键签到**全部账号**（逐个签，不只当前那个）；可开每日定时签到（默认关，
   到点自动签，没跑成则下次打开 App 自动补签，成功有通知）；积分与用量按模型统计
+- **积分监测 · 自动换号**：服务运行中每 30 秒查当前账号剩余积分，低于你设的阈值就自动切到
+  余额最多的另一个账号（阈值可填任意数字，总开关默认开）
+- **账号备份**：全部账号导出成一个 JSON（**导出前可勾选**带哪几个），换设备后在新机导入即可，
+  不用重新登录；导入会先列「新增 / 更新 / 跳过」再让你确认，不会覆盖本机更新过的凭据
 - **模型表**：从上游拉真实模型清单，本地持久化，重启不丢，客户端随时可拉
 - **保活**：前台服务 + 常驻通知 + 唤醒锁 + 看门狗闹钟 + 划掉任务自动拉回；有保活体检面板
 - **省心**：打开 App 自动启动服务（手动停止过则尊重你的选择）；改了亮暗主题与多配色风格
@@ -48,7 +52,8 @@
 
 ## 快速开始（30 秒版）
 
-1. 安装 `out/` 目录最新的 apk，打开 App；
+1. 打开 **[Releases 下载页](https://github.com/jiunianyyds/traework2api-android/releases/latest)**
+   （点开直接是当前最新版），下载 `TraeWork2API-x.y.z-debug.apk`，装到手机并打开；
 2. 「账号」页 → 复制国服登录链接 → 浏览器登录 Trae → 把回调链接粘回 App；
 3. 回「概览」页确认服务显示「运行中」（通常已自动启动）；
 4. 把 `http://127.0.0.1:8787/v1`（同机客户端）或概览页显示的局域网地址
