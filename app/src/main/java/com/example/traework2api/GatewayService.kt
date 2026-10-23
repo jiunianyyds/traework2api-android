@@ -32,16 +32,20 @@ import android.util.Log
  * **第二层：国产 ROM（ColorOS / MIUI / EMUI）适配** —— 这层才是真机上的命门。
  * 厂商的省电策略会**无视 START_STICKY 直接强杀**前台服务，所以必须有补偿：
  *  5. `onTaskRemoved` —— 从最近任务划掉时立刻拉回；被后台启动限制拦住就挂精确闹钟兜底
- *  6. **AlarmManager 看门狗**（15 分钟）—— 只有 `setExactAndAllowWhileIdle` 能在 Doze 下
- *     把进程叫醒。用 15 分钟间隔：更密会被 ColorOS 判定异常唤醒而拦截，反而更不可靠
+ *  6. **看门狗** —— 已按 WorkBuddy 的结构**外置**为独立广播接收器 [KeepAliveWatchdog]：
+ *     15 分钟一次精确闹钟唤醒它，由它判断"该不该拉起前台服务"。判断不再写在服务里，
+ *     服务被杀也照样有人判断（原先 `PendingIntent.getService` 把判断塞进服务，
+ *     服务不在就等于没人判断）。间隔 15 分钟：更密会被 ColorOS 判异常唤醒而拦截。
+ *     8. 悬浮窗（[OverlayKeepAlive]）—— 有可见窗口的进程优先级更高，点一下即可复活
+ *     9. 开机自启（[BootReceiver]，可选、默认关）
  *  7. `should_run` **持久化用户意图** —— 区分"用户主动关了"和"被系统杀了"，
  *     否则会出现"我都关了它怎么又自己开了"
  *
  * 另有**界面侧**的两项（不在本文件）：电池优化白名单引导、保活状态自检面板。
  * 电池优化白名单是厂商白名单机制的正门，比前面所有技术手段都管用。
  *
- * ⚠️ 刻意**不做开机自启**：用户明确要求"重启手机后必须自己重新打开 App 手动开"。
- * 因此 manifest 里**没有** `RECEIVE_BOOT_COMPLETED` / BootReceiver —— 别"顺手加上"。
+ * 开机自启是**可选开关**（默认关），实现在 [BootReceiver]：默认保持"重启后自己开一次"
+ * 的原行为，用户在保活页显式打开才会在开机时拉起。
  *
  * 0.4.8 更新：用户意图语义变了 —— "进入 App 就默认开启，除非手动停止过"。
  * shouldRun 默认值仍为 false，但 MainActivity 的 autoStartServiceIfWanted 用
@@ -57,15 +61,6 @@ class GatewayService : Service() {
 
         /** 通知栏「停止」按钮走这条 —— 不必为了停服务而打开 App。 */
         const val ACTION_STOP = "com.example.traework2api.STOP"
-        /** 看门狗闹钟动作：被它唤醒时只需确认前台服务与唤醒锁仍在。 */
-        const val ACTION_WATCHDOG = "com.example.traework2api.WATCHDOG"
-
-        /**
-         * 看门狗轮询间隔 15 分钟。**别调小**：更频繁会被 ColorOS 判定为异常唤醒而拦截，
-         * 结果比 15 分钟还不可靠。
-         */
-        private const val WATCHDOG_INTERVAL_MS = 15 * 60_000L
-
         /**
          * 唤醒锁超时 10 分钟，短于看门狗续期间隔。
          *
@@ -73,9 +68,6 @@ class GatewayService : Service() {
          * 与保活初衷相反。带超时 + 定期续期 = 始终持锁，又不留无人回收的永久锁。
          */
         private const val WAKELOCK_TIMEOUT_MS = 10 * 60_000L
-
-        private const val WATCHDOG_REQUEST = 8789
-        private const val TASK_REMOVED_REQUEST = 8790
 
         /** 用户意图持久化：true = 用户希望服务处于运行状态。 */
         private const val PREFS = "traework2api_service"
@@ -144,25 +136,22 @@ class GatewayService : Service() {
             // 用户主动停止 → 不允许系统再拉起来（否则会"关了又自己开"）。
             return START_NOT_STICKY
         }
-        // 看门狗/兜底闹钟唤醒时，用户可能已经主动停止（cancelWatchdog 只能取消**还没发**的
-        // 闹钟，已经离开 AlarmManager 在投递路上的 Intent 拦不住）—— 此时必须拒绝重启，
-        // 否则 onStartCommand 末尾的 markShouldRun(true) 会把用户刚写入的 should_run=false
-        // 又翻回 true，出现"手动停止后重开 App 服务自己又开了"。
-        if (intent?.action == ACTION_WATCHDOG && !shouldRun(applicationContext)) {
-            Log.i(TAG, "看门狗唤醒，但用户已停止服务 → 不拉起")
-            cancelWatchdog()
-            return START_NOT_STICKY
-        }
-        // 只要服务被启动（用户点按 / 看门狗兜底 / 划掉后拉回），就记为"用户希望它运行"，
-        // 这样 onTaskRemoved 与看门狗的前置校验才会放行。
+        // 只要服务被启动（用户点按 / 看门狗兜底 / 划掉后拉回），就记为"用户希望它运行"。
+        // 拦"用户已手动停止"的活儿现在在**拉起方**做：KeepAliveWatchdog 先查 shouldRun，
+        // 再决定是否 startForegroundService —— 闹钟已不再直接投递 intent 给本服务，
+        // 那些"在途 intent 拦不住"的边角情况随之消失。
         markShouldRun(applicationContext, true)
         // 必须在数秒内 startForeground，否则系统按 ANR 处理并杀掉服务。
         startForeground(NOTIFICATION_ID, notification())
         acquireWakeLock()
         Gateway.start(applicationContext)
         running = true
-        // 每次进入都续期看门狗，防止闹钟一次性触发后再无兜底。
-        scheduleWatchdog()
+        // 悬浮窗保活：与「开关 + 权限」对齐（幂等，每次进服务都对齐一次，
+        // 这样用户在设置页授权返回、或服务被重启后窗口都会自己回来）。
+        OverlayKeepAlive.sync(applicationContext)
+        // 每次进入都续期看门狗。看门狗本体是**独立广播接收器**（KeepAliveWatchdog），
+        // 不再是由本服务自己接 intent —— 服务没了还能有人判断"该不该拉起"。
+        if (KeepAlive.keepEnabled(applicationContext)) KeepAliveWatchdog.arm(applicationContext)
         return START_STICKY
     }
 
@@ -191,14 +180,17 @@ class GatewayService : Service() {
         }.isSuccess
         if (!started) {
             Log.w(TAG, "后台拉起被拦，退化为精确闹钟")
-            scheduleAlarm(TASK_REMOVED_REQUEST, 5_000L, "划掉后兜底")
+            KeepAliveWatchdog.armTaskRemovedFallback(applicationContext)
         }
-        scheduleWatchdog()
+        if (KeepAlive.keepEnabled(applicationContext)) KeepAliveWatchdog.arm(applicationContext)
         super.onTaskRemoved(rootIntent)
     }
 
     override fun onDestroy() {
         Gateway.stop()
+        // 服务先于进程结束时必须摘窗口：否则进程没了、窗口还挂在屏幕上，
+        // 只能靠重启手机清掉（典型的"幽灵悬浮窗"）。
+        OverlayKeepAlive.hide(applicationContext)
         releaseWakeLock()
         running = false
         super.onDestroy()
@@ -208,64 +200,13 @@ class GatewayService : Service() {
         running = false
         markShouldRun(applicationContext, false)
         // 必须撤掉看门狗，否则 15 分钟后会被闹钟莫名拉起来（"关了又自己开"）。
-        cancelWatchdog()
+        KeepAliveWatchdog.disarm(applicationContext)
         Gateway.stop()
+        OverlayKeepAlive.hide(applicationContext)
         releaseWakeLock()
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
         Log.i(TAG, "网关已按用户要求停止")
-    }
-
-    // ------------------------------------------------------------------
-    // 看门狗 / 闹钟兜底
-    // ------------------------------------------------------------------
-
-    /**
-     * 看门狗：定时用 AlarmManager 检查服务是否还活着。
-     *
-     * 为什么需要它：一加/OPPO 的 ColorOS 会在锁屏、长时间待机或内存回收时直接干掉前台服务，
-     * **且会无视 START_STICKY 不重启** —— 只有 AlarmManager 的 `setExactAndAllowWhileIdle`
-     * 能在 Doze 下把进程叫醒。每次唤醒时若服务已不在，onStartCommand 会把它重新拉起来。
-     */
-    private fun scheduleWatchdog() {
-        scheduleAlarm(WATCHDOG_REQUEST, WATCHDOG_INTERVAL_MS, "看门狗")
-    }
-
-    private fun scheduleAlarm(request: Int, delayMs: Long, label: String) {
-        runCatching {
-            val am = getSystemService(Context.ALARM_SERVICE) as AlarmManager
-            val pi = PendingIntent.getService(
-                this, request,
-                Intent(this, GatewayService::class.java).setAction(ACTION_WATCHDOG),
-                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-            )
-            val at = SystemClock.elapsedRealtime() + delayMs
-            // Android 12+ 即使用户授权过，也可能事后在设置里关掉"闹钟与提醒"，
-            // 此时 setExactAndAllowWhileIdle 直接抛 SecurityException。先预检再选，
-            // 避免"精确失败→静默退化"，也便于在日志里暴露这一降级（Doze 下非精确可能延迟数小时）。
-            val canExact = Build.VERSION.SDK_INT < 31 || am.canScheduleExactAlarms()
-            if (canExact) {
-                runCatching { am.setExactAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, at, pi) }
-                    .onFailure { am.setAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, at, pi) }
-            } else {
-                Log.w(TAG, "精确闹钟未授权，$label 降级为非精确（Doze 下可能延迟数小时）")
-                am.setAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, at, pi)
-            }
-        }.onFailure { Log.w(TAG, "$label 调度失败", it) }
-    }
-
-    private fun cancelWatchdog() {
-        runCatching {
-            val am = getSystemService(Context.ALARM_SERVICE) as AlarmManager
-            am.cancel(
-                PendingIntent.getService(
-                    this, WATCHDOG_REQUEST,
-                    Intent(this, GatewayService::class.java).setAction(ACTION_WATCHDOG),
-                    PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-                )
-            )
-            Log.i(TAG, "看门狗已取消")
-        }.onFailure { Log.w(TAG, "看门狗取消失败", it) }
     }
 
     // ------------------------------------------------------------------

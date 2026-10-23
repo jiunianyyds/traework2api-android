@@ -17,6 +17,12 @@
          用于在 ColorOS 等**无视 START_STICKY 强杀**前台服务后把它重新拉起来。 -->
     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
     <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
+    <!-- 悬浮窗保活：屏幕上的小圆点 = 一个真实窗口，把本进程提到「有可见窗口」优先级，
+         被杀后点一下即可复活。属于特殊权限，只能在系统页手动授予。 -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <!-- 开机自启（可选开关，默认关）。参考 WorkBuddy：同时监听 LOCKED_BOOT_COMPLETED
+         与部分 ROM 的 QUICKBOOT_POWERON，否则某些机器收不到 BOOT_COMPLETED。 -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <!-- ⚠️ 刻意**没有** RECEIVE_BOOT_COMPLETED：用户要求"重启手机后必须自己打开 App 手动开"，
          所以不做开机自启。别"顺手"加上它和 BootReceiver。 -->
 
@@ -49,15 +55,31 @@
         <receiver
             android:name=".CheckinReceiver"
             android:exported="false" />
+        <!-- 看门狗：独立广播接收器（WorkBuddy 式），15 分钟一次精确闹钟唤醒它，
+             由它判断要不要把前台服务拉起来。不再由服务自己接 intent。 -->
+        <receiver
+            android:name=".KeepAliveWatchdog"
+            android:exported="false" />
+        <!-- 开机自启接收器：只是"可选开关"的执行者，默认不做事（见 BootReceiver 注释）。 -->
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="true"
+            android:directBootAware="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+            </intent-filter>
+        </receiver>
+        <!-- ⚠️ 类型用 dataSync 而不是 specialUse，是因为本地打包工具链是 compileSdk 33
+             （API 34 才引入 specialUse 这个 flag，33 的 aapt2 不认，会直接链接失败）。
+             本项目 targetSdk=33，Android 14/15 对 dataSync 的 6 小时上限只在
+             targetSdk>=35 时才生效，所以这里不会被截断。将来升到 34+ 再换回 specialUse。 -->
         <service
             android:name=".GatewayService"
             android:exported="false"
-            android:foregroundServiceType="specialUse"
-            android:stopWithTask="false">
-            <property
-                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="User-started on-device OpenAI-compatible API gateway" />
-        </service>
+            android:foregroundServiceType="dataSync"
+            android:stopWithTask="false" />
     </application>
 
 </manifest>

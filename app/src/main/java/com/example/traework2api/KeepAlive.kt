@@ -152,6 +152,14 @@ object KeepAlive {
                 "渠道被关掉等同于通知不可见，服务会被削弱。",
                 autoOpenable = false
             ),
+            // 悬浮窗是**可选加强项**：没开不算"没准备好"，所以未开启时判为 ok，
+            // 否则每一项都会亮 ⚠，用户会以为必须开（其实很多人不想要屏幕上多个点）。
+            Item(
+                "悬浮窗保活", !OverlayKeepAlive.isEnabled(ctx) || OverlayKeepAlive.canDraw(ctx),
+                "在屏幕上挂一个可拖动的小圆点：进程多一层「可见窗口」优先级，网关被杀后点一下就能复活。" +
+                    "没有「显示在其他应用上层」权限时它不起作用。",
+                autoOpenable = true
+            ),
             Item(
                 "精确闹钟", canExact,
                 "服务被厂商强杀后靠它定时唤醒恢复；被禁用时只能退化成非精确闹钟，Doze 下可能延迟数小时。",
@@ -190,6 +198,136 @@ object KeepAlive {
             Uri.parse("package:${ctx.packageName}")
         ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
     }.isSuccess
+
+    /**
+     * 悬浮窗授权页。
+     *
+     * 这是**特殊权限**（SYSTEM_ALERT_WINDOW），不能运行时弹框申请，只能把这个页面
+     * 甩给用户手动勾选；回来后再用 `Settings.canDrawOverlays` 复查。
+     */
+    fun openOverlayPermission(ctx: Context): Boolean = OverlayKeepAlive.openPermission(ctx)
+
+    // ------------------------------------------------------------------
+    // 保活总开关与保活时长（WorkBuddy 的 keepalive_enabled / keepalive_hours）
+    // ------------------------------------------------------------------
+
+    private const val PREF = "traework2api_prefs"
+    private const val KEY_BOOT_AUTOSTART = "keepalive_boot_autostart"
+    private const val KEY_KEEP_ENABLED = "keepalive_enabled"
+    private const val KEY_KEEP_HOURS = "keepalive_hours"
+    private const val KEY_ARMED_AT = "keepalive_armed_at"
+
+    /** 保活总开关：关掉后看门狗不再自检、不再拉起服务（服务本身不受影响）。默认开。 */
+    fun keepEnabled(ctx: Context): Boolean =
+        prefs(ctx).getBoolean(KEY_KEEP_ENABLED, true)
+
+    fun setKeepEnabled(ctx: Context, value: Boolean) {
+        prefs(ctx).edit().putBoolean(KEY_KEEP_ENABLED, value).apply()
+        if (value) KeepAliveWatchdog.arm(ctx) else KeepAliveWatchdog.disarm(ctx)
+    }
+
+    /**
+     * 保活时长（小时），**0 = 一直保活**。
+     *
+     * 语义照 WorkBuddy：`keepalive_hours` 到期后看门狗自行收工，
+     * 不再周期性把服务拉起来 —— 给"我只要它撑过这几个小时"这种用法。
+     */
+    fun keepHours(ctx: Context): Int =
+        prefs(ctx).getInt(KEY_KEEP_HOURS, 0).coerceIn(0, 72)
+
+    fun setKeepHours(ctx: Context, hours: Int) {
+        prefs(ctx).edit().putInt(KEY_KEEP_HOURS, hours.coerceIn(0, 72)).apply()
+        // 改时长等于重新开始计时。
+        if (hours > 0) markArmed(ctx) else clearArmed(ctx)
+    }
+
+    /** 记下"这一轮保活从什么时候开始"。 */
+    fun markArmed(ctx: Context) {
+        val p = prefs(ctx)
+        if (p.getLong(KEY_ARMED_AT, 0L) == 0L) {
+            p.edit().putLong(KEY_ARMED_AT, System.currentTimeMillis()).apply()
+        }
+    }
+
+    fun clearArmed(ctx: Context) {
+        prefs(ctx).edit().putLong(KEY_ARMED_AT, 0L).apply()
+    }
+
+    /** 保活时长是否已到期（0 小时 = 永不"到期"，但要求确实被 armed 过）。 */
+    fun keepExpired(ctx: Context): Boolean {
+        val hours = keepHours(ctx)
+        if (hours <= 0) return false
+        val armedAt = prefs(ctx).getLong(KEY_ARMED_AT, 0L)
+        if (armedAt <= 0L) return false
+        return System.currentTimeMillis() - armedAt > hours * 3_600_000L
+    }
+
+    // ------------------------------------------------------------------
+    // 开机自启（可选，默认关）
+    // ------------------------------------------------------------------
+
+    private fun prefs(ctx: Context) =
+        ctx.applicationContext.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+
+    fun isBootAutostartEnabled(ctx: Context): Boolean =
+        prefs(ctx).getBoolean(KEY_BOOT_AUTOSTART, false)
+
+    fun setBootAutostart(ctx: Context, value: Boolean) {
+        prefs(ctx).edit().putBoolean(KEY_BOOT_AUTOSTART, value).apply()
+    }
+
+    /**
+     * 尝试**直达**各家 ROM 的「耗电管理 / 自启动」页。
+     *
+     * 这些是厂商私有 Activity，名字可能随版本变。所以：
+     *  - 按本机 ROM 只试**本家**的那几个（乱试会打开别家页面或直接崩）；
+     *  - 全部失败就退到系统公开的「应用详情」页 —— 至少用户能从这里再点进权限。
+     *
+     * 参考 WorkBuddy 的做法：它把 `com.oplus.battery/com.oplus.powermanager.fuelgaue.
+     * PowerUsageModelActivity`、`com.coloros.oppoguardelf/...` 都硬编码试一遍，
+     * 因为 ColorOS 上这两代包名并存，只试一个会有一半机器跳不过去。
+     */
+    fun openRomPowerPage(ctx: Context): Boolean {
+        val rom = rom()
+        val candidates = when (rom) {
+            Rom.COLOR_OS -> listOf(
+                "com.oplus.battery" to "com.oplus.powermanager.fuelgaue.PowerUsageModelActivity",
+                "com.coloros.oppoguardelf" to "com.coloros.powermanager.fuelgaue.PowerUsageModelActivity",
+                "com.coloros.oppoguardelf" to "com.coloros.oppoguardelf.PowerConsumeManageActivity"
+            )
+            Rom.MIUI -> listOf(
+                "com.miui.powerkeeper" to "com.miui.powerkeeper.ui.HiddenAppsConfigActivity",
+                "com.miui.securitycenter" to "com.miui.permcenter.autostart.AutoStartManagementActivity"
+            )
+            Rom.EMUI -> listOf(
+                "com.huawei.systemmanager" to "com.huawei.systemmanager.startupmgr.ui.StartupNormalAppListActivity",
+                "com.huawei.systemmanager" to "com.huawei.systemmanager.optimize.process.ProtectActivity"
+            )
+            Rom.ORIGIN_OS -> listOf(
+                "com.vivo.permissionmanager" to "com.vivo.permissionmanager.activity.BgStartUpManagerActivity",
+                "com.iqoo.secure" to "com.iqoo.secure.ui.phoneoptimize.AddWhiteListActivity"
+            )
+            Rom.OTHER -> emptyList()
+        }
+        for ((pkg, cls) in candidates) {
+            val ok = runCatching {
+                ctx.startActivity(Intent().apply {
+                    component = android.content.ComponentName(pkg, cls)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    // MIUI 的「隐藏应用配置」页靠这个 extra 定位到本 App，不带就显示空列表。
+                    putExtra("package_name", ctx.packageName)
+                })
+            }.isSuccess
+            if (ok) return true
+        }
+        // 兜底：系统「应用详情」页（公开接口，任何 ROM 都在）。
+        return runCatching {
+            ctx.startActivity(
+                Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${ctx.packageName}"))
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+        }.isSuccess
+    }
 
     fun openAppNotificationSettings(ctx: Context): Boolean = runCatching {
         ctx.startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)

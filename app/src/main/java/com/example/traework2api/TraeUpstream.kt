@@ -26,6 +26,17 @@ object TraeUpstream {
     /** 日志 tag（任务书要求用 `TraeUpstream:*`；**只打模型名，绝不打 token**）。 */
     private const val TAG = "TraeUpstream"
 
+    /**
+     * 最近一次模型解析的诊断信息（缺多少条、原始 model_detail_list 样例）。
+     *
+     * 为什么要有它：`131072` 是回落常量，和上游真值长得一模一样；而 logcat 在
+     * 国产 ROM 上会被系统日志淹掉（我们自己的 tag 常常捞不到）。所以把结论写进文件，
+     * 用户点一次刷新 → 我们从 `/sdcard/Android/data/<pkg>/files/models_probe.txt` 直接读。
+     */
+    @Volatile
+    var lastParseProbe: String = ""
+        private set
+
     // host 随区域变化，统一从 TraeRegion 取（见该文件；国内版为已实测值）。
     //
     // ⚠️ **不要在长流程里反复读这些 getter**：`TraeRegion.current` 会被 UI 线程改写
@@ -429,27 +440,56 @@ object TraeUpstream {
      * `browser_use_subagent` 等内部 agent、以及各类子能力项）。它们当 config_name 发过去
      * 聊天会 4001，摆在「模型」Tab 里只会让用户选错。判据见 [isChatModel]。
      */
-    internal fun parseModels(root: JSONObject): JSONArray? {
+    internal fun parseModels(
+        root: JSONObject,
+        /** >0 时覆盖每条模型的 context_length（默认取设置里的声明值，1M）。0 = 跟随上游。 */
+        declaredContext: Long = ContextBudget.declared(),
+    ): JSONArray? {
         val list = root.optJSONArray("config_info_list") ?: return null
         val arr = JSONArray()
+        // 诊断：131072 是回落常量，长得和上游真值一模一样。不把原始字段摊开，
+        // 就永远分不清"上游只给 128K"和"我们没解析到 max_input_tokens"。
+        var missingDetail = 0
+        var sampleDetail = ""
         for (i in 0 until list.length()) {
             val cfg = list.optJSONObject(i) ?: continue
             val id = cfg.optString("config_name", "").trim()
             if (id.isEmpty()) continue
             if (!isChatModel(cfg)) continue
             val name = cfg.optJSONObject("display_config")?.optString("display_name", "")?.trim().orEmpty()
+            if (sampleDetail.isEmpty()) {
+                sampleDetail = cfg.opt("model_detail_list")?.toString().orEmpty().take(400)
+            }
             var ctx = 0L
             cfg.optJSONArray("model_detail_list")?.optJSONObject(0)
                 ?.let { ctx = it.optLong("max_input_tokens", 0L) }
-            if (ctx <= 0L) ctx = 131072L
+            // 上游**上报值**：0 = 这条 detail 里根本没有 max_input_tokens。
+            // 关键：这里**不再填 131072**。以前填了，界面就永远显示"上游上报 128K"，
+            // 和真的上报 128K 长得一模一样，把人骗得以为上游上限就是 128K
+            // （实测上游能吃满 1M，见 ContextBudget.DEFAULT_UPSTREAM）。
+            // 上报值只用于展示"上游到底说了多少"，0 就老实显示"未上报"。
+            val upstreamCtx = if (ctx > 0L) ctx else 0L
+            if (ctx <= 0L) {
+                // context_length 的回落常量：给不认识 context_upstream 的客户端兜一个能用的数。
+                // 它**不是**上游上限，也**不参与**网关预算（预算看 ContextBudget.upstream()）。
+                ctx = 131072L
+                missingDetail++
+            }
+            // 声明值覆盖：只改"给客户端看的数"，不影响网关侧真实预算 ——
+            // 真实预算由 ContextBudget.trim 在转发前把关，超了丢最老的消息。
+            if (declaredContext > 0L) ctx = declaredContext
             arr.put(
                 JSONObject()
                     .put("id", id).put("name", name.ifEmpty { id })
                     .put("config_name", id).put("context_length", ctx)
+                    .put("context_upstream", upstreamCtx)
                     .put("object", "model").put("owned_by", "trae-solo")
                     .put("created", 1753600000)
             )
         }
+        lastParseProbe = "模型解析：${arr.length()} 条，缺 max_input_tokens 的 $missingDetail 条" +
+            "（缺 = 上游没上报，展示为“未上报”；context_length 兜 131072 仅供老客户端）；样例 detail=$sampleDetail"
+        android.util.Log.i(TAG, lastParseProbe)
         return if (arr.length() == 0) null else arr
     }
 
@@ -562,7 +602,7 @@ object TraeUpstream {
             // 🔴 第三方接入：config_source=3 + is_custom_model=true（"肖恩ai-…"/"ZZ …" 就是这类）→ 过滤
             .put(entry("gemini-3.1-pro", "肖恩ai-gemini-3.1-pro", src = 3, custom = true))
             .put(entry("DeepSeek-V4-Flash", "TRAE-DeepSeek-V4-Flash", src = 3, custom = true)))
-        val out = parseModels(root) ?: throw IllegalStateException("自检失败：模型表解析返回 null")
+        val out = parseModels(root, 0L) ?: throw IllegalStateException("自检失败：模型表解析返回 null")
 
         // 只有官方内置那条该留下：空名、无 display_config、占位、agent、不可见、第三方全部挡掉
         check(out.length() == 1) { "自检失败：应只剩 1 条官方内置模型，得到 ${out.length()} 条" }
@@ -573,13 +613,18 @@ object TraeUpstream {
 
         // 回落规则：name 缺省回落 id、context 缺省回落 131072
         val fb = parseModels(JSONObject().put("config_info_list",
-            JSONArray().put(entry("no-name-no-detail"))))!!
+            JSONArray().put(entry("no-name-no-detail"))), 0L)!!
         check(fb.getJSONObject(0).getString("name") == "no-name-no-detail") { "自检失败：name 缺省应回落 id" }
         check(fb.getJSONObject(0).getLong("context_length") == 131072L) { "自检失败：context 缺省应回落 131072" }
+        // 上游没上报时 context_upstream 必须是 0（=未上报），**不能**填 131072。
+        // 填了就会让界面把"我们兜的值"显示成"上游说的值"，实测证明上游能吃满 1M。
+        check(fb.getJSONObject(0).getLong("context_upstream") == 0L) {
+            "自检失败：未上报时应为 0，得到 ${fb.getJSONObject(0).getLong("context_upstream")}"
+        }
 
         // 空表 / 无表必须返回 null（否则会把静态表覆盖成空 = 所有客户端看不到模型）
-        check(parseModels(JSONObject()) == null) { "自检失败：没有 config_info_list 时应返回 null" }
-        check(parseModels(JSONObject().put("config_info_list", JSONArray())) == null) {
+        check(parseModels(JSONObject(), 0L) == null) { "自检失败：没有 config_info_list 时应返回 null" }
+        check(parseModels(JSONObject().put("config_info_list", JSONArray()), 0L) == null) {
             "自检失败：空表应返回 null（空表覆盖会让所有客户端看不到模型）"
         }
 

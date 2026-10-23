@@ -47,6 +47,8 @@ object Gateway {
     fun start(ctx: Context) {
         if (isRunning) return
         val app = ctx.applicationContext
+        // 上下文预算要能在没有 Context 的转发线程里读 pref，所以在这里注入一次。
+        ContextBudget.init(app)
         val s = LocalFakeServer(apiKey(app))
         s.usageRecorder = { model, usage, ms, ok, err ->
             UsageStore.record(app, model,

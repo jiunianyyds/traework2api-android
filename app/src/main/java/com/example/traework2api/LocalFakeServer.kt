@@ -504,6 +504,9 @@ class LocalFakeServer(private val apiKey: String) {
         // ⚠️ 必须在 prepareBody **之前**读：prepareBody 会把 `stream` 原地改成 true
         //（上游只认流式），改完就看不到客户端原本要的是不是非流式了。
         val wantsStream = src.optBoolean("stream", false)
+        // 上下文预算把关：客户端按 /v1/models 的**声明值**（默认 1M）发多长都行，
+        // 网关这里按上游真实预算把超出的最老消息丢掉，并记日志。
+        ContextBudget.trim(src)
         val prepared = TraeUpstream.prepareBody(src)
         val model = prepared.optString("model", "")
         if (wantsStream) {

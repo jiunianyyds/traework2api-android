@@ -2,6 +2,7 @@ package com.example.traework2api
 
 import android.content.Context
 import org.json.JSONArray
+import java.io.File
 import org.json.JSONObject
 
 /**
@@ -76,6 +77,32 @@ object ModelsRepo {
                 ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
                     .edit().putString(KEY_MODELS, arr.toString()).apply()
             }
+            writeProbe(ctx, arr)
+        }
+    }
+
+    /**
+     * 诊断落盘：把「上游到底报了多少」写成文件，绕开 logcat。
+     *
+     * 写到 App 自己的外部私有目录（`/sdcard/Android/data/<pkg>/files/models_probe.txt`），
+     * Android 4.4+ 不需要任何存储权限，外部只读也能被 adb/文件管理器看到。
+     */
+    private fun writeProbe(ctx: Context, arr: JSONArray) {
+        runCatching {
+            val dir = ctx.getExternalFilesDir(null) ?: return
+            if (!dir.exists()) dir.mkdirs()
+            val perModel = StringBuilder()
+            for (i in 0 until arr.length()) {
+                val m = arr.optJSONObject(i) ?: continue
+                val up = m.optLong("context_upstream", 0L)
+                perModel.append(m.optString("id", "?"))
+                    .append("  上游=").append(if (up > 0L) up.toString() else "未上报")
+                    .append("  声明=").append(m.optLong("context_length", 0L))
+                    .append('\n')
+            }
+            val body = TraeUpstream.lastParseProbe + "\n\n" + perModel
+            File(dir, "models_probe.txt").writeText(body)
+            android.util.Log.i("ModelsRepo", "诊断已写入 models_probe.txt")
         }
     }
 

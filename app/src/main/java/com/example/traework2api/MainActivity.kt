@@ -227,6 +227,7 @@ class MainActivity : Activity() {
         removeLegacyPlaintextToken()
         // 请求体按字节读的自检：中文 body 曾因按字符读而挂死，这里早失败早暴露。
         LocalFakeServer.selfCheck()
+        ContextBudget.selfCheck()
         // 区域常量自检：CN 是已实测链路，不能被后续改动弄坏。
         TraeRegion.selfCheck()
         // 多账号索引自检：uid 是主键，序列化错了会串账号。
@@ -994,6 +995,38 @@ class MainActivity : Activity() {
         val edit = searchInput("搜索模型…")
         addView(edit, lp(-1, -2))
 
+        // 上下文预算：**声明值**只影响客户端怎么算预算；**上游真实值**由网关裁剪把关。
+        // 两个数分开摆，是为了避免"声明 1M 就以为真能塞 1M"这种误解。
+        val ctxInfo = caption("")
+        fun ctxText() {
+            ctxInfo.text = "声明 ${fmtCtx(ContextBudget.declared())}：客户端按它决定何时压缩历史。" +
+                "网关预算 ${fmtCtx(ContextBudget.upstream())}：超了从最老的消息开始丢并记日志。" +
+                "实测上游能吃满 1M（1,048,075 记得暗号，1,048,600 返回空正文），" +
+                "所以预算默认 1M；切到 128K 只是主动收紧。"
+        }
+        // lateinit：lambda 里要改自己的文案，val 不能在初始化表达式里引用自己。
+        lateinit var declaredBtn: android.widget.Button
+        declaredBtn = action("声明 ${fmtCtx(ContextBudget.declared())}") {
+            ContextBudget.setDeclared(ContextBudget.nextDeclared())
+            declaredBtn.text = "声明 ${fmtCtx(ContextBudget.declared())}"
+            ctxText()
+        }
+        lateinit var upstreamBtn: android.widget.Button
+        upstreamBtn = action("预算 ${fmtCtx(ContextBudget.upstream())}", outlined = true) {
+            ContextBudget.setUpstream(ContextBudget.nextUpstream())
+            upstreamBtn.text = "预算 ${fmtCtx(ContextBudget.upstream())}"
+            ctxText()
+        }
+        addView(card {
+            addView(text("上下文预算", FS_CARD_TITLE, true))
+            addView(row(top = 10) {
+                addView(declaredBtn, weighted())
+                addView(upstreamBtn, lp(-2, -2, start = 8))
+            })
+            addView(ctxInfo, top(8))
+        })
+        ctxText()
+
         // 刷新按钮 + 计数。计数是"刷新真的起作用了"的证据 —— 否则点了没新增时用户会以为没生效。
         val countView = caption("")
         fun refreshCountLabel() {
@@ -1098,7 +1131,13 @@ class MainActivity : Activity() {
             }, weighted())
             addView(linkAction("复制") { copyModelId(id) })
         })
-        addView(caption("context ${m.optInt("context_length", 0)} · trae-solo"), top(4))
+        // 三个数一起摆：声明值（客户端用）/ 上游原值（真限，用来判断是不是走了回落）/ 网关预算。
+        val ctxDeclared = m.optLong("context_length", 0L)
+        val ctxUpstream = m.optLong("context_upstream", 0L)
+        addView(caption(
+            "context ${fmtCtx(ctxDeclared)}（上游上报 ${if (ctxUpstream > 0) fmtCtx(ctxUpstream) else "未上报"}" +
+                " · 预算 ${fmtCtx(ContextBudget.upstream())}）· trae-solo"
+        ), top(4))
     }
 
     private fun copyModelId(id: String) = copyToClipboard("modelId", id, "已复制模型 ID: $id")
@@ -1218,6 +1257,37 @@ class MainActivity : Activity() {
                 "下面标 ⚠ 的项会让服务在真机上被系统清掉，建议逐项开启。"), top(8))
         })
 
+        // 保活总开关 + 保活时长（WorkBuddy 的 keepalive_enabled / keepalive_hours）
+        val keepOn = KeepAlive.keepEnabled(this@MainActivity)
+        val keepH = KeepAlive.keepHours(this@MainActivity)
+        val nextH = when (keepH) {
+            0 -> 1; 1 -> 4; 4 -> 8; 8 -> 12; 12 -> 24; else -> 0
+        }
+        addView(card {
+            addView(row {
+                addView(text("后台保活", FS_CARD_TITLE, true), weighted())
+                addView(if (keepOn) chipOk("已启用") else chipWarn("已关闭"))
+            })
+            addView(caption(
+                "看门狗本体是独立广播接收器：每 15 分钟一次精确闹钟，醒了就检查前台服务还在不在，" +
+                    "不在就拉起。关掉这里只停掉自检与自动拉起，服务本体照常运行。"
+            ), top(6))
+            addView(row(top = 10) {
+                addView(action(if (keepOn) "关闭保活" else "开启保活", outlined = true) {
+                    KeepAlive.setKeepEnabled(this@MainActivity, !keepOn)
+                    openKeepAlive()
+                }, weighted())
+                addView(action("时长 " + if (keepH == 0) "一直" else "${keepH}h", outlined = true) {
+                    KeepAlive.setKeepHours(this@MainActivity, nextH)
+                    openKeepAlive()
+                }, lp(-2, -2, start = 8))
+            })
+            addView(caption(
+                if (keepH == 0) "当前：一直保活，直到你手动关闭。点「时长」可改成限时。"
+                else "当前：${keepH} 小时后看门狗自动收工（不再拉起服务），改时长会重新计时。"
+            ), top(6))
+        })
+
         // 一键配置
         val autoCount = pending.count { it.autoOpenable }
         addView(card {
@@ -1248,6 +1318,67 @@ class MainActivity : Activity() {
             }
         })
 
+        // 悬浮窗保活（可选加强项，默认关）
+        val overlayOn = OverlayKeepAlive.isEnabled(this@MainActivity)
+        val overlayPerm = OverlayKeepAlive.canDraw(this@MainActivity)
+        addView(section("悬浮窗保活"))
+        addView(card {
+            addView(row {
+                addView(text("悬浮窗小圆点", FS_CARD_TITLE, true), weighted())
+                addView(
+                    when {
+                        !overlayOn -> chipWarn("未开启")
+                        overlayPerm -> chipOk("运行中")
+                        else -> chipWarn("缺权限")
+                    }
+                )
+            })
+            addView(caption(
+                "在屏幕上挂一个可拖动的小圆点。作用有两个：让本进程多一层「有可见窗口」的" +
+                    "优先级（冻结/回收时排在后面），以及网关被厂商杀掉后点一下就地复活、" +
+                    "不用回桌面找图标。"
+            ), top(8))
+            if (!overlayPerm) {
+                addView(action("去授予「显示在其他应用上层」", outlined = true) {
+                    KeepAlive.openOverlayPermission(this@MainActivity)
+                    // 用户可能去系统页勾选后返回，回来重绘一次拿到最新状态。
+                    contentHost.postDelayed({
+                        if (!isFinishing && !isDestroyed && showKeepAlive) openKeepAlive()
+                    }, 800)
+                }, top(12))
+            } else {
+                addView(row(top = 12) {
+                    addView(action(
+                        if (overlayOn) "关闭悬浮窗" else "开启悬浮窗",
+                        outlined = overlayOn, danger = overlayOn
+                    ) {
+                        OverlayKeepAlive.setEnabled(this@MainActivity, !overlayOn)
+                        if (!overlayOn) toast("已开启：点小圆点可复活网关，长按可拖动")
+                        openKeepAlive()
+                    }, weighted())
+                    addView(action("−") {
+                        OverlayKeepAlive.setSizeDp(
+                            this@MainActivity, OverlayKeepAlive.sizeDp(this@MainActivity) - 3
+                        )
+                        openKeepAlive()
+                    }, lp(-2, -2, start = 8))
+                    addView(action("+") {
+                        OverlayKeepAlive.setSizeDp(
+                            this@MainActivity, OverlayKeepAlive.sizeDp(this@MainActivity) + 3
+                        )
+                        openKeepAlive()
+                    }, lp(-2, -2, start = 8))
+                })
+                addView(caption(
+                    "当前直径 ${OverlayKeepAlive.sizeDp(this@MainActivity)}dp" +
+                        "（1dp 最隐蔽，但部分 ROM 会当「无效窗口」回收；建议 6~16dp）"
+                ), top(6))
+            }
+            addView(caption(
+                "MIUI / HyperOS 还需在应用权限里打开「后台弹出界面」，否则系统会静默拒绝这个窗口。"
+            ), top(6))
+        })
+
         // 厂商私有路径（系统查不到、跳不了）
         addView(section("本机需要手动确认的项"))
         addView(card {
@@ -1260,6 +1391,30 @@ class MainActivity : Activity() {
                 copyToClipboard("keepAliveGuide", KeepAlive.romGuide(rom).joinToString("\n"),
                     "路径已复制，可到系统设置里照着找")
             }, top(12))
+        })
+
+        // 开机自启（可选，默认关）+ 直达厂商省电页（参考 WorkBuddy 的硬编码跳转）
+        val bootOn = KeepAlive.isBootAutostartEnabled(this@MainActivity)
+        addView(card {
+            addView(row {
+                addView(text("重启手机后自动恢复", FS_VALUE, true), weighted())
+                addView(if (bootOn) chipOk("已开启") else chipInfo("未开启"))
+            })
+            addView(caption(
+                "默认关：保持「重启后自己开一次」的原行为。打开后开机广播会把网关服务拉起来，" +
+                    "但你手动停过网关时仍然不会自动启动。"
+            ), top(6))
+            addView(row(top = 10) {
+                addView(action(if (bootOn) "关闭开机自启" else "开启开机自启", outlined = true) {
+                    KeepAlive.setBootAutostart(this@MainActivity, !bootOn)
+                    openKeepAlive()
+                }, weighted())
+                addView(action("直达厂商省电页", outlined = true) {
+                    if (!KeepAlive.openRomPowerPage(this@MainActivity)) {
+                        toast("本机没有可跳转的页面，请按上面的路径手动找")
+                    }
+                }, lp(-2, -2, start = 8))
+            })
         })
     }
 
@@ -1279,6 +1434,7 @@ class MainActivity : Activity() {
             "电池优化白名单" -> KeepAlive.openBatteryWhitelist(this)
             "精确闹钟" -> KeepAlive.openExactAlarm(this)
             "通知权限", "通知渠道未被关闭" -> KeepAlive.openAppNotificationSettings(this)
+            "悬浮窗保活" -> KeepAlive.openOverlayPermission(this)
             else -> false
         }
         if (!ok) {
@@ -2659,6 +2815,13 @@ class MainActivity : Activity() {
      */
     private fun color(name: String) = AppStyle.color(name)
     private fun toast(value: String) = Toast.makeText(this, value, Toast.LENGTH_SHORT).show()
+    /** 上下文长度的显示形式（131072 → 128K、1048576 → 1M）。模型卡与预算卡共用。 */
+    private fun fmtCtx(v: Long): String = when {
+        v >= 1_048_576L -> "${v / 1_048_576L}M"
+        v >= 1_024L -> "${v / 1_024L}K"
+        else -> v.toString()
+    }
+
     private fun dp(value: Int) = (value * resources.displayMetrics.density + 0.5f).toInt()
     private fun dp(value: Float) = (value * resources.displayMetrics.density + 0.5f).toInt()
     private fun lp(width: Int, height: Int, start: Int = 0, top: Int = 0, end: Int = 0, bottom: Int = 0) =

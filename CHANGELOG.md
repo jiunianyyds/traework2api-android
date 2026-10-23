@@ -8,6 +8,86 @@ UI 规范看 `docs/UI现状清单.md`，本文件只是改动流水。（原引�
 
 ---
 
+## [0.4.22] - 2026-10-24
+
+**保活按 WorkBuddy 1.2.1 的结构重写（替换原实现）；上下文预算改成实测出来的真 1M。**
+`versionName` 0.4.14 → **0.4.22**、`versionCode` 18 → **26**（中间 0.4.15~0.4.21 是本地迭代版本，未单独发布）。
+
+### Added
+
+1. **`KeepAliveWatchdog.kt`（149 行）** —— 独立广播接收器。`ACTION = com.example.traework2api.WATCHDOG`，
+   `INTERVAL_MS = 15 min`，`REQ_WATCHDOG = 8801` / `REQ_TASK_REMOVED = 8802`。
+   `onReceive` 顺序：`shouldRun` → `keepEnabled` → `keepExpired` → 打日志
+   `watchdog fired($action), ensuring foreground` → `GatewayService.start` + `OverlayKeepAlive.sync` → 重新 arm。
+
+2. **`OverlayKeepAlive.kt`（283 行）** —— 悬浮窗保活。`TYPE_APPLICATION_OVERLAY`、
+   `FLAG_NOT_FOCUSABLE|FLAG_NOT_TOUCH_MODAL|FLAG_LAYOUT_NO_LIMITS|FLAG_WATCH_OUTSIDE_TOUCH`、
+   `REVIVE_DEBOUNCE_MS = 1500L`、`TOUCH_SLOP = 12`；尺寸 1~48 dp（`MIN_DP`/`MAX_DP`/`DEFAULT_DP = 10`）；
+   pref key `keepalive_overlay_{enabled,dp,x,y}`。
+
+3. **`BootReceiver.kt`（63 行）** —— 开机自恢复，收 `BOOT_COMPLETED` / `LOCKED_BOOT_COMPLETED` /
+   `QUICKBOOT_POWERON`，双闸：`KeepAlive.isBootAutostartEnabled`（默认 **false**）+ `GatewayService.shouldRun`。
+
+4. **`ContextBudget.kt`（242 行）** —— 声明值与网关预算拆开。
+   pref `models_declared_context` / `gateway_upstream_context`，`OPTIONS = [128K, 256K, 512K, 1M]`，
+   `DEFAULT_DECLARED = 1_048_576`，`DEFAULT_UPSTREAM = 1_048_576`。
+   `trim()` 从最老的非 system 消息开始丢，`oldestDroppable` 跳过 system。
+
+5. **`ModelsRepo` 写诊断文件** `models_probe.txt`（`getExternalFilesDir`），记录「缺
+   `max_input_tokens` 的条数」与逐模型的上报/声明值。
+
+6. **`KeepAlive` 新增三个开关**：`keepalive_enabled`（总开关）、`keepalive_hours`（0/1/4/8/12/24，
+   到期自动 disarm 并摘悬浮窗）、`keepalive_boot_autostart`（默认关）。`check()` 增加
+   `Item("悬浮窗保活", …)`。
+
+7. **`AndroidManifest.xml`**：`SYSTEM_ALERT_WINDOW`、`RECEIVE_BOOT_COMPLETED`、`.BootReceiver`
+   （exported=true，directBootAware）、`.KeepAliveWatchdog`（exported=false）。
+
+### Changed
+
+1. **看门狗宿主从服务搬到接收器**（`GatewayService.kt` −90 行）：删掉 `ACTION_WATCHDOG`、
+   `WATCHDOG_INTERVAL_MS`、`scheduleWatchdog`、`scheduleAlarm`、`cancelWatchdog`，改调
+   `KeepAliveWatchdog.arm/disarm/armTaskRemovedFallback`。`onStartCommand` 调 `OverlayKeepAlive.sync`，
+   `onDestroy`/`stopNow` 调 `hide`。
+
+2. **`DEFAULT_UPSTREAM` 131072 → 1048576**。实测（见下）上游真能吃满 1M，128K 是解析不到
+   `max_input_tokens` 时的回落常量，拿它当预算等于白扔 8 倍窗口。
+
+3. **`estimateTokens` 改分类型加权**：`ch.code >= 0x2E80` 记 0.570 token/字，其余 0.190，整数存
+   千分之一。原来用 `字符数 * 2 / 5`（≈2.5 字符/token）：对英文高估一倍（2.5 vs 实测 5.17），
+   会把还装得下的对话提前丢掉；对中文又低估（2.5 vs 1.77），该丢时没丢照样撞墙。
+
+4. **未上报时 `context_upstream` 存 0 而非 131072**。旧代码 `if (ctx <= 0L) ctx = 131072L`
+   紧接着 `val upstreamCtx = ctx`，导致界面永远显示「上游上报 128K」——那是回落值，
+   和真上报长得一模一样，把人骗了。
+
+5. **`MainActivity`**：模型页新增「上下文预算」卡（`声明` / `预算` 两个循环按钮 + 说明行），
+   模型卡三数文案改为 `context X（上游上报 Y · 预算 Z）`，`fmtCtx` 提到类级。
+
+### 实测记录（deepseek-v4.1-flash，走本 App 的 8787 网关）
+
+往 `/v1/chat/completions` 灌等长填充，开头埋暗号 `紫电河马-7781`，结尾问「最开始那个暗号是什么」，
+读上游 `usage.prompt_tokens` 校准字符/token 比（英文 5.17、中文 1.77），再逐步加压卡边界：
+
+| 实际 `prompt_tokens` | 暗号还在吗 |
+|---|---|
+| 42,026 / 147,394 / 262,256 / 393,354 | 记得 |
+| 786,648 / 917,744 / 1,022,623 | 记得 |
+| 1,045,074 | 记得 |
+| **1,048,075** | **记得** |
+| **1,048,600** | **返回空 content** |
+
+边界正好卡在 `1_048_576`。超限表现：HTTP 200 + `content: ""` + `usage` 字段消失。
+抽样其他模型：`Doubao-Seed-2.1-Turbo` 到 254K 记得 / 520K 超限；`glm-5.3`、`kimi-k3` 到 544K 都记得。
+
+### Fixed
+
+1. **悬浮窗点了没反应也拖不动**：`onTouch` 原来只对 `ACTION_UP` 返回 `true`，DOWN 返回 `false`
+   之后 MOVE/UP 再也不送到该 View。现在每个 action 都返回 `true`。
+2. **`context_upstream` 把回落值伪装成上游上报**（见 Changed 第 4 条）。
+
+---
+
 ## [0.4.14] - 2026-10-23
 
 **账号备份改成多选：导出前勾选要带走的账号，导入前先看预览再勾。去掉剪贴板入口。**
