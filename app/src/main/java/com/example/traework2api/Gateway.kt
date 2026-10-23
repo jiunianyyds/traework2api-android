@@ -65,9 +65,11 @@ object Gateway {
         }
         // 故障转移：上游**还没吐正文**就失败（token 死了的 401 / 限流 429 / 5xx）时换另一个账号重试一次。
         // 换号会**真的切过去并持久化** —— 否则下一个请求还拿同一个死账号去撞墙。
+        // 过滤 CreditMonitor 标了冷却的账号：它刚因低余额被切走，换回它只会让账号来回跳。
         s.failoverProvider = failover@{ failedUid, err ->
-            val next = TraeAuthStore.pickFailoverCandidate(TraeAuthStore.list(app), failedUid)
-                ?: return@failover null
+            val next = TraeAuthStore.pickFailoverCandidate(
+                TraeAuthStore.list(app).filterNot { CreditMonitor.isDemoted(it.uid) }, failedUid,
+            ) ?: return@failover null
             android.util.Log.i(TAG, "转发失败($err)，自动换到账号 ${next.uid}(${next.regionId})")
             locked {
                 TraeAuthStore.setActive(app, next.uid)
@@ -78,21 +80,31 @@ object Gateway {
             }
         }
         // 换号也没救活 → 切回用户原来选的账号（否则账号会在请求间来回跳）
+        // 例外：原账号刚被判低余额（CreditMonitor 冷却中）。回滚它 = 下一轮 monitor 又把它切走，
+        // 两个机制会每 30 秒对着掰一次。宁可停在当前号上，让错误如实报给客户端。
         s.failoverRollback = { originalUid ->
-            android.util.Log.i(TAG, "换号后仍失败，切回原账号 $originalUid")
-            locked {
-                TraeAuthStore.setActive(app, originalUid)
-                TraeAuthStore.syncRegionToActiveAccount(app)
+            if (CreditMonitor.isDemoted(originalUid)) {
+                android.util.Log.i(TAG, "原账号 $originalUid 处于低余额冷却期，不回滚")
+            } else {
+                android.util.Log.i(TAG, "换号后仍失败，切回原账号 $originalUid")
+                locked {
+                    TraeAuthStore.setActive(app, originalUid)
+                    TraeAuthStore.syncRegionToActiveAccount(app)
+                }
             }
         }
         server = s
         s.start()
+        // 积分监测线程随网关起停：只有网关在跑（才可能消耗积分）时它才有意义。
+        // 注意它内部只做「锁内读本地 → 锁外发网络」，绝不在 tokenLock 内做网络请求。
+        CreditMonitor.start(app)
         android.util.Log.i(TAG, "网关已启动，端口 ${LocalFakeServer.PORT}")
     }
 
     /** 幂等停止：没启动时调用也安全（用户可能没开就退出）。 */
     @Synchronized
     fun stop() {
+        CreditMonitor.stop()
         server?.stop()
         server = null
         android.util.Log.i(TAG, "网关已停止")

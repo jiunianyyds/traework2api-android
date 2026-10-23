@@ -270,7 +270,8 @@ object TraeAuthApi {
         return ex.accessToken
     }
 
-    private fun expiredWithin(expiresAt: Long?, skewSec: Long): Boolean {
+    /** internal 而非 private：CreditMonitor 要按同一判据决定"这个号该不该先续期"。 */
+    internal fun expiredWithin(expiresAt: Long?, skewSec: Long): Boolean {
         if (expiresAt == null || expiresAt <= 0) return true
         return System.currentTimeMillis() / 1000 + skewSec >= expiresAt
     }

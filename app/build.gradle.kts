@@ -12,8 +12,8 @@ android {
         applicationId = "com.example.traework2api"
         minSdk = 24
         targetSdk = 36
-        versionCode = 16
-        versionName = "0.4.12"
+        versionCode = 18
+        versionName = "0.4.14"
     }
 
     buildTypes {

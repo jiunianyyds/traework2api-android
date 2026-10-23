@@ -6,12 +6,14 @@ import android.app.AlertDialog
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Bundle
 import android.text.InputType
+import android.text.TextUtils
 import android.view.Gravity
 import android.view.View
 import android.widget.Button
@@ -40,6 +42,10 @@ class MainActivity : Activity() {
     companion object {
         /** 通知权限请求码（Android 13+ 前台服务的常驻通知要用）。 */
         private const val REQ_NOTIF = 1002
+        /** SAF：导出账号备份（ACTION_CREATE_DOCUMENT）。 */
+        private const val REQ_EXPORT = 1003
+        /** SAF：导入账号备份（ACTION_OPEN_DOCUMENT）。 */
+        private const val REQ_IMPORT = 1004
         private const val SIXTY_MINUTES_SEC = 3600L
         /** 模型页刷新按钮文案：空状态卡与工具条共用同一份，改一处两边同步。 */
         private const val REFRESH_MODELS_LABEL = "刷新模型目录"
@@ -155,6 +161,35 @@ class MainActivity : Activity() {
     private var quotaApply: (() -> Unit)? = null
 
     /**
+     * 「积分监测」卡里会被后台监测器改写的控件（状态行）。
+     * 与 [quotaApply] 同一套"原地改文字、不重建页面"的做法 —— 监测器每 30 秒回一次，
+     * 重建页面会把用户正在看的卡片弹走。
+     */
+    private var monitorApply: (() -> Unit)? = null
+
+    /** 已提示过的自动换号时间戳，避免同一次换号被重复 toast。 */
+    private var seenSwitchAt = 0L
+
+    /** 导出到 SAF 时暂存的 JSON（点了「保存」拿到 Uri 才有地方写）。 */
+    private var pendingExportJson: String? = null
+
+    /**
+     * 导出完成后附在 toast 后面的说明（有账号读不出 token 时告诉用户少导了几个）。
+     * 与 [pendingExportJson] 成对存在、成对清空 —— 收口在 [clearPendingExport]，
+     * 别在两个字段上各自手工置 null（迟早漏一个，下一次导出会带着上一轮的说明）。
+     */
+    private var pendingExportNote: String? = null
+
+    /**
+     * 监测器回调引用本身。
+     *
+     * 留着它的唯一目的是 [onDestroy] 里做**身份比对**：旋转屏幕/窗口重建时新旧 Activity
+     * 会短暂共存，旧实例的 onDestroy 晚于新实例的 onCreate 执行时，无条件置 null 会把
+     * 新实例刚装上的监听清掉 —— 表现是"转屏后监测数字再也不动"。
+     */
+    private val monitorListener: (CreditMonitor.Snapshot) -> Unit = { onMonitorSnapshot(it) }
+
+    /**
      * 「刷新模型」完成后**原地更新模型 Tab**（重建卡片 + 更新计数），不整页 render。
      *
      * 与 [quotaApply] 同一个理由：`render()`/`redraw()` 会 `removeAllViews()`，
@@ -200,6 +235,8 @@ class MainActivity : Activity() {
         TraeAuthApi.selfCheck()
         // 批量签到纯计算自检：时刻/日期去重/结果往返判错会让用户白丢积分或多打上游。
         BatchCheckin.selfCheck()
+        // 积分监测的换号判据：余额未知（null）被判成 0 会因一次网络抖动把好好的账号切走。
+        CreditMonitor.selfCheck()
         // 国际服 plan_item 累积快照 → 增量的 diff 自检（错则客户端看到内容重复）
         TraeIntlUpstream.selfCheck()
         // 上游模型表解析自检：空 config_name 必须跳过、非聊天项必须过滤、name/context 回落规则
@@ -220,6 +257,10 @@ class MainActivity : Activity() {
         Gateway.selfCheck(this)
         // 保活页的 ROM 识别自检：SystemProperties 是隐藏 API（靠反射），读不到也不能崩。
         KeepAlive.selfCheck()
+
+        // 积分监测回调（监测器在主线程 post）。这里只改文字或整页重绘，
+        // 绝不在此做网络/持锁操作 —— 它运行在 UI 线程上。
+        CreditMonitor.listener = monitorListener
 
         // 网关由 Gateway（业务）+ GatewayService（保活）持有，**Activity 不再拥有它**：
         // 这样 Activity 被销毁时端口不会跟着断，用户才能"网关开着、切到别的客户端用"。
@@ -345,6 +386,7 @@ class MainActivity : Activity() {
         backAction.visibility = View.GONE
         // 页面要重建了，旧的"原地刷新"句柄作废（accountPage / modelsPage 构建时会重新登记）
         quotaApply = null
+        monitorApply = null
         modelsRefreshApply = null
         pageTitle.text = page.title
         pageSubtitle.text = page.subtitle
@@ -657,6 +699,45 @@ class MainActivity : Activity() {
                 addView(checkinAction, lp(-2, -2))
                 addView(rewardView, lp(-2, -2, start = 12))
             }, top(14))
+        })
+        addView(section("积分监测 · 自动换号"))
+        addView(card {
+            var autoLabel: TextView? = null
+            var thresholdLabel: TextView? = null
+            val statusView = caption(monitorStatusText())
+
+            autoLabel = linkAction(autoSwitchLabel()) {
+                val next = !CreditMonitor.isAutoSwitchEnabled(this@MainActivity)
+                CreditMonitor.setAutoSwitchEnabled(this@MainActivity, next)
+                autoLabel?.text = autoSwitchLabel()
+            }
+            thresholdLabel = linkAction(thresholdLabelText()) {
+                promptThreshold { thresholdLabel?.text = thresholdLabelText() }
+            }
+            addView(row(top = 2) {
+                addView(autoLabel!!, weighted())
+                addView(thresholdLabel!!, weighted(start = 8))
+            })
+            addView(caption(
+                "服务运行中每 ${CreditMonitor.TICK_MS / 1000} 秒查一次当前账号的剩余积分；" +
+                    "低于阈值就自动切到余额最多的另一个国服账号。"), top(10))
+            addView(statusView, top(8))
+            // 监测器每 30 秒回调一次，只改这一行文字（重建页面会把滚动位置弹回去）
+            monitorApply = { statusView.text = monitorStatusText() }
+        })
+
+        addView(section("账号备份"))
+        addView(card {
+            addView(text("导出 / 导入（JSON）", FS_CARD_TITLE, true))
+            addView(caption(
+                "导出内容含「明文」access / refresh token，等于账号钥匙：只在本机与自己的设备之间传，" +
+                    "别发到公开地方。换设备时在新机导入即可，不用重新登录。\n" +
+                    "导出前可以勾选要带走哪几个账号；导入会先列出「新增 / 更新 / 跳过」，勾完再导。\n" +
+                    "同一份文件别在多台设备同时用 —— refresh token 是轮换的，后来的会让先前的失效。"), top(6))
+            addView(row(top = 12) {
+                addView(action("导出为文件", outlined = true) { promptExportAccounts() }, weighted())
+                addView(action("从文件导入", outlined = true) { importFromFile() }, weighted(start = 8))
+            })
         })
         addView(section("批量签到"))
         addView(batchCheckinCard())
@@ -1363,6 +1444,11 @@ class MainActivity : Activity() {
         cancelText: String? = "取消",
         danger: Boolean = false,
         content: View? = null,
+        /**
+         * 返回 false 时**不关窗、不回调**。用于"一个都没选就别放行"这类前置校验 ——
+         * 确定按钮是先 dismiss 再 onOk 的，没有这个守卫就只能关掉窗再弹 toast，体验很差。
+         */
+        okGuard: (() -> Boolean)? = null,
         onOk: () -> Unit,
     ): AlertDialog {
         var dialog: AlertDialog? = null
@@ -1377,6 +1463,7 @@ class MainActivity : Activity() {
                     addView(action(cancelText, outlined = true) { dialog?.dismiss() }, weighted())
                 }
                 addView(action(okText, danger = danger) {
+                    if (okGuard?.invoke() == false) return@action
                     dialog?.dismiss()
                     onOk()
                 }, weighted(start = if (cancelText != null) 8 else 0))
@@ -1570,6 +1657,320 @@ class MainActivity : Activity() {
         (getSystemService(CLIPBOARD_SERVICE) as ClipboardManager)
             .setPrimaryClip(ClipData.newPlainText(label, value))
         toast(tip)
+    }
+
+    // ------------------------------------------------------------------
+    // 积分监测 · 自动换号
+    // ------------------------------------------------------------------
+
+    private fun autoSwitchLabel(): String =
+        if (CreditMonitor.isAutoSwitchEnabled(this)) "自动换号：开" else "自动换号：关"
+
+    private fun thresholdLabelText(): String = "换号阈值：≤ ${CreditMonitor.threshold(this)}"
+
+    /**
+     * 监测卡的状态行。
+     *
+     * 刻意不把"每 30 秒"写成保证：Doze/省电模式会冻结后台线程，间隔会漂。
+     * 显示**上次检查的实际时间**，用户看到的才是事实。
+     */
+    private fun monitorStatusText(): String {
+        val snap = CreditMonitor.currentSnapshot()
+            ?: return if (Gateway.isRunning) "等待首次检查…" else "服务未运行，监测暂停"
+        val time = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(snap.atMs))
+        val balance = snap.balance?.let { "余 $it" } ?: "余额未取到"
+        val sw = CreditMonitor.lastSwitchOrNull()
+        val tail = if (sw != null && System.currentTimeMillis() - sw.atMs < 10 * 60_000L) {
+            " · 已自动从 ${sw.fromNick} 切到 ${sw.toNick}"
+        } else {
+            ""
+        }
+        return "上次检查 $time · $balance$tail"
+    }
+
+    /**
+     * 监测器回调（主线程）。
+     *
+     * 自动换号发生时**必须作废账号级缓存**：否则账号页会拿新账号的昵称配旧账号的
+     * 余额/签到状态（"新账号继承今日已签到"这个坑项目里踩过，见 doSwitchAccount 注释）。
+     */
+    private fun onMonitorSnapshot(snapshot: CreditMonitor.Snapshot) {
+        if (isFinishing || isDestroyed) return
+        val sw = snapshot.switch
+        if (sw != null && sw.atMs > seenSwitchAt) {
+            seenSwitchAt = sw.atMs
+            invalidateAccountQuota()
+            toast("积分低于阈值，已自动切到 ${sw.toNick}（余 ${sw.toBalance}）")
+            // 账号页要整页重绘：昵称 / UID / 区域都变了，改一行文字覆盖不了
+            if (currentPage == Page.ACCOUNT && !showKeepAlive && !showStyle) redraw()
+            return
+        }
+        monitorApply?.invoke()
+    }
+
+    /** 阈值输入：任意非负整数（不是固定几档，用户要能填自己的数字）。 */
+    private fun promptThreshold(onDone: () -> Unit) {
+        val edit = EditText(this).apply {
+            hint = "剩余积分 ≤ 这个值就换号"
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setText(CreditMonitor.threshold(this@MainActivity).toString())
+            setSelection(text.length)
+            setTextColor(color("on_surface"))
+            setHintTextColor(color("on_surface_variant"))
+            background = shape("surface_container", RADIUS_CONTROL)
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+        }
+        confirmDialog(
+            title = "换号阈值",
+            message = "当前账号剩余积分低于或等于这个数字时，自动切到余额更多的账号。\n" +
+                "填 0 = 积分用完才切。",
+            okText = "保存",
+            content = edit,
+        ) {
+            val value = edit.text?.toString()?.trim()?.toLongOrNull()
+            if (value == null || value < 0) {
+                toast("请输入 0 或正整数")
+                return@confirmDialog
+            }
+            CreditMonitor.setThreshold(this, value)
+            toast("阈值已设为 $value")
+            onDone()
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 账号备份（JSON）
+    // ------------------------------------------------------------------
+
+    /** 导出第一步：**总是**让用户勾选（1 个账号也弹，行为一致比省一次点击重要）。 */
+    private fun promptExportAccounts() {
+        val metas = TraeAuthStore.list(this)
+        if (metas.isEmpty()) {
+            toast("还没有账号，先登录一个再导出")
+            return
+        }
+        promptPickAccounts(
+            title = "选择要导出的账号",
+            message = "勾选要写进这个文件的账号（共 ${metas.size} 个）。\n" +
+                "文件里是明文 token，等于账号钥匙，别发到公开地方。",
+            items = metas.map { m ->
+                PickItem(
+                    uid = m.uid,
+                    title = m.nickname.ifBlank { m.uid },
+                    subtitle = "UID ${m.uid} · ${regionLabelFull(m.region)} · ${expShort(m.expiresAt)}",
+                    chipText = regionLabel(m.region),
+                    chipBg = if (m.region.isSupported) "primary_container" else "warning_container",
+                    chipFg = if (m.region.isSupported) "primary" else "warning",
+                )
+            },
+            okText = "导出",
+        ) { uids -> exportToFile(uids) }
+    }
+
+    /** 导出到文件。SAF 不需要任何存储权限，也不需要 FileProvider（全程 content:// 单次授权）。 */
+    private fun exportToFile(uids: Set<String>) {
+        val json = runCatching { TraeAuthStore.exportJson(this, uids) }.getOrElse {
+            toast("导出失败：${it.message}")
+            return
+        }
+        // 解不开 token 的账号已被 exportJson 跳过 —— 文件名必须写**真实**条数，
+        // 否则"勾 3 个、文件名写 3、文件里只有 2 条"，导入端汇总数对不上，用户会以为文件坏了。
+        val n = TraeAuthStore.countAccounts(json)
+        if (n == 0) {
+            toast("选中的账号都读不出 token，未导出")
+            return
+        }
+        pendingExportJson = json
+        pendingExportNote = if (n < uids.size) "（${uids.size - n} 个账号读不出 token，已跳过）" else ""
+        val name = "traework2api-${n}accounts-" +
+            SimpleDateFormat("yyyyMMdd-HHmm", Locale.US).format(Date()) + ".json"
+        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "application/json"
+            putExtra(Intent.EXTRA_TITLE, name)
+        }
+        runCatching { startActivityForResult(intent, REQ_EXPORT) }.onFailure {
+            clearPendingExport()
+            toast("没有可用的文件选择器")
+        }
+    }
+
+    /** 暂存的明文一律从这一个出口清 —— 两个字段成对存在，别在别处单独置 null。 */
+    private fun clearPendingExport() {
+        pendingExportJson = null
+        pendingExportNote = null
+    }
+
+    private fun importFromFile() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "*/*"
+            // 有的文件管理器把 .json 报成 text/plain，只写 application/json 会选不中
+            putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("application/json", "text/plain"))
+        }
+        runCatching { startActivityForResult(intent, REQ_IMPORT) }
+            .onFailure { toast("没有可用的文件选择器") }
+    }
+
+    /**
+     * 导入第一步：先出示"会发生什么"（新增/更新/跳过各几个），再让用户勾。
+     *
+     * 为什么不选完文件直接导：用户从旧备份恢复时，最想知道的是"导进来会不会把现在能用的号弄坏"。
+     * 预览把这件事摊开，而不是导完再告诉他"跳过 3 个"。
+     */
+    private fun promptImportPreview(text: String) {
+        val previews = runCatching { TraeAuthStore.previewImport(this, text) }.getOrElse {
+            toast("导入失败：${it.message}")
+            return
+        }
+        val added = previews.count { it.status == TraeAuthStore.ImportStatus.ADD }
+        val updated = previews.count { it.status == TraeAuthStore.ImportStatus.UPDATE }
+        val skipped = previews.count { it.status == TraeAuthStore.ImportStatus.SKIP }
+
+        if (added + updated == 0) {
+            // 全是"跳过"：仍然给出理由，别让用户以为导入失败
+            confirmDialog(
+                title = "没有需要导入的账号",
+                message = "文件里 ${previews.size} 个账号，本地凭据都比它新且没过期，导进来也会被跳过。\n" +
+                    "想强制用文件里这份：先在账号页删掉那个号，再导入。",
+                okText = "知道了",
+                cancelText = null,
+            ) {}
+            return
+        }
+
+        promptPickAccounts(
+            title = "确认要导入的账号",
+            message = "文件里 ${previews.size} 个：新增 $added，更新 $updated，跳过 $skipped。\n" +
+                "「跳过」= 本地这条凭据更新且还没过期 —— 覆盖会把能用的 refresh token 换成旧的。",
+            items = previews.map { p ->
+                PickItem(
+                    uid = p.uid,
+                    title = p.nickname.ifBlank { p.uid },
+                    subtitle = importRowSubtitle(p),
+                    chipText = when (p.status) {
+                        TraeAuthStore.ImportStatus.ADD -> "新增"
+                        TraeAuthStore.ImportStatus.UPDATE -> "更新"
+                        TraeAuthStore.ImportStatus.SKIP -> "跳过"
+                    },
+                    chipBg = when (p.status) {
+                        TraeAuthStore.ImportStatus.ADD -> "success_container"
+                        TraeAuthStore.ImportStatus.UPDATE -> "primary_container"
+                        TraeAuthStore.ImportStatus.SKIP -> "surface_variant"
+                    },
+                    chipFg = when (p.status) {
+                        TraeAuthStore.ImportStatus.ADD -> "success"
+                        TraeAuthStore.ImportStatus.UPDATE -> "primary"
+                        TraeAuthStore.ImportStatus.SKIP -> "on_surface_variant"
+                    },
+                    // 跳过项不给勾：勾了也会被合并规则再判一次跳过，
+                    // "明确要求导入却什么都没发生"是最糟的体验。
+                    selectable = p.status != TraeAuthStore.ImportStatus.SKIP,
+                    checked = p.status != TraeAuthStore.ImportStatus.SKIP,
+                )
+            },
+            okText = "导入",
+        ) { uids -> applyImport(text, uids) }
+    }
+
+    /** 预览行副标题：三种状态各自说清"为什么"。 */
+    private fun importRowSubtitle(p: TraeAuthStore.ImportPreview): String = when (p.status) {
+        TraeAuthStore.ImportStatus.ADD -> "新账号 · ${expShort(p.fileExpiresAt)}"
+        TraeAuthStore.ImportStatus.UPDATE ->
+            "覆盖本地 · ${expShort(p.localExpiresAt)} → ${expShort(p.fileExpiresAt)}"
+        TraeAuthStore.ImportStatus.SKIP ->
+            "本地凭据更新（${expShort(p.localExpiresAt)}），已跳过"
+    }
+
+    /** 紧凑到期时间：`formatExp` 会写"剩 x 天"，在列表一行里放不下。 */
+    private fun expShort(epochSec: Long): String =
+        if (epochSec <= 0L) "到期未知"
+        else SimpleDateFormat("MM-dd HH:mm", Locale.getDefault()).format(Date(epochSec * 1000)) + " 到期"
+
+    /**
+     * 导入：解析 + N 次 KeyStore 加密都是重活，必须离开主线程。
+     * 结果原样报"新增 / 更新 / 跳过"三个数 —— 只说"导入成功"用户不知道覆盖了什么。
+     */
+    private fun applyImport(text: String, uids: Set<String>) {
+        toast("正在导入…")
+        thread(name = "account-import") {
+            val result = runCatching { TraeAuthStore.importJson(this, text, uids) }
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                result.onSuccess { report ->
+                    // 跳过要解释清楚：用户把旧备份导回同一台机器时全被跳过，不说明会以为失败
+                    val note = if (report.skipped > 0) "，跳过 ${report.skipped}（本地凭据更新）" else ""
+                    toast("导入完成：新增 ${report.added}，更新 ${report.updated}$note")
+                    invalidateAccountQuota()
+                    redraw()
+                }.onFailure { e ->
+                    toast("导入失败：${e.message}")
+                }
+            }
+        }
+    }
+
+    /**
+     * 系统文件选择器的回执。
+     *
+     * 用平台的 startActivityForResult 而不是 registerForActivityResult：本项目
+     * **没有任何 androidx 依赖**（只有 okhttp），为两个按钮引入 androidx.activity
+     * 就得连带 AppCompat 迁移，不值得。
+     */
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (resultCode != RESULT_OK) {
+            // 取消 / 异常回执：暂存的明文一律清掉，别挂到下一次导出上
+            clearPendingExport()
+            return
+        }
+        val uri = data?.data ?: run {
+            // 用户点了返回但没选文件时 resultCode 通常已是 CANCEL；这里兜住个别 ROM 的异常回执
+            clearPendingExport()
+            toast("没有选中文件")
+            return
+        }
+        when (requestCode) {
+            REQ_EXPORT -> {
+                // Activity 被系统重建（转屏 / 换风格）时字段会丢 —— 静默什么都不做是最糟的
+                val json = pendingExportJson ?: run {
+                    toast("导出内容已失效，请重新导出")
+                    return
+                }
+                val note = pendingExportNote.orEmpty()
+                clearPendingExport()
+                thread(name = "account-export") {
+                    val result = runCatching {
+                        // "wt" 而不是默认的 "w"：默认模式**不截断**，覆盖一个内容变短的同名文件时
+                        // 尾部会残留旧字节，导出的 JSON 直接坏掉 —— 而用户看到的是"导出成功"。
+                        contentResolver.openOutputStream(uri, "wt")?.use { out ->
+                            out.write(json.toByteArray(Charsets.UTF_8))
+                            out.flush()
+                        } ?: throw java.io.IOException("无法打开目标文件")
+                    }
+                    runOnUiThread {
+                        toast(
+                            if (result.isSuccess) "已导出到所选位置$note"
+                            else "写入失败：${result.exceptionOrNull()?.message}"
+                        )
+                    }
+                }
+            }
+
+            REQ_IMPORT -> thread(name = "account-import-read") {
+                val result = runCatching {
+                    contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                        ?.toString(Charsets.UTF_8)
+                        ?: throw java.io.IOException("无法读取该文件")
+                }
+                runOnUiThread {
+                    result.onSuccess { text ->
+                        if (text.length > 1_048_576) toast("文件太大，不像是账号备份")
+                        else promptImportPreview(text)   // 先给预览，勾完才真正写盘
+                    }.onFailure { toast("读取失败：${it.message}") }
+                }
+            }
+        }
     }
 
     /** 拉积分/额度（后台线程，用解密后的真实 token 打 ug 接口），成功后重绘账号页。 */
@@ -1841,6 +2242,11 @@ class MainActivity : Activity() {
         quotaLoading = false
         modelsLoading = false
         checkinBusy = false
+        // 监测器是 object，活得比 Activity 久：不摘监听就是长驻内存泄漏，且回调还会打到
+        // 已销毁的界面上。它自己会继续跑（服务还在），只是不再往这里推。
+        // 用身份比对而不是无条件置 null：窗口重建时旧实例的 onDestroy 可能晚于新实例的 onCreate。
+        if (CreditMonitor.listener === monitorListener) CreditMonitor.listener = null
+        monitorApply = null
         super.onDestroy()
     }
 
@@ -1944,6 +2350,180 @@ class MainActivity : Activity() {
     private fun divider(): View = View(this).apply {
         setBackgroundColor(color("outline_variant"))
         layoutParams = LinearLayout.LayoutParams(-1, dp(1))
+    }
+
+    // ------------------------------------------------------------------
+    // 多选弹窗（账号导出 / 导入共用）
+    // ------------------------------------------------------------------
+
+    /**
+     * 多选弹窗的一行。文案全由调用方给，这里只管"能不能选 / 默认选没选 / 右边那枚标记"。
+     *
+     * @param selectable false = 只展示不可选（导入时"会跳过"的账号）
+     */
+    private data class PickItem(
+        val uid: String,
+        val title: String,
+        val subtitle: String,
+        val chipText: String? = null,
+        val chipBg: String = "primary_container",
+        val chipFg: String = "primary",
+        val selectable: Boolean = true,
+        val checked: Boolean = true,
+    )
+
+    /**
+     * 自绘勾选框外观。颜色/描边全走 AppStyle，不写字面量色值。
+     *
+     * 圆角取 `minOf(RADIUS_CONTROL, 6f)`：大圆角风格下也不会被揉成一枚圆点 ——
+     * 那会和单选（[radioDot]）视觉混淆。选中态是"主色实心 + ✓"，不靠颜色单独传达。
+     */
+    private fun paintCheckBox(box: TextView, checked: Boolean) {
+        val radius = minOf(RADIUS_CONTROL, 6f)
+        box.text = if (checked) "✓" else ""
+        box.setTextColor(color(if (checked) "on_primary" else "on_surface_variant"))
+        box.background =
+            if (checked) shape("primary", radius) else shape("surface", radius, "outline", 2)
+    }
+
+    /**
+     * 单行：勾选框 + 两行文案 + 右侧标记。整行可点，行高 56dp（触控目标远大于 48dp）。
+     *
+     * @return (行 View, "把勾选态改成 X"的重绘函数) —— 后半段给"全选/清空"用，
+     *   避免它们自己去找每一行的勾选框（找到也未必是同一个实例）。
+     */
+    private fun pickRow(
+        item: PickItem,
+        checked: Boolean,
+        onToggle: (Boolean) -> Unit,
+    ): Pair<View, (Boolean) -> Unit> {
+        var on = checked
+        val box = TextView(this).apply {
+            gravity = Gravity.CENTER
+            textSize = FS_CHIP.toFloat()
+            typeface = Typeface.DEFAULT_BOLD
+        }
+        paintCheckBox(box, on)
+
+        val texts = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(text(
+                item.title, FS_VALUE, true,
+                if (item.selectable) "on_surface" else "on_surface_variant",
+            ).apply {
+                isSingleLine = true
+                ellipsize = TextUtils.TruncateAt.END
+            })
+            addView(caption(item.subtitle).apply {
+                isSingleLine = true
+                ellipsize = TextUtils.TruncateAt.END
+            }, top(2))
+        }
+
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            minimumHeight = dp(56)
+            setPadding(0, dp(6), 0, dp(6))
+            if (item.selectable) addView(box, lp(dp(22), dp(22), end = 12))
+            addView(texts, weighted())
+            item.chipText?.let { addView(chip(it, item.chipBg, item.chipFg), lp(-2, -2, start = 10)) }
+        }
+
+        // 只在 row 建好之后定义：它要改 row 的 contentDescription（读屏用户靠这句知道选没选上）
+        fun applyState(state: Boolean) {
+            on = state
+            paintCheckBox(box, state)
+            // 不可选的行没有勾选框，不能说"已选中/未选中"——读屏用户会以为自己能点
+            row.contentDescription = if (!item.selectable) {
+                "${item.title}，不可选（${item.chipText ?: "已跳过"}）"
+            } else {
+                item.title + if (state) "，已选中" else "，未选中"
+            }
+        }
+
+        applyState(on)
+        if (item.selectable) row.setOnClickListener {
+            applyState(!on)
+            onToggle(on)
+        }
+        return row to { want -> if (item.selectable) applyState(want) }
+    }
+
+    /**
+     * 账号多选弹窗（项目没有 androidx，也不为一个弹窗引依赖 → 自绘，见文件头设计 token 约定）。
+     *
+     * 三条硬约束：
+     *  - 列表**必须限高滚动**：确定/取消按钮是内容末尾的最后一个 View，行一多按钮会被顶出屏幕；
+     *  - 点一行只重绘**该行 + 计数行**，绝不 render()/redraw() —— 那会重建整页、滚回页首；
+     *  - 一个都没选时**不关窗**（[confirmDialog] 的 okGuard），而不是关掉再 toast。
+     */
+    private fun promptPickAccounts(
+        title: String,
+        message: String,
+        items: List<PickItem>,
+        okText: String,
+        onConfirm: (Set<String>) -> Unit,
+    ) {
+        val selected = items.filter { it.selectable && it.checked }.map { it.uid }.toMutableSet()
+        val appliers = arrayOfNulls<(Boolean) -> Unit>(items.size)
+        val selectableCount = items.count { it.selectable }
+
+        val countLabel = text("", FS_CAPTION, true, "on_surface_variant")
+        var allBtn: TextView? = null
+
+        fun refreshCount() {
+            countLabel.text = if (selected.isEmpty()) "已选 0 个 · 至少选 1 个" else "已选 ${selected.size} 个"
+            countLabel.setTextColor(color(if (selected.isEmpty()) "warning" else "on_surface_variant"))
+            allBtn?.text = if (selectableCount > 0 && selected.size == selectableCount) "清空" else "全选"
+        }
+
+        allBtn = linkAction("全选") {
+            val selectAll = selected.size < selectableCount
+            selected.clear()
+            if (selectAll) selected += items.filter { it.selectable }.map { it.uid }
+            items.forEachIndexed { i, item ->
+                appliers[i]?.invoke(item.selectable && item.uid in selected)
+            }
+            refreshCount()
+        }
+
+        val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        items.forEachIndexed { i, item ->
+            val (rowView, apply) = pickRow(item, item.uid in selected) { isOn ->
+                if (isOn) selected += item.uid else selected -= item.uid
+                refreshCount()
+            }
+            appliers[i] = apply
+            list.addView(rowView, LinearLayout.LayoutParams(-1, -2))
+            if (i < items.lastIndex) list.addView(divider())
+        }
+        refreshCount()
+
+        // 行高固定 56dp，所以列表高度算得准；超出上限就在框内滚。
+        // 分隔线要按 dp(1) 算（divider() 用的是 dp(1)）：少算的话最后一行的分隔线会被裁掉。
+        val rowsHeight = dp(56) * items.size + dp(1) * (items.size - 1)
+        val maxHeight = minOf(dp(280), (resources.displayMetrics.heightPixels * 0.35f).toInt())
+        val scroller = ScrollView(this).apply {
+            isFillViewport = false
+            addView(list, FrameLayout.LayoutParams(-1, -2))
+        }
+        val body = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(row(6) {
+                addView(countLabel, weighted())
+                addView(allBtn, lp(-2, -2))
+            })
+            addView(scroller, lp(-1, minOf(rowsHeight, maxHeight), top = 6))
+        }
+
+        confirmDialog(
+            title = title,
+            message = message,
+            okText = okText,
+            content = body,
+            okGuard = { selected.isNotEmpty() },
+        ) { onConfirm(selected.toSet()) }
     }
 
     /**
