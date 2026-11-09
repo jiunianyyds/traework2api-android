@@ -27,20 +27,41 @@ import android.provider.Settings
  */
 object KeepAlive {
 
-    /** 一项保活检查。 */
+    /**
+     * 一项保活检查。
+     *
+     * 三态而不是两态：除了"就绪/未就绪"，还要能表达"**系统根本查不到**"。
+     * 厂商私有的「自启动 / 省电策略」没有公开查询接口，以前这两项硬编码成 `ok=false`，
+     * 于是界面 `count { !it.ok }` 恒 ≥ 2 —— 用户把能开的都开了，概览页还在催
+     * "还有 2 项未开启"，而"保活已就绪"是一次都到不了的分支。
+     */
     data class Item(
         /** 展示名，如「电池优化白名单」。 */
         val title: String,
-        /** 是否已就绪。 */
+        /** 是否已就绪。仅当 [detectable] 为 true 时有意义。 */
         val ok: Boolean,
         /** 未就绪时为什么需要它（给用户看的大白话）。 */
         val why: String,
         /**
-         * 是否可以用 Intent 一键跳转。
-         * false = 厂商私有页面，只能靠 [romGuide] 引导用户自己找。
+         * 一键打开对应系统页面；null = 跳不了（厂商私有），只能靠 [romGuide] 引导。
+         *
+         * 以前这里是个 `autoOpenable: Boolean`，跳转动作另在 UI 里按**中文标题字符串**匹配
+         * （`when (title) { "电池优化白名单" -> … }`）—— 文案改一个字，按钮就静默失效并弹
+         * "这个页面在本机打不开"。把动作本身放进 Item 里，这类错配从根上不存在。
          */
-        val autoOpenable: Boolean
-    )
+        val open: ((Context) -> Boolean)? = null,
+        /**
+         * 系统能否查询到状态。false = 厂商私有、查不到 —— 此时**不计入待开启数**，
+         * 也不能显示"✓ 正常"（那是编造事实），只做路径引导。
+         */
+        val detectable: Boolean = true,
+    ) {
+        /** 真正需要用户处理的项：查得到、且没就绪。 */
+        val needsAction: Boolean get() = detectable && !ok
+
+        /** 能不能一键跳过去（跳不了就只能照着路径自己找）。 */
+        val autoOpenable: Boolean get() = open != null
+    }
 
     /** 本机 ROM 家族，决定引导文案。 */
     enum class Rom(val label: String) {
@@ -140,32 +161,35 @@ object KeepAlive {
             Item(
                 "电池优化白名单", ignoringBattery,
                 "没加入白名单时，系统省电策略会在息屏后清掉后台服务 —— 这是真机上最致命的一项。",
-                autoOpenable = true
+                open = ::openBatteryWhitelist,
             ),
             Item(
                 "通知权限", notifOk,
                 "前台服务的常驻通知需要它；通知不可见时系统会弱化甚至清理服务。",
-                autoOpenable = true
+                open = ::openAppNotificationSettings,
             ),
             Item(
                 "通知渠道未被关闭", !channelOff,
                 "渠道被关掉等同于通知不可见，服务会被削弱。",
-                autoOpenable = false
+                // 以前这里是 autoOpenable=false，但 UI 的字符串映射里其实写好了
+                // "通知渠道未被关闭" → openAppNotificationSettings —— 一个永远走不到的分支。
+                open = ::openAppNotificationSettings,
             ),
             Item(
                 "精确闹钟", canExact,
                 "服务被厂商强杀后靠它定时唤醒恢复；被禁用时只能退化成非精确闹钟，Doze 下可能延迟数小时。",
-                autoOpenable = true
+                open = ::openExactAlarm,
             ),
             Item(
-                "自启动 / 后台运行", false,
+                "自启动 / 后台运行", ok = false,
                 "系统不提供查询接口，需要你自己确认（路径见下方）。",
-                autoOpenable = false
+                // 查不到 = 不计入待开启。以前这里 ok 硬编码 false，让"全部就绪"永远不可达。
+                detectable = false,
             ),
             Item(
-                "省电策略 = 无限制", false,
+                "省电策略 = 无限制", ok = false,
                 "系统不提供查询接口，需要你自己确认（路径见下方）。",
-                autoOpenable = false
+                detectable = false,
             )
         )
     }
@@ -228,6 +252,20 @@ object KeepAlive {
         // 属性优先于品牌名：一加手机跑的是 ColorOS，按品牌名会判错，必须靠属性纠正。
         check(romFor("OnePlus", "OnePlus") { it == "ro.build.version.oplusrom" } == Rom.COLOR_OS) {
             "自检失败：一加跑 ColorOS 时应靠属性判为 ColorOS（品牌名会误判）"
+        }
+
+        // 三态的小不变式：查不到的项永远不该被算进"待开启"，否则"全部就绪"不可达
+        // （v0.4.14 就是这样：两项硬编码 false，概览页永远在催 2 项）。
+        val items = listOf(
+            Item("查得到且就绪", ok = true, why = ""),
+            Item("查得到未就绪", ok = false, why = "", open = { true }),
+            Item("查不到", ok = false, why = "", detectable = false),
+        )
+        check(items.count { it.needsAction } == 1) {
+            "自检失败：待开启项应只统计「查得到且未就绪」的项，得到 ${items.count { it.needsAction }}"
+        }
+        check(items.none { !it.detectable && it.needsAction }) {
+            "自检失败：查不到的项不得计入 needsAction（会让待办永远清不掉）"
         }
         // 属性读不到（SystemProperties 反射失败）时不能崩，要能回落到品牌名。
         check(runCatching { romFor("Xiaomi", "Xiaomi", none) }.isSuccess) {

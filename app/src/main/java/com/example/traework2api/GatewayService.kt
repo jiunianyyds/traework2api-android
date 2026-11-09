@@ -153,13 +153,29 @@ class GatewayService : Service() {
             cancelWatchdog()
             return START_NOT_STICKY
         }
-        // 只要服务被启动（用户点按 / 看门狗兜底 / 划掉后拉回），就记为"用户希望它运行"，
-        // 这样 onTaskRemoved 与看门狗的前置校验才会放行。
-        markShouldRun(applicationContext, true)
+        // 只要服务被启动（用户点按 / 看门狗兜底 / 划掉后拉回），就记为"用户希望它运行"——
+        // 但**只在启动成功后**才落（见下面 markShouldRun 的位置）。
+        // ⚠️ 这行判断用 shouldRun 而不是已落盘的标记：闹钟 Intent 一旦投递出去，
+        // cancelWatchdog 拦不住，所以这里必须前置校验用户意图（v0.4.8 踩过）。
         // 必须在数秒内 startForeground，否则系统按 ANR 处理并杀掉服务。
         startForeground(NOTIFICATION_ID, notification())
         acquireWakeLock()
-        Gateway.start(applicationContext)
+        // ⚠️ Gateway.start() 现在**不抛异常**，失败时返回 false（原因在 Gateway.lastStartError）。
+        // 以前端口被占会从这一行抛出去 → 未捕获 → 进程崩溃 → "每次开 App 都闪退"。
+        // 失败时老实收摊：不能 running=true（界面会显示"运行中"却没端口在听），
+        // 也不再启动积分监测（那会持续打上游却服务不了任何请求）。
+        if (!Gateway.start(applicationContext)) {
+            Log.e(TAG, "网关启动失败，服务收摊：${Gateway.lastStartError}")
+            running = false
+            cancelWatchdog()
+            releaseWakeLock()
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            // 刻意**不改** should_run：那是"用户想不想它跑"，与"这次能不能跑起来"是两件事。
+            // 改成 false 会让用户手动点过启动的意图凭空消失，下次进 App 也不再自动重试。
+            return START_NOT_STICKY
+        }
+        markShouldRun(applicationContext, true)
         running = true
         // 每次进入都续期看门狗，防止闹钟一次性触发后再无兜底。
         scheduleWatchdog()

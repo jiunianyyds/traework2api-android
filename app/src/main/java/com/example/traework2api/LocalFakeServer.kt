@@ -5,6 +5,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.OutputStream
 import java.net.ServerSocket
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 
@@ -100,6 +101,28 @@ class LocalFakeServer(private val apiKey: String) {
             val expect = "{\"a\":\"你好\"}"
             val gotChunked = readChunkedBody(java.io.ByteArrayInputStream(chunked.toByteArray(Charsets.UTF_8)))
             check(gotChunked == expect) { "自检失败：chunked 解析结果不对，得到 [$gotChunked]" }
+
+            // chunked 的体上限：这条曾整条漏掉（只给 Content-Length 加了闸），
+            // 于是持本地 key 的客户端发一个畸形 chunk 头就能让 `ByteArray(size)` 分配 2GB、
+            // 抛 OutOfMemoryError 把进程打死。两种超限都必须**在分配之前**被拒。
+            // 用小 maxBytes 造样本，避免自检自己吃掉十几 MB 内存。
+            val oneChunkHuge = (200).toString(16) + "\r\n" + "a".repeat(200) + "\r\n0\r\n\r\n"
+            check(runCatching {
+                readChunkedBody(java.io.ByteArrayInputStream(oneChunkHuge.toByteArray()), maxBytes = 100)
+            }.isFailure) { "自检失败：单块超过上限必须被拒（否则 2GB 分配会 OOM 打死进程）" }
+            val cumulativeHuge = (60).toString(16) + "\r\n" + "a".repeat(60) + "\r\n" +
+                (60).toString(16) + "\r\n" + "a".repeat(60) + "\r\n0\r\n\r\n"
+            check(runCatching {
+                readChunkedBody(java.io.ByteArrayInputStream(cumulativeHuge.toByteArray()), maxBytes = 100)
+            }.isFailure) { "自检失败：累计超过上限必须被拒" }
+            // 上限之内必须照常工作（别把闸设成把正常请求也挡了）
+            check(readChunkedBody(
+                java.io.ByteArrayInputStream(cumulativeHuge.toByteArray()), maxBytes = 120
+            ) == "a".repeat(120)) { "自检失败：上限内的 chunked 请求应正常解析" }
+            // 长度行溢出/非法必须报错，不能被当成 EOF 悄悄返回半截 body
+            check(runCatching {
+                readChunkedBody(java.io.ByteArrayInputStream("FFFFFFFF\r\nabc\r\n0\r\n\r\n".toByteArray()))
+            }.isFailure) { "自检失败：非法 chunk 长度行必须报错（静默 break 会返回残缺 body）" }
             // 中文必须按字节切块：按字符切会把多字节字符劈开 → 解码出乱码。
             check(readChunkedBody(java.io.ByteArrayInputStream("3\r\n你\r\n0\r\n\r\n".toByteArray(Charsets.UTF_8))) == "你") {
                 "自检失败：chunked 里的中文（多字节）被切坏了"
@@ -125,6 +148,19 @@ class LocalFakeServer(private val apiKey: String) {
             }
             check(agg.getJSONObject("usage").optInt("total_tokens") == 7) { "自检失败：usage 未被带出" }
             check(agg.optString("id") == "c1") { "自检失败：聚合后的 id 不对" }
+
+            // 上游失败时只有 `data: {"error":…}`，聚合器**必然**给不出内容 —— 这钉住了
+            // "为什么非流式失败路径必须回 502 而不能照常 aggregate 成 200"：
+            // 那样客户端会收到 content:"" + finish_reason:"stop" 的"成功"响应，静默吞错。
+            val errOnly = listOf(
+                "data: {\"error\":{\"message\":\"upstream http 401\",\"type\":\"api_error\"}}\n\n",
+                "data: [DONE]\n\n"
+            )
+            val errAgg = aggregateChunks(errOnly, "m3")
+            val errMsg = errAgg.getJSONArray("choices").getJSONObject(0).getJSONObject("message")
+            check(errMsg.optString("content").isEmpty()) {
+                "自检失败：错误帧不该被聚合成有内容的回答（否则 200 空气泡就是这个 bug 的形态）"
+            }
 
             // 工具调用：name 在首帧、arguments 分片在后帧，必须合并成一条而不是互相覆盖。
             val toolFrames = listOf(
@@ -169,6 +205,20 @@ class LocalFakeServer(private val apiKey: String) {
          */
         private const val MAX_BODY_BYTES = 8 * 1024 * 1024
 
+        /**
+         * 单行请求头（含 chunk 长度行）上限。同样是安全边界，不是可调项：
+         * 请求行/头是**逐字节**读进 `StringBuilder` 的，无上限时一个不换行的客户端就能
+         * 让内存一直涨（`soTimeout` 只是 15s 的兜底，局域网内足够塞进几十 MB）。
+         * 8KB 远超任何真实客户端（最长的 Cookie/JWT 也就几 KB）。
+         */
+        internal const val MAX_HEADER_LINE = 8 * 1024
+
+        /** 并发连接上限（见实例字段 connSlots）。 */
+        private const val MAX_CONNS = 32
+
+        /** 拿不到空位时最多等多久再丢弃：给瞬时并发一点缓冲，又不会把 accept 线程堵死。 */
+        private const val CONN_QUEUE_WAIT_MS = 5_000L
+
         /** 与实例方法同逻辑的静态版，供 [selfCheck] 直接调用。 */
         private fun readBody(input: java.io.InputStream, contentLength: Int): String {
             if (contentLength <= 0) return ""
@@ -195,8 +245,9 @@ class LocalFakeServer(private val apiKey: String) {
          * 长度按**字节**算（中文一字多字节），故逐块按字节读、最后整体 UTF-8 解码 ——
          * 不能按字符拼（与 [readBody] 是同一个坑）。
          */
-        internal fun readChunkedBody(input: java.io.InputStream): String {
+        internal fun readChunkedBody(input: java.io.InputStream, maxBytes: Int = MAX_BODY_BYTES): String {
             val buf = java.io.ByteArrayOutputStream()
+            var total = 0
             // 逐字节读到 CRLF：不能用 BufferedReader，它会预读进自己的缓冲、把后续 chunk 吃掉。
             fun readLine(): String? {
                 val sb = StringBuilder()
@@ -204,14 +255,30 @@ class LocalFakeServer(private val apiKey: String) {
                     val c = input.read()
                     if (c < 0) return if (sb.isEmpty()) null else sb.toString()
                     if (c == '\n'.code) return sb.toString().removeSuffix("\r")
+                    // 长度行本身也必须设上限：逐字节读的 sb 是**无界**的，
+                    // 一个不换行的客户端能让它一直涨（15s soTimeout 只是兜底，局域网内足够塞进几十 MB）。
+                    if (sb.length > MAX_HEADER_LINE) return null
                     sb.append(c.toChar())
                 }
             }
             while (true) {
                 val sizeLine = readLine() ?: break
                 // 长度行可能带 chunk 扩展（如 `1a;ext=1`），取分号前那一段。
-                val size = sizeLine.substringBefore(';').trim().toIntOrNull(16) ?: break
+                // 解析失败（含 `FFFFFFFF` 这种溢出、或长度行超长被 readLine 截成 null）
+                // **必须报错而不是当 EOF**：静默 break 会返回半截 body → 上游收到残缺请求，
+                // 客户端看到的是"空气泡"，而服务端日志一片太平。
+                val size = sizeLine.substringBefore(';').trim().toIntOrNull(16)
+                    ?: throw IllegalArgumentException("chunk 长度行非法: ${sizeLine.take(40)}")
                 if (size == 0) break   // 末块；后面的 trailer 用不上，不读
+                // ⚠️ **与 Content-Length 路径同一个安全边界，不能只给一边**：
+                // `size` 直接来自报文，下面 `ByteArray(size)` 会照着它分配 —— 一个 `7FFFFFFF`
+                // 就是 2GB → `OutOfMemoryError`。而它是 **Error 不是 Exception**，
+                // 连接线程的 `catch (e: Exception)` 抓不到，整个进程直接被干掉。
+                // 单块与累计都要卡，且在**分配之前**卡。
+                require(size in 1..maxBytes && total + size <= maxBytes) {
+                    "请求体过大: 块 $size 字节、累计 ${total + size} 字节 > $maxBytes"
+                }
+                total += size
                 val chunk = ByteArray(size)
                 var off = 0
                 while (off < size) {
@@ -315,21 +382,52 @@ class LocalFakeServer(private val apiKey: String) {
     private var server: ServerSocket? = null
     private var acceptThread: Thread? = null
 
+    /**
+     * 并发连接上限。服务监听 0.0.0.0，同网段任何设备都能建连；
+     * 无上限时几百条连接就能把线程栈 + 堆打满（每条连接一个线程）。
+     */
+    private val connSlots = java.util.concurrent.Semaphore(MAX_CONNS)
+
     val isRunning: Boolean get() = running.get()
 
+    /**
+     * 开始监听，**同步完成 bind**。绑定失败直接抛（调用方 [Gateway.start] 负责兜住并报人话原因）。
+     *
+     * ⚠️ 顺序是硬约束：**先 bind 成功，再把 `running` 置 true**。
+     * 以前是 `compareAndSet(false,true)` 之后才 `ServerSocket(...)`，于是端口被占时：
+     *  1) `IOException` 抛出去，`running` 却已经是 true；
+     *  2) 若异常被别处捕获，`Gateway.isRunning` 会读成 true、`Gateway.start` 直接早退
+     *     —— 端口永远起不来，只能杀进程。
+     * 现在失败时 `running` 保持 false，下一次调用还能正常重试。
+     */
+    @Synchronized
     fun start() {
-        if (!running.compareAndSet(false, true)) return
+        if (running.get()) return
+        // bind 失败会在这里抛，此时还没有任何状态被改动
         val ss = ServerSocket(PORT, 50, java.net.InetAddress.getByName("0.0.0.0"))
         server = ss
+        running.set(true)
         acceptThread = thread(name = "LocalFakeServer-accept", isDaemon = true) {
             while (running.get()) {
                 try {
                     val client = ss.accept()
+                    // 单个连接必须**受管辖**：无上限时局域网内几百条连接就能把线程栈 + 堆打满
+                    // （服务监听 0.0.0.0，任何同网段设备都到得了）。32 远超正常客户端用量
+                    // （Chatbox 并行几条），超了就排队等前面释放。
+                    // ponytail: 用信号量而非线程池 —— 少了拒绝策略/队列语义的复杂度，
+                    // 反正是本地服务，排队比拒绝更友好。真要限速再换 ThreadPoolExecutor。
+                    if (!connSlots.tryAcquire(CONN_QUEUE_WAIT_MS, TimeUnit.MILLISECONDS)) {
+                        android.util.Log.w(TAG, "并发连接已满（${MAX_CONNS}），丢弃一条")
+                        try { client.close() } catch (_: Exception) {}
+                        continue
+                    }
                     // 单个连接的异常不得杀掉进程：一个坏请求只应影响它自己。
                     thread(name = "LocalFakeServer-conn", isDaemon = true) {
                         try { handle(client) } catch (e: Exception) {
-                            android.util.Log.w("LocalFakeServer", "连接处理失败: ${e.javaClass.simpleName}: ${e.message}")
+                            android.util.Log.w(TAG, "连接处理失败: ${e.javaClass.simpleName}: ${e.message}")
                             try { client.close() } catch (_: Exception) {}
+                        } finally {
+                            connSlots.release()
                         }
                     }
                 } catch (e: Exception) {
@@ -339,6 +437,7 @@ class LocalFakeServer(private val apiKey: String) {
         }
     }
 
+    @Synchronized
     fun stop() {
         running.set(false)
         try { server?.close() } catch (_: Exception) {}
@@ -363,6 +462,9 @@ class LocalFakeServer(private val apiKey: String) {
                     val c = input.read()
                     if (c < 0) return if (sb.isEmpty()) null else sb.toString()
                     if (c == '\n'.code) return sb.toString().removeSuffix("\r")
+                    // 超长行直接当连接结束处理（不返回半截行：截断的头会解析出错误的
+                    // Content-Length/Auth，比"断开"更难诊断）。见 MAX_HEADER_LINE。
+                    if (sb.length > MAX_HEADER_LINE) return null
                     sb.append(c.toChar())
                 }
             }
@@ -425,14 +527,26 @@ class LocalFakeServer(private val apiKey: String) {
                     // 只认 Content-Length 的话 chunked 请求的 body 会读成空串 → 上游收到空请求
                     // → 什么都不返回 → 客户端显示**空气泡**。curl 默认发 Content-Length，
                     // 所以这个 bug 只用 curl 测是发现不了的。
-                    val body = if (chunked) readChunkedBody(input)
-                    else try {
-                        readBody(input, contentLength)
+                    // 两种传体方式的**上限检查都必须在同一个 try 里**：chunked 路径曾经在
+                    // try 之外裸读（只给 Content-Length 加了闸），超限会抛到连接线程 → 连接被重置，
+                    // 客户端完全不知道发生了什么。现在两边都收敛成 413。
+                    val body = try {
+                        if (chunked) readChunkedBody(input) else readBody(input, contentLength)
                     } catch (e: Exception) {
-                        // 体过大/非法：必须**明确回 413**，不能让它冒泡成"连接被重置"。
-                        android.util.Log.w(TAG, "请求体被拒: ${e.message}")
-                        writeJson(out, 413, openAIError("invalid_request_error",
-                            "请求体过大（上限 ${MAX_BODY_BYTES / 1024 / 1024} MB）", 413))
+                        // 体过大 / 报文畸形：都必须**明确回状态码**，不能冒泡成"连接被重置"。
+                        // 分开报是因为两者对用户的意义不同：413 = 你发的东西太大，
+                        // 400 = 你发的报文本身坏了（客户端 bug 或中间设备改写）。
+                        val tooLarge = e.message?.startsWith("请求体过大") == true
+                        android.util.Log.w(TAG, "请求体被拒（${if (tooLarge) 413 else 400}）: ${e.message}")
+                        writeJson(
+                            out,
+                            if (tooLarge) 413 else 400,
+                            openAIError(
+                                if (tooLarge) "request_too_large" else "invalid_request_error",
+                                if (tooLarge) "请求体过大（上限 ${MAX_BODY_BYTES / 1024 / 1024} MB）"
+                                else "请求体报文畸形：${e.message}",
+                            )
+                        )
                         return
                     }
                     // 每次请求都问一次「当下有效」的凭证：服务长驻，token 会过期，
@@ -442,6 +556,11 @@ class LocalFakeServer(private val apiKey: String) {
                         null
                     }
                     if (fresh == null || fresh.accessToken.isBlank()) {
+                        // 假回复也记一笔用量（0 token、ok）：否则"发了请求但记录页空空如也"，
+                        // 用户没法区分"请求没到达"和"没登录走了假回复"。model 取请求里的
+                        // 原始 model（还没进 prepareBody，非法名也不经这里）。
+                        val fakeModel = try { org.json.JSONObject(body).optString("model", "") } catch (_: Exception) { "" }
+                        usageRecorder?.invoke(fakeModel.ifBlank { "fake" }, null, 0, true, null)
                         writeJson(out, 200, fakeCompletion())
                     } else {
                         // X-Uid 必须与本次 token 同属一个账号，否则上游接受连接却不返回数据。
@@ -452,10 +571,9 @@ class LocalFakeServer(private val apiKey: String) {
                         // 表现成"连接被重置"，既没有状态行也无法诊断。
                         try {
                             streamingChat(out, body, fresh)
-                        } catch (e: Exception) {
-                            android.util.Log.w(TAG, "转发失败: ${e.javaClass.simpleName}: ${e.message}")
+                        } catch (e: Exception) {                            android.util.Log.w(TAG, "转发失败: ${e.javaClass.simpleName}: ${e.message}")
                             // 只在还没写过任何字节时补错误响应（流式头一旦发了就不能再补）
-                            try { writeJson(out, 502, openAIError("upstream_error", "上游转发失败", 502)) } catch (_: Exception) {}
+                            try { writeJson(out, 502, openAIError("upstream_error", "上游转发失败")) } catch (_: Exception) {}
                         }
                     }
                 }
@@ -463,7 +581,7 @@ class LocalFakeServer(private val apiKey: String) {
                     // 未知路径必须留痕：客户端"连不上/用不了"时，这条日志直接指出是路径没对上，
                     // 而不是让人去猜端口、鉴权、防火墙。同样不记查询串（可能含 key）。
                     android.util.Log.w(TAG, "← 404 未知端点: $method $query")
-                    writeJson(out, 404, openAIError("not_found", "unknown endpoint: $query", 404))
+                    writeJson(out, 404, openAIError("not_found", "unknown endpoint: $query"))
                 }
             }
         }
@@ -498,7 +616,7 @@ class LocalFakeServer(private val apiKey: String) {
         val src = try {
             org.json.JSONObject(body)
         } catch (_: org.json.JSONException) {
-            writeJson(out, 400, openAIError("invalid_request_error", "请求体不是合法 JSON", 400))
+            writeJson(out, 400, openAIError("invalid_request_error", "请求体不是合法 JSON"))
             return
         }
         // ⚠️ 必须在 prepareBody **之前**读：prepareBody 会把 `stream` 原地改成 true
@@ -535,7 +653,9 @@ class LocalFakeServer(private val apiKey: String) {
             var streaming = false          // 已确认这次上游成功（出现过 choices 帧）
             var usage: org.json.JSONObject? = null
             var err: String? = null
-            TraeUpstream.chatStream(prepared, cur.accessToken, cur.uid, { chunk ->
+            // 区域取**这份凭证自己的**（不是全局 current）：换号后 cur 已更新，
+            // 传 cur.region 才能保证"token 与 host 同属一个区域"。
+            TraeUpstream.chatStream(prepared, cur.accessToken, cur.uid, cur.region, { chunk ->
                 if (streaming) writeChunk(chunk)
                 else {
                     pending.add(chunk)
@@ -565,8 +685,21 @@ class LocalFakeServer(private val apiKey: String) {
                         android.util.Log.w(TAG, "还原账号失败: ${e.javaClass.simpleName}: ${e.message}")
                     }
                 }
-                // 非流式：到这里所有帧都攒完了，聚合成一个 chat.completion 一次性返回。
-                if (collected != null) writeJson(out, 200, aggregateChunks(collected, model))
+                if (collected != null) {
+                    // 非流式收尾。**上游在吐出任何正文之前就失败时必须回 502**：
+                    // 以前这里无条件 `aggregateChunks` 再写 200，而错误帧是 `event: error` +
+                    // 字符串 data，聚合器只认 `data:{…}`，会把错误全部丢掉 ——
+                    // 客户端于是收到一个 HTTP 200、`content:""`、`finish_reason:"stop"` 的
+                    // "成功"响应，既不报错也不会重试，用户只能看到空气泡。
+                    if (!streaming && err != null) {
+                        writeJson(out, 502, openAIError("upstream_error", "上游请求失败：$err"))
+                    } else {
+                        // ponytail: 上游"已经吐了半截正文再中断"时仍回 200（内容保留给用户），
+                        // finish_reason 由 done 帧决定；要精确区分截断，得在聚合结果里加自定义字段，
+                        // 那会破坏 OpenAI 兼容性，暂不做。
+                        writeJson(out, 200, aggregateChunks(collected, model))
+                    }
+                }
                 return
             }
             android.util.Log.i(TAG, "账号 ${cur.uid} 失败(${err})，换 ${next.uid} 重试")
@@ -576,14 +709,19 @@ class LocalFakeServer(private val apiKey: String) {
     }
 
     private fun authorized(auth: String?): Boolean {
-        if (apiKey.isEmpty()) return true
+        // **fail-closed**：key 异常为空时一律拒绝。以前这里是 `return true`（fail-open），
+        // 现状走不到（Gateway.apiKey 恒生成非空值），但那是"将来某次改动一漏就整个服务裸奔"的默认值。
+        if (apiKey.isEmpty()) return false
         val prefix = "Bearer "
         if (auth == null || !auth.startsWith(prefix, ignoreCase = true)) return false
-        return auth.substring(prefix.length).trim() == apiKey
+        // 常量时间比较：`==` 会在首个不同字节处提前返回，理论上可被逐字节试探。
+        // MessageDigest.isEqual 是 JDK 自带的、对长度差异也按常量时间处理的实现（不引依赖）。
+        val given = auth.substring(prefix.length).trim().toByteArray(Charsets.UTF_8)
+        return java.security.MessageDigest.isEqual(given, apiKey.toByteArray(Charsets.UTF_8))
     }
 
     private fun writeUnauthorized(out: OutputStream) {
-        writeJson(out, 401, openAIError("invalid_api_key", "missing or invalid local API key", 401))
+        writeJson(out, 401, openAIError("invalid_api_key", "missing or invalid local API key"))
     }
 
     /** 固定的测试回复：与真实 Trae 结构一致，但内容是假的。 */
@@ -611,12 +749,10 @@ class LocalFakeServer(private val apiKey: String) {
             )
     }
 
-    private fun openAIError(code: String, msg: String, status: Int): JSONObject {
-        val body = JSONObject().put("error",
+    /** OpenAI 形状的错误体。**status 不进 body**：它由 HTTP 状态行承载（调用方传）。 */
+    private fun openAIError(code: String, msg: String): JSONObject =
+        JSONObject().put("error",
             JSONObject().put("message", msg).put("type", "api_error").put("code", code))
-        // 参考工程把 status 放返回值；此处仅用于 name/url 兼容，故不放 body。
-        return body
-    }
 
     private fun writeJson(out: OutputStream, status: Int, obj: JSONObject) {
         writeRaw(out, status, "application/json", obj.toString())

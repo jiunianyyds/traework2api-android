@@ -27,6 +27,17 @@ object Gateway {
 
     val isRunning: Boolean get() = server?.isRunning == true
 
+    /**
+     * 最近一次启动失败的人话原因；null = 没有失败记录，或已成功启动。
+     *
+     * 为什么必须有它：端口被占时 `LocalFakeServer.start()` 会抛 `IOException`，而它以前
+     * 一路冒到 `GatewayService.onStartCommand` → **未捕获 → 进程崩溃**。表现是"每次打开 App
+     * 都闪退"，用户连"端口被占"这个可能性都猜不到。现在在这里兜住并把原因留给界面。
+     */
+    @Volatile
+    var lastStartError: String? = null
+        private set
+
     /** 供 MainActivity 的主动续期复用同一把锁（别再加第二把：轮换只允许一个续期在跑）。 */
     fun <T> locked(block: () -> T): T = synchronized(tokenLock) { block() }
 
@@ -35,18 +46,30 @@ object Gateway {
         val prefs = ctx.getSharedPreferences("traework2api_prefs", Context.MODE_PRIVATE)
         prefs.getString("local_api_key", null)?.takeIf { it.isNotBlank() }?.let { return it }
         val key = "sk-" + UUID.randomUUID().toString().replace("-", "")
-        prefs.edit().putString("local_api_key", key).apply()
+        // **首次生成必须用 commit()**，不能用 apply()：apply 是异步落盘，
+        // 若进程在写盘前被杀（冷启动时很常见），下次会**重新生成一个 key** ——
+        // 所有已经填好 key 的客户端全部 401，而现象是"昨天能用今天不能"，极难定位。
+        // 一次同步 IO 换掉整类事故，值得。
+        prefs.edit().putString("local_api_key", key).commit()
         return key
     }
 
     /**
-     * 幂等启动：已在跑就直接返回。
+     * 幂等启动：已在跑就直接返回 true。
      * 重复 start 会去抢同一个端口 → `EADDRINUSE` 崩掉，所以这道闸必须留着。
+     *
+     * @return true = 端口已监听（或本来就在跑）；false = 启动失败，原因见 [lastStartError]。
+     *   **绝不抛异常**：调用方是 `GatewayService.onStartCommand`，抛出去就是进程崩溃。
      */
     @Synchronized
-    fun start(ctx: Context) {
-        if (isRunning) return
+    fun start(ctx: Context): Boolean {
+        if (isRunning) return true
         val app = ctx.applicationContext
+        // 装入磁盘模型缓存。**必须在这里也调一次**（幂等），不能只靠 MainActivity.onCreate：
+        // 服务会被 START_STICKY / 看门狗在**没有 Activity 的新进程**里拉起来，
+        // 那时 ModelsRepo.dynamic 为 null → /v1/models 返回空表 → 客户端"获取模型失败"。
+        // 这正是 v0.4.8 修过的同一个症状的残余路径。
+        ModelsRepo.init(app)
         val s = LocalFakeServer(apiKey(app))
         s.usageRecorder = { model, usage, ms, ok, err ->
             UsageStore.record(app, model,
@@ -94,11 +117,25 @@ object Gateway {
             }
         }
         server = s
-        s.start()
+        val ok = try {
+            s.start()
+            lastStartError = null
+            true
+        } catch (e: Exception) {
+            // 端口被占（EADDRINUSE）/ 绑不上 0.0.0.0 / 权限问题都落在这里。
+            // 必须把异常**兜住**：它是从 onStartCommand 调过来的，冒出去就是整个进程崩。
+            server = null
+            lastStartError = "端口 ${LocalFakeServer.PORT} 无法监听（可能被其它 App 占用）：" +
+                "${e.javaClass.simpleName} ${e.message.orEmpty()}".trim()
+            android.util.Log.e(TAG, "网关启动失败 → $lastStartError", e)
+            false
+        }
+        if (!ok) return false
         // 积分监测线程随网关起停：只有网关在跑（才可能消耗积分）时它才有意义。
         // 注意它内部只做「锁内读本地 → 锁外发网络」，绝不在 tokenLock 内做网络请求。
         CreditMonitor.start(app)
         android.util.Log.i(TAG, "网关已启动，端口 ${LocalFakeServer.PORT}")
+        return true
     }
 
     /** 幂等停止：没启动时调用也安全（用户可能没开就退出）。 */
@@ -107,6 +144,8 @@ object Gateway {
         CreditMonitor.stop()
         server?.stop()
         server = null
+        // 清掉上次的失败原因：用户主动停掉服务后，界面不该再顶着一条过期的"启动失败"。
+        lastStartError = null
         android.util.Log.i(TAG, "网关已停止")
     }
 
@@ -120,5 +159,8 @@ object Gateway {
         val a = apiKey(ctx)
         check(a.isNotBlank() && a.startsWith("sk-")) { "自检失败：本地 API Key 格式不对" }
         check(a == apiKey(ctx)) { "自检失败：本地 API Key 不稳定（每次取值都变会让所有客户端 401）" }
+        // 注意：这里**不要**顺手调 ModelsRepo.init() —— 它会装入磁盘缓存，
+        // 而 MainActivity.onCreate 的 ModelsRepo.selfCheck() 断言"初始必须为空"，
+        // 两个自检的先后顺序就成了隐性依赖。缓存装在 Gateway.start() 里（幂等）即可。
     }
 }

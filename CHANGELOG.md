@@ -8,6 +8,113 @@ UI 规范看 `docs/UI现状清单.md`，本文件只是改动流水。（原引�
 
 ---
 
+## [0.4.15] - 2026-11-09
+
+**全面审计后的修复轮：四个 P0 崩溃/静默失败 + 并发串号 + 界面误报 + 一批删减。**
+`versionName` 0.4.14 → **0.4.15**、`versionCode` 18 → **19**。
+审计基线 tag：`v0.4.14-pre-audit`；全部修复在 `fix/audit-p0` 分支。
+
+### Fixed（P0：崩溃与静默失败）
+
+1. **端口被占不再每次开 App 闪退**（`LocalFakeServer` + `Gateway` + `GatewayService`）。
+   以前 `start()` 先置 `running=true` 再 bind，8787 被占时 `IOException` 从
+   `onStartCommand` 冒出去 → 进程崩溃。现在先 bind 成功再置标志；`Gateway.start()`
+   返回 Boolean 并兜住异常，失败原因（含端口号）留在 `Gateway.lastStartError`，
+   概览页如实显示 + toast 提示"关掉占用端口的应用"。失败时刻意不写 `should_run`
+   （"用户想不想跑"与"这次能不能跑"是两件事，写 false 会让用户的启动意图凭空消失）。
+
+2. **chunked 请求体加上与 Content-Length 同一条安全边界**（`LocalFakeServer`）。
+   以前只有 Content-Length 路径有 8MB 闸，chunked 分支的 `ByteArray(size)` 直接吃
+   报文里的长度 —— 一个 `7FFFFFFF` 就是 2GB → `OutOfMemoryError`（是 Error，
+   `catch (Exception)` 抓不到）→ 进程被干掉。现在单块与累计都在**分配之前**卡；
+   非法长度行从"静默当 EOF（返回半截 body）"改为报 400；请求头单行加 8KB 上限；
+   并发连接限 32（信号量）。
+
+3. **上游失败不再被包装成 HTTP 200 + 空回答**（`LocalFakeServer` + `TraeUpstream` +
+   `TraeIntlUpstream`）。非流式路径以前无条件聚合后写 200，而错误帧（`event: error` +
+   字符串 data）会被聚合器丢弃 → 客户端收到 `content:""` + `finish_reason:"stop"`
+   的"成功"响应，不报错也不重试。现在未吐正文即失败回 502 + OpenAI 形状错误体；
+   错误帧本身也改成 `data: {"error":…}` + `[DONE]`（流式客户端的 JSON 解析才认得），
+   国内服/国际服两条通道一起改。
+
+4. **批量签到不再全程持有网关锁**（`BatchCheckin` + `TraeAuthApi` + `CreditMonitor`）。
+   以前 `runAll` 整批包在 `Gateway.locked` 里，而每个 `/v1/chat/completions` 在写响应头
+   之前同步走同一把锁（credProvider）→ 签到期间所有对话请求零字节挂死；且
+   **进 App 就触发补签**，冷启动后第一个请求必然卡住。现在整批不持锁，只有"续期"
+   在锁内（refresh 是轮换的，必须串行），收进新函数 `TraeAuthApi.validTokenForUid`
+   （同时统一了 CreditMonitor / BatchCheckin 两份重复实现）。
+   额度/签到接口改走独立的 `ugClient`（15s 读超时），不再蹭聊天的 180s ——
+   单账号最坏从 9 分钟降到 45 秒内，定时签到的 2 分钟唤醒锁终于够用。
+
+### Fixed（P1：串号与误报）
+
+5. **区域改为随请求显式传递**（`TraeUpstream.chatStream(…, region, …)`）。
+   以前入口快照全局 `TraeRegion.current`，而它会被并发路径改写（切号/自动换号），
+   快照点与使用点之间隔着可达 180s 的窗口 —— 窗口内翻面就把 CN 的 token 发到 SG
+   的 host。现在一律传 `cred.region`，换号后传 `cur.region`，竞态从根上不存在。
+
+6. **切号瞬间不再把旧账号数据写进新账号缓存**（`MainActivity`）。积分刷新/签到回写前
+   比对 `activeUid`，等待期间切过号（含积分监测自动换号）就丢弃本次结果 ——
+   修掉"新账号显示上一个账号的余额/今日已签到"的最后一个入口。
+
+7. **服务单独重建后 `/v1/models` 不再返回空表**（`Gateway.start` 里补 `ModelsRepo.init`，
+   幂等）。以前缓存只在 `MainActivity.onCreate` 装，进程被 START_STICKY/看门狗单独
+   拉起时没有 Activity → 客户端"获取模型失败"。
+
+8. **保活体检不再永远报警**（`KeepAlive.Item` 加 `detectable` 三态）。
+   「自启动/省电策略」系统查不到，以前硬编码 `ok=false` 且计入待开启 → 概览页恒
+   "还有 2 项未开启"，"保活已就绪"一次都到不了。现在三态显示（✓/⚠/— 无法检测），
+   待办能真正清零。
+
+9. **签到 code=0 但状态重查失败时报对结果**：以前落到 else 分支报"签到未生效
+   （code=0）"——把已签上说成没签。现在明确提示"已提交，状态未取回，请刷新确认"。
+
+### Changed / Removed
+
+- **删 `AppStyle` 的 `secondary` 色键**（4 风格 × 亮暗 8 处定义，全库 0 处使用）。
+- **删 `network_security_config` 里 localhost 明文放行**：本 App 从不请求自己的本地服务。
+- **`KeepAlive.Item.autoOpenable` → `open: ((Context) -> Boolean)?`**：跳转动作随条目走，
+  拆掉 MainActivity 里"按中文标题字符串匹配跳转"的脆弱耦合（文案改一个字按钮就
+  静默失效）；顺带让「通知渠道未被关闭」真正可点。
+- **`openAIError` 删未用的 status 形参**；`EXPORT_FORMAT` 注释改为事实（导入不校验它）。
+- `Gateway.apiKey` 首次生成 `apply()` → `commit()`：进程在异步落盘前被杀会重新生成
+  key，所有已配置客户端 401。
+- 复制 API Key / 登录链接时打 `EXTRA_IS_SENSITIVE`（API 33+ 剪贴板浮层不再明文展示）。
+- `TraeAuthStore` 缓存 KeyStore 主密钥（导入导出 N 账号从 2N 次 Binder 往返降到 1 次）；
+  旧数据迁移的 check-then-act 加锁（它是整表覆盖写）。
+- `UsageStore.record` 落盘改 1 秒防抖（原来每条请求在连接线程全量序列化 100 条）。
+- `AppStyle.color` 按风格×亮暗缓存解析结果。
+- 进账号页的自动拉取不再弹"已更新"toast（`refreshQuota(quiet)`）；导入文件先看
+  `statSize` 再读（原来 `readBytes()` 全读进来才判 1MB）。
+- `MainActivity.autoModelsTried` 挪到 companion（注释说"进程级"，实现原是 Activity 级，
+  切风格 recreate 会多刷一次上游）。
+- `docs/` 三份文档里指向已删除的 `交接文档.md` / `.workbuddy\` 的断链全部改注。
+
+### Fixed（发布前真机回归发现的回归，当日修复）
+
+11. **切外观风格必崩**（`ModelsRepo.selfCheck`，MuMu/Android 12 真机复现）。
+   FATAL: `IllegalStateException: 自检失败：未刷新时模型表应为空`。根因正是上面第 7 条
+   修复（`Gateway.start` 也调 `init`）与旧自检隐性约定的冲突：旧自检断言"初始必须为空"
+   并顺手清空 `dynamic`，其前提"自检永远跑在 init 之前"被服务先起（onCreate 里
+   autoStart 拉网关 → Gateway.start → init 装入磁盘缓存）打破；而该自检每次
+   `recreate()` 都会跑 → 切风格/切亮暗/转屏重建必崩。改为"保存进来的状态 → 受控初态
+   下测 → finally 原样放回"。同时加 `persistEnabled` 闸修掉验证中暴露的第二个问题：
+   自检探针会被 `applyFetched` **写进磁盘缓存**（`/v1/models` 一度返回 `selfcheck-probe`）。
+
+### 验证
+
+- MuMu 模拟器（Android 12）真机回归：靛蓝/石墨/苔绿/落日来回切 + 深色模式 +
+  force-stop 冷启重开，全程 0 crash；`/healthz` ok、`/v1/models` 无探针污染。
+- `compileDebugKotlin --offline` 每轮修复后通过；`build-apk.ps1` 出
+  `out\TraeWork2API-0.4.15-debug.apk`。
+- `assembleRelease`（含 R8 收缩 + lintVital）首次全量通过。
+- 新增自检：chunked 单块/累计超限拒、上限内放行、非法长度行报错、错误帧可解析为
+  `{"error":…}` 且聚合后 content 为空（钉住"为什么必须回 502"）、needsAction 不计
+  不可检测项。
+- **待真机回归**：多账号批量签到（锁边界改动）、端口占用场景、Chatbox chunked 对话。
+
+---
+
 ## [0.4.14] - 2026-10-23
 
 **账号备份改成多选：导出前勾选要带走的账号，导入前先看预览再勾。去掉剪贴板入口。**

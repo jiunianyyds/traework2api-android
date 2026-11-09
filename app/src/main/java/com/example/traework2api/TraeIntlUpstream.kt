@@ -179,8 +179,7 @@ object TraeIntlUpstream {
     ) {
         val userText = promptOf(prepared)
         if (userText.isBlank()) {
-            out("event: error\ndata: ${jsonQuote("请求里没有 user 消息内容")}\n\n")
-            out("data: [DONE]\n\n")
+            out(TraeUpstream.errorFrame("请求里没有 user 消息内容", "invalid_request_error"))
             onResult(null, "intl:empty_user_message")
             return
         }
@@ -195,22 +194,19 @@ object TraeIntlUpstream {
         try {
             created = createSession(body, ts, traeToken)
         } catch (e: Exception) {
-            out("event: error\ndata: ${jsonQuote("国际服建会话异常: ${e.javaClass.simpleName}: ${e.message}")}\n\n")
-            out("data: [DONE]\n\n")
+            out(TraeUpstream.errorFrame("国际服建会话异常: ${e.javaClass.simpleName}: ${e.message}", "intl_create_exception"))
             onResult(null, "intl_create:exception")
             return
         }
         if (created.second == NO_SESSION) {
-            out("event: error\ndata: ${jsonQuote("国际服建会话失败 http ${created.first}")}\n\n")
-            out("data: [DONE]\n\n")
+            out(TraeUpstream.errorFrame("国际服建会话失败 http ${created.first}", "intl_create_${created.first}"))
             onResult(null, "intl_create:${created.first}")
             return
         }
         val sid = created.first
         val mid = created.second
         if (sid.isBlank()) {
-            out("event: error\ndata: ${jsonQuote("国际服建会话未返回 chat_session_id")}\n\n")
-            out("data: [DONE]\n\n")
+            out(TraeUpstream.errorFrame("国际服建会话未返回 chat_session_id", "intl_create_no_session"))
             onResult(null, "intl_create:no_session")
             return
         }
@@ -222,15 +218,13 @@ object TraeIntlUpstream {
             client.newCall(postJson("$HOST$EP_SESSIONS/$sid/commit", traeToken, cb)).execute().use { r ->
                 if (!r.isSuccessful) {
                     val t = r.body?.string().orEmpty()
-                    out("event: error\ndata: ${jsonQuote("国际服 commit 失败 http ${r.code}: ${t.take(200)}")}\n\n")
-                    out("data: [DONE]\n\n")
+                    out(TraeUpstream.errorFrame("国际服 commit 失败 http ${r.code}: ${t.take(200)}", "intl_commit_${r.code}"))
                     onResult(null, "intl_commit:${r.code}")
                     return
                 }
             }
         } catch (e: Exception) {
-            out("event: error\ndata: ${jsonQuote("国际服 commit 异常: ${e.javaClass.simpleName}")}\n\n")
-            out("data: [DONE]\n\n")
+            out(TraeUpstream.errorFrame("国际服 commit 异常: ${e.javaClass.simpleName}", "intl_commit_exception"))
             onResult(null, "intl_commit:exception")
             return
         }
@@ -244,16 +238,14 @@ object TraeIntlUpstream {
             client.newCall(evReq).execute().use { resp ->
                 if (!resp.isSuccessful) {
                     val t = resp.body?.string().orEmpty()
-                    out("event: error\ndata: ${jsonQuote("国际服事件流失败 http ${resp.code}: ${t.take(200)}")}\n\n")
-                    out("data: [DONE]\n\n")
+                    out(TraeUpstream.errorFrame("国际服事件流失败 http ${resp.code}: ${t.take(200)}", "intl_events_${resp.code}"))
                     onResult(null, "intl_events:${resp.code}")
                     return
                 }
                 streamEvents(resp.body!!.source(), out, onResult)
             }
         } catch (e: Exception) {
-            out("event: error\ndata: ${jsonQuote("国际服事件流异常: ${e.javaClass.simpleName}: ${e.message}")}\n\n")
-            out("data: [DONE]\n\n")
+            out(TraeUpstream.errorFrame("国际服事件流异常: ${e.javaClass.simpleName}: ${e.message}", "intl_events_exception"))
             onResult(null, "intl_events:exception")
         }
     }
@@ -403,8 +395,7 @@ object TraeIntlUpstream {
                                     settle(lastUsage ?: r.usage, null)
                                 }
                                 Kind.ERROR -> {
-                                    out("event: error\ndata: ${jsonQuote(r.errorText)}\n\n")
-                                    out("data: [DONE]\n\n")
+                                    out(TraeUpstream.errorFrame(r.errorText))
                                     sawDone = true
                                     settle(null, "intl:${r.errorText.take(60)}")
                                 }
@@ -482,7 +473,6 @@ object TraeIntlUpstream {
         .put("function", JSONObject().put("name", name).put("arguments", args))
 
     private fun jsonQuote(s: String): String = JSONObject.quote(s)
-
     /**
      * 累积快照 → 增量差值。这是国际服转换里**最容易错**的一处：
      * 上游 `plan_item.thought` 每帧给全文，OpenAI 客户端按增量拼接，

@@ -31,6 +31,14 @@ object UsageStore {
     private val cached = mutableListOf<UsageRecord>()
     @Volatile private var loaded = false
 
+    /**
+     * 落盘防抖：`record` 跑在**连接线程**上，以前每条请求都同步"全量序列化 100 条 +
+     * 写 prefs"——高并发对话时是纯写放大，还拖慢响应。攒 1 秒批量落一次，
+     * 代价是进程被杀时最多丢最后 1 秒的用量**统计**（不涉及任何业务数据，可接受）。
+     */
+    @Volatile private var flushScheduled = false
+    private val flushHandler = android.os.Handler(android.os.Looper.getMainLooper())
+
     fun record(context: Context, model: String, prompt: Int, completion: Int, total: Int,
                durationMs: Long, ok: Boolean, errorType: String) {
         synchronized(lock) {
@@ -38,8 +46,17 @@ object UsageStore {
             cached.add(UsageRecord(System.currentTimeMillis(), model, prompt, completion, total,
                 durationMs, ok, errorType))
             while (cached.size > MAX) cached.removeAt(0)
-            persist(context)
         }
+        scheduleFlush(context)
+    }
+
+    private fun scheduleFlush(context: Context) {
+        if (flushScheduled) return
+        flushScheduled = true
+        flushHandler.postDelayed({
+            flushScheduled = false
+            synchronized(lock) { persist(context) }
+        }, 1_000L)
     }
 
     fun all(context: Context): List<UsageRecord> = synchronized(lock) {

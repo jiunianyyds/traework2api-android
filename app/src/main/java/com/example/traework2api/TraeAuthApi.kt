@@ -270,6 +270,48 @@ object TraeAuthApi {
         return ex.accessToken
     }
 
+    /**
+     * 取**指定账号**的可用 access token；临近/已过期则在 `Gateway.locked` 内续期。
+     * 取不到返回 null（无该账号 / 无 refreshToken / 续期失败）。
+     *
+     * 这是**后台路径**（积分监测、批量签到）唯一的续期入口，三条约束都在这里兑现：
+     *
+     * 1. **必须在锁内续期**：refresh token 是轮换的，与 `Gateway.credProvider`、
+     *    MainActivity 的主动续期并发跑会让先换到的那个立即作废。
+     * 2. **绝不碰 active**：不走 [TraeAuthStore.save]（它会把保存的账号设为当前账号），
+     *    后台给非当前账号续期时会把用户正在用的号偷偷切走。
+     * 3. **绝不翻全局区域**：按账号自己的 `cred.region` 显式传参，
+     *    不读也不写 `TraeRegion.current`（用户可能正在复制另一个区域的登录链接）。
+     *
+     * 网络在锁内是**必要之恶**（就是第 1 条），但只在这一条路径上、且约 14 天一次/账号。
+     * 调用方**不要**把网络请求（查余额/签到）也包进同一把锁 —— 那会让所有转发请求
+     * 在锁上排队，是 v0.4.14 批量签到的实际故障形态。
+     */
+    fun validTokenForUid(context: Context, uid: String, skewSec: Long): String? = Gateway.locked {
+        val c = TraeAuthStore.loadByUid(context, uid) ?: return@locked null
+        if (c.accessToken.isNotBlank() && !expiredWithin(c.expiresAt, skewSec)) {
+            return@locked c.accessToken
+        }
+        // 进锁后再判一次：这几十毫秒里别人可能已经换过了（否则会白烧一个 refresh）
+        if (c.refreshToken.isBlank()) return@locked c.accessToken.takeIf { it.isNotBlank() }
+        val ex = try {
+            exchangeToken(c.refreshToken, c.region)   // 显式传区域，不读全局
+        } catch (e: Exception) {
+            Log.w(TAG, "账号 $uid 续期失败: ${e.javaClass.simpleName}: ${e.message}")
+            return@locked c.accessToken.takeIf { it.isNotBlank() }
+        }
+        val nc = c.copy(
+            accessToken = ex.accessToken,
+            refreshToken = ex.refreshToken ?: c.refreshToken,
+            expiresAt = ex.expiresAt ?: c.expiresAt,
+        )
+        TraeAuthStore.updateTokens(context, nc)   // 不切 active
+        // expiresAt 存在索引里，必须一起回写：不然下一轮还会再"续期"一次，白耗一个 refresh
+        TraeAuthStore.updateMeta(context, nc.toMeta())
+        Log.i(TAG, "账号 $uid 已续期 (新exp=${nc.expiresAt}, refresh轮换=${ex.refreshToken != null})")
+        nc.accessToken
+    }
+
     /** internal 而非 private：CreditMonitor 要按同一判据决定"这个号该不该先续期"。 */
     internal fun expiredWithin(expiresAt: Long?, skewSec: Long): Boolean {
         if (expiresAt == null || expiresAt <= 0) return true

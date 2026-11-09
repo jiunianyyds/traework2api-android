@@ -46,6 +46,12 @@ class MainActivity : Activity() {
         private const val REQ_EXPORT = 1003
         /** SAF：导入账号备份（ACTION_OPEN_DOCUMENT）。 */
         private const val REQ_IMPORT = 1004
+
+        /**
+         * 账号备份文件大小上限。**边界而非可调项**：正常备份是几十个账号的 JSON（几十 KB），
+         * 超过 1 MB 基本就是用户选错了文件；不先判大小就直接 readBytes 是一次 OOM 尝试。
+         */
+        private const val MAX_IMPORT_BYTES = 1_048_576L
         private const val SIXTY_MINUTES_SEC = 3600L
         /** 模型页刷新按钮文案：空状态卡与工具条共用同一份，改一处两边同步。 */
         private const val REFRESH_MODELS_LABEL = "刷新模型目录"
@@ -87,6 +93,14 @@ class MainActivity : Activity() {
             "GET" to "/v1/models",
             "GET" to "/healthz",
         )
+
+        /**
+         * 本次**进程**是否已经静默补过一次模型表。
+         * 必须是进程级（companion）：放 Activity 实例上时，切风格/切亮暗触发的 recreate()
+         * 会重置它、再刷一次上游，与"每个冷启动恰好一次"的语义不符。
+         */
+        @Volatile
+        private var autoModelsTried = false
     }
 
     // ------------------------------------------------------------------
@@ -404,7 +418,7 @@ class MainActivity : Activity() {
         // 拿它当"这个账号是否已经拉过"的单一标志（旧写法要求三个都为 null，
         // 只要余额先回填成功就会整体跳过 → 签到状态可能一直是 null，按钮变"未登录"却可点）。
         if (page == Page.ACCOUNT && accountCheckin == null && !quotaLoading) {
-            contentHost.post { refreshQuota() }
+            contentHost.post { refreshQuota(quiet = true) }
         }
         navItems.forEach { (key, item) ->
             val active = key == page
@@ -485,13 +499,24 @@ class MainActivity : Activity() {
             running -> statusChip("服务运行中", "success", true)
             else -> statusChip("服务已停止", "error", false)
         })
-        // 服务现在是**默认开启**的（进 App 自动拉起，0.4.8）。走到这个分支基本只有一种情况：
-        // 用户主动停过。文案说清"怎么再开"，别再写"本服务默认关闭"（那已经是过去式）。
+        // 服务现在是**默认开启**的（进 App 自动拉起，0.4.8）。走到这个分支基本只有两种：
+        // 用户主动停过，或者启动失败了（典型：8787 被别的 App 占着）。后者以前会
+        // 直接崩进程（异常从 onStartCommand 冒出去），现在改成在这里如实报原因。
         if (!running) {
+            val failure = Gateway.lastStartError
             addView(card(tone = CardTone.SOFT) {
-                addView(text("服务未启动", FS_CARD_TITLE, true))
-                addView(caption("你（或通知栏）停止过服务，端口未在监听，客户端暂时连不上。\n" +
-                    "点下面的「启动服务」即可重新开启；下次进 App 也会保持关闭，直到你手动启动。"), top(8))
+                addView(text(if (failure != null) "服务启动失败" else "服务未启动", FS_CARD_TITLE, true))
+                if (failure != null) {
+                    // 原因照抄底层给的人话：用户唯一能采取的行动就是"关掉占端口的那个 App"
+                    addView(caption(failure), top(8))
+                    addView(caption("端口被占用时：关掉其它占用 ${
+                        LocalFakeServer.PORT
+                    } 端口的应用（常见于同机跑了别的本地网关），再点下面的「启动服务」。"),
+                        top(6))
+                } else {
+                    addView(caption("你（或通知栏）停止过服务，端口未在监听，客户端暂时连不上。\n" +
+                        "点下面的「启动服务」即可重新开启；下次进 App 也会保持关闭，直到你手动启动。"), top(8))
+                }
             }, top(GAP))
         } else {
             addView(card(tone = CardTone.SOFT) {
@@ -500,7 +525,7 @@ class MainActivity : Activity() {
                     "你可以切到任意客户端使用。\n停止请点下面的「停止服务」或通知栏的「停止」。"), top(8))
                 // 保活体检：国产 ROM 会无视 START_STICKY 直接强杀，能不能长期活着
                 // 取决于几项系统授权 —— 用户很难自己想到，所以这里给个醒目入口。
-                val pending = KeepAlive.check(this@MainActivity).count { !it.ok }
+                val pending = KeepAlive.check(this@MainActivity).count { it.needsAction }
                 if (pending > 0) {
                     addView(caption("⚠️ 还有 $pending 项保活设置未开启，真机上可能被系统清掉"), top(10))
                 }
@@ -1180,7 +1205,7 @@ class MainActivity : Activity() {
         addView(card {
             addView(row {
                 addView(text("后台保活设置", FS_CARD_TITLE, true), weighted())
-                val pending = KeepAlive.check(this@MainActivity).count { !it.ok }
+                val pending = KeepAlive.check(this@MainActivity).count { it.needsAction }
                 addView(if (pending == 0) chipOk("已就绪") else chipWarn("$pending 项待开启"))
             })
             addView(caption("让网关在息屏、被系统回收后仍能存活。国产 ROM 会强杀前台服务，" +
@@ -1202,7 +1227,7 @@ class MainActivity : Activity() {
      */
     private fun keepAlivePage(): View = scroll {
         val items = KeepAlive.check(this@MainActivity)
-        val pending = items.filter { !it.ok }
+        val pending = items.filter { it.needsAction }
         val rom = KeepAlive.rom()
 
         // 顶部总状态（首卡不留上间距，紧跟页面顶部）
@@ -1235,15 +1260,21 @@ class MainActivity : Activity() {
         addView(card {
             items.forEachIndexed { i, it ->
                 if (i > 0) addView(divider(), top(12))
+                // 三态：✓ 已就绪 / ⚠ 需处理 / — 查不到。
+                // 「查不到」既不能打勾（编造事实），也不能打⚠（会永远挂在待办上，见 Item.detectable）。
+                val glyph = if (!it.detectable) "—" else if (it.ok) "✓" else "⚠"
+                val tone = if (!it.detectable) "on_surface_variant" else if (it.ok) "success" else "warning"
                 addView(row(top = if (i > 0) 12 else 0) {
-                    addView(text(if (it.ok) "✓" else "⚠", FS_BODY, true,
-                        if (it.ok) "success" else "warning"), lp(-2, -2, end = 8))
+                    addView(text(glyph, FS_BODY, true, tone), lp(-2, -2, end = 8))
                     addView(text(it.title, FS_VALUE, true), weighted())
-                    if (!it.ok) addView(if (it.autoOpenable) chipInfo("可一键") else chipWarn("需手动"))
+                    when {
+                        !it.detectable -> addView(chipInfo("无法检测"))
+                        it.needsAction -> addView(if (it.autoOpenable) chipInfo("可一键") else chipWarn("需手动"))
+                    }
                 })
                 addView(caption(it.why), top(4))
-                if (!it.ok && it.autoOpenable) {
-                    addView(action("去开启", outlined = true) { openAutoItem(it.title) }, top(8))
+                if (it.needsAction && it.autoOpenable) {
+                    addView(action("去开启", outlined = true) { openAutoItem(it) }, top(8))
                 }
             }
         })
@@ -1265,22 +1296,21 @@ class MainActivity : Activity() {
 
     /** 「一键配置」：按顺序跳到**第一个**未就绪且可自动打开的项。 */
     private fun runAutoConfig() {
-        val next = KeepAlive.check(this).firstOrNull { !it.ok && it.autoOpenable }
+        val next = KeepAlive.check(this).firstOrNull { it.needsAction && it.autoOpenable }
         if (next == null) {
             toast("能自动配置的项都已就绪")
             return
         }
         // 一次只跳一个：连着弹多个系统页面会互相顶掉，用户也来不及看。
-        openAutoItem(next.title)
+        openAutoItem(next)
     }
 
-    private fun openAutoItem(title: String) {
-        val ok = when (title) {
-            "电池优化白名单" -> KeepAlive.openBatteryWhitelist(this)
-            "精确闹钟" -> KeepAlive.openExactAlarm(this)
-            "通知权限", "通知渠道未被关闭" -> KeepAlive.openAppNotificationSettings(this)
-            else -> false
-        }
+    /**
+     * 打开某一项对应的系统页面。跳转动作由 [KeepAlive.Item.open] 自带，
+     * 不再按中文标题字符串匹配（文案改一个字就静默失效的那种错配）。
+     */
+    private fun openAutoItem(item: KeepAlive.Item) {
+        val ok = runCatching { item.open?.invoke(this) == true }.getOrDefault(false)
         if (!ok) {
             toast("这个页面在本机打不开，请按下方路径手动设置")
         }
@@ -1485,7 +1515,7 @@ class MainActivity : Activity() {
         if (!region.canLogin) { toast("${region.id} 区域常量未配置完整"); return }
         TraeRegion.set(this, region)
         val url = TraeAuthApi.buildLoginUrl()
-        copyToClipboard("traeLoginUrl", url, "${regionLabel(region)}登录链接已复制，请用系统浏览器打开并登录")
+        copyToClipboard("traeLoginUrl", url, "${regionLabel(region)}登录链接已复制，请用系统浏览器打开并登录", sensitive = true)
     }
 
     /**
@@ -1587,7 +1617,7 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun copyApiKey() = copyToClipboard("apiKey", apiKey, "已复制 API Key")
+    private fun copyApiKey() = copyToClipboard("apiKey", apiKey, "已复制 API Key", sensitive = true)
 
     /**
      * 本机在局域网里的 IPv4 地址（如 `http://192.168.1.5:8787/v1`）；拿不到返回 null。
@@ -1652,10 +1682,21 @@ class MainActivity : Activity() {
     /** 邮箱复制：手打 11 位数字容易错，点一下拿完整的比让用户自己抄靠谱。 */
     private fun copyEmail() = copyToClipboard("authorEmail", AUTHOR_EMAIL, "已复制邮箱 $AUTHOR_EMAIL")
 
-    /** 复制到剪贴板 + 提示。原先三处各写一遍 getSystemService/setPrimaryClip，收口到这一处。 */
-    private fun copyToClipboard(label: String, value: String, tip: String) {
-        (getSystemService(CLIPBOARD_SERVICE) as ClipboardManager)
-            .setPrimaryClip(ClipData.newPlainText(label, value))
+    /**
+     * 复制到剪贴板 + 提示。原先三处各写一遍 getSystemService/setPrimaryClip，收口到这一处。
+     *
+     * [sensitive] = 内容是凭据（API Key / 登录链接里的 refreshToken）。Android 13+ 会在
+     * 剪贴板浮层与剪贴板历史里**明文展示**，打上 isSensitive 后系统会遮住预览、
+     * 且不写入剪贴板历史。只是一个 extra，两行代价。
+     */
+    private fun copyToClipboard(label: String, value: String, tip: String, sensitive: Boolean = false) {
+        val clip = ClipData.newPlainText(label, value)
+        if (sensitive && Build.VERSION.SDK_INT >= 33) {
+            clip.description.extras = android.os.PersistableBundle().apply {
+                putBoolean(android.content.ClipDescription.EXTRA_IS_SENSITIVE, true)
+            }
+        }
+        (getSystemService(CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(clip)
         toast(tip)
     }
 
@@ -1959,13 +2000,20 @@ class MainActivity : Activity() {
 
             REQ_IMPORT -> thread(name = "account-import-read") {
                 val result = runCatching {
+                    // 先看文件大小再读：以前是 readBytes() 全读进来之后才判 1MB，
+                    // 用户误选一个视频就是一次 OOM 尝试（账号备份撑死几十 KB）。
+                    val size = contentResolver.openFileDescriptor(uri, "r")?.use { it.statSize } ?: -1L
+                    if (size > MAX_IMPORT_BYTES) {
+                        throw IllegalArgumentException("文件太大（${size / 1024} KB），不像是账号备份")
+                    }
                     contentResolver.openInputStream(uri)?.use { it.readBytes() }
                         ?.toString(Charsets.UTF_8)
                         ?: throw java.io.IOException("无法读取该文件")
                 }
                 runOnUiThread {
                     result.onSuccess { text ->
-                        if (text.length > 1_048_576) toast("文件太大，不像是账号备份")
+                        // statSize 在部分 provider 上返回 -1（大小未知），这里再兜一次
+                        if (text.length > MAX_IMPORT_BYTES) toast("文件太大，不像是账号备份")
                         else promptImportPreview(text)   // 先给预览，勾完才真正写盘
                     }.onFailure { toast("读取失败：${it.message}") }
                 }
@@ -1973,10 +2021,18 @@ class MainActivity : Activity() {
         }
     }
 
-    /** 拉积分/额度（后台线程，用解密后的真实 token 打 ug 接口），成功后重绘账号页。 */
-    private fun refreshQuota() {
+    /**
+     * 拉积分/额度（后台线程，用解密后的真实 token 打 ug 接口），成功后原地更新控件。
+     *
+     * [quiet] = **自动拉取**（进账号页时触发）：不弹 toast、未登录也不提示。
+     * 用户没点任何按钮，屏幕上不该出现"已更新"或"未登录"——那是噪声。
+     */
+    private fun refreshQuota(quiet: Boolean = false) {
         val cred = TraeAuthStore.load(this)
-        if (cred == null || cred.accessToken.isBlank()) { toast("未登录 Trae，请先登录"); return }
+        if (cred == null || cred.accessToken.isBlank()) {
+            if (!quiet) toast("未登录 Trae，请先登录")
+            return
+        }
         if (quotaLoading) return
         // 数值位立刻变「…」：网络往返有几百毫秒，不给反馈用户会以为没点动。
         // 原地改控件而不是 redraw() —— 重建页面会把滚动位置弹回页首，用户就看不见这张卡了。
@@ -1986,19 +2042,28 @@ class MainActivity : Activity() {
             // runCatching 同 refreshModels：抛异常会让线程在复位前死掉，`quotaLoading`
             // 卡 true → 按钮永远「刷新中…」且不再响应点击。
             val pair = runCatching {
-                TraeUpstream.fetchUsage(cred.accessToken, cred.uid) to
-                    TraeUpstream.fetchCheckin(cred.accessToken, cred.uid)
+                TraeUpstream.fetchUsage(cred.accessToken, cred.uid, cred.region) to
+                    TraeUpstream.fetchCheckin(cred.accessToken, cred.uid, cred.region)
             }.getOrNull()
             val u = pair?.first
             val c = pair?.second
             runOnUiThread {
                 if (isFinishing || isDestroyed) { quotaLoading = false; return@runOnUiThread }
+                // ⚠️ 写回前比对账号：等待期间用户可能切过号（自动换号也会），
+                // 无条件写回会让新账号显示上一个账号的积分/签到状态。
+                if (TraeAuthStore.activeUid(this@MainActivity) != cred.uid) {
+                    quotaLoading = false
+                    quotaApply?.invoke()
+                    return@runOnUiThread
+                }
                 // 拉失败时**保留旧值**（与 claimCheckin 一致）：网络抖一下就把已显示的
                 // 积分/签到状态擦回「—」是净损失，用户会以为数据丢了。
                 accountBalance = u ?: accountBalance
                 accountCheckin = c ?: accountCheckin
                 quotaLoading = false
-                toast(if (u == null) "未获取到额度" else "已更新")
+                // [quiet] = 进账号页的自动拉取：用户只是点了个 Tab，不该被"已更新"打扰。
+                // 只有他真的点了「刷新」才需要回执。
+                if (!quiet) toast(if (u == null) "未获取到额度" else "已更新")
                 quotaApply?.invoke()
             }
         }
@@ -2038,16 +2103,16 @@ class MainActivity : Activity() {
             // 网络层），线程死掉后标志永远为 true → 签到按钮永久卡在「签到中…」。
             val result = try {
                 // 状态未知（before == null）先补查：不能在不知道 enable/checkedIn 的情况下打 claim
-                val known = before ?: TraeUpstream.fetchCheckin(cred.accessToken, cred.uid)
+                val known = before ?: TraeUpstream.fetchCheckin(cred.accessToken, cred.uid, cred.region)
                 if (known?.checkedIn == true) {
                     Triple(known, null, null as Long?)
                 } else if (known?.enable == false) {
                     Triple(known, null, null as Long?)
                 } else {
-                    val code = TraeUpstream.claimCheckin(cred.accessToken, cred.uid)
+                    val code = TraeUpstream.claimCheckin(cred.accessToken, cred.uid, cred.region)
                     // 签到后重查积分与状态：拿到最新余额，同时把按钮切成「今日已签到」
-                    val u = TraeUpstream.fetchUsage(cred.accessToken, cred.uid)
-                    val after = TraeUpstream.fetchCheckin(cred.accessToken, cred.uid)
+                    val u = TraeUpstream.fetchUsage(cred.accessToken, cred.uid, cred.region)
+                    val after = TraeUpstream.fetchCheckin(cred.accessToken, cred.uid, cred.region)
                     Triple(known, Triple(code, after, u), null)
                 }
             } catch (e: Exception) {
@@ -2066,11 +2131,21 @@ class MainActivity : Activity() {
                     return@runOnUiThread
                 }
                 val (code, after, u) = tail
+                // ⚠️ 写回前比对账号：这次请求是给 cred.uid 发的，等待期间用户可能已经切号。
+                // 无条件写回就会出现"新账号顶着上一个账号的签到状态/余额"（同一个误报的入口）。
+                if (TraeAuthStore.activeUid(this@MainActivity) != cred.uid) {
+                    toast("签到请求已完成，但你已切换账号，结果未写入当前账号")
+                    return@runOnUiThread
+                }
                 accountBalance = u ?: accountBalance
                 accountCheckin = after ?: accountCheckin
                 toast(
                     when {
                         TraeUpstream.checkinSucceeded(known, after, code) -> "签到成功"
+                        // 成功码但**重查没回来**：code=0 是成功码，上游多半已经签上了，
+                        // 只是那次状态重查失败（网络抖一下）。以前这里落到 else 分支报
+                        // "签到未生效（code=0）"，等于把成功说成失败。
+                        code == 0 && after == null -> "签到请求已提交，状态未取回，请点「刷新」确认"
                         after?.checkedIn == true -> "今日已签到"
                         code == null -> "签到失败：网络不通，请稍后重试"
                         // 9074 = 上游判"操作太过频繁"。参考 trae-mate（trae_instance.rs:111）：
@@ -2115,7 +2190,7 @@ class MainActivity : Activity() {
             // 都会让线程在 `runOnUiThread` **之前**死掉 → `modelsLoading` 永远为 true →
             // `refreshModels()` 在开头直接 return、按钮永久 disabled + 文案卡在「刷新中…」。
             // 这是"唯一会让用户可见控件永久失效"的失败面，所以失败也要把标志捎回来复位。
-            val arr = runCatching { TraeUpstream.fetchModels(cred.accessToken, cred.uid) }.getOrNull()
+            val arr = runCatching { TraeUpstream.fetchModels(cred.accessToken, cred.uid, cred.region) }.getOrNull()
             runOnUiThread {
                 if (isFinishing || isDestroyed) { modelsLoading = false; return@runOnUiThread }
                 modelsLoading = false
@@ -2138,11 +2213,10 @@ class MainActivity : Activity() {
      * 可能落后于上游 —— 静默刷一次，让用户无感拿到最新表。
      *
      * 判据**不能**用 `ModelsRepo.isDynamic`（init 装过磁盘缓存后它恒为 true，
-     * 有缓存的设备将永远补不到新表），用进程级一次性标志：每个冷启动恰好刷一次，
-     * recreate（转屏/切主题）不重刷。
+     * 有缓存的设备将永远补不到新表）。标志必须放在 companion（**进程级**）：
+     * 写成 Activity 实例字段的话，切外观风格触发的 `recreate()` 会再刷一次上游 ——
+     * 注释说"每个冷启动恰好刷一次"就与实现不一致了。
      */
-    private var autoModelsTried = false
-
     private fun maybeAutoRefreshModels() {
         if (autoModelsTried || modelsLoading) return
         autoModelsTried = true
@@ -2207,7 +2281,15 @@ class MainActivity : Activity() {
         contentHost.postDelayed({
             if (isFinishing || isDestroyed) return@postDelayed
             serviceBusy = null
-            toast(if (stopping) "服务已停止" else "服务已启动")
+            // 失败时如实报原因（典型：端口被占）。以前这种情况是进程崩溃，
+            // 现在至少能把"为什么没起来"说清楚，用户才知道该去关掉什么。
+            toast(
+                when {
+                    Gateway.lastStartError != null -> "启动失败：${Gateway.lastStartError}"
+                    stopping -> "服务已停止"
+                    else -> "服务已启动"
+                }
+            )
             redraw()
         }, 500)
     }

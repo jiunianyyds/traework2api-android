@@ -24,7 +24,7 @@ object AppStyle {
 
     /** 语义色名：与 [Style.light] / [Style.dark] 的键一一对应。 */
     val KEYS = listOf(
-        "primary", "primary_container", "on_primary", "on_primary_container", "secondary",
+        "primary", "primary_container", "on_primary", "on_primary_container",
         "background", "surface", "surface_container", "surface_variant",
         "on_surface", "on_surface_variant", "outline", "outline_variant",
         "success", "success_container", "warning", "warning_container", "error", "error_container",
@@ -110,7 +110,7 @@ object AppStyle {
         light = mapOf(
             "primary" to "#4F46E5", "primary_container" to "#E6E7FF",
             "on_primary" to "#FFFFFF", "on_primary_container" to "#17115B",
-            "secondary" to "#2563A9", "background" to "#F7F7FC", "surface" to "#FFFFFF",
+            "background" to "#F7F7FC", "surface" to "#FFFFFF",
             "surface_container" to "#F0F0F8", "surface_variant" to "#E7E7F0",
             "on_surface" to "#1B1B22", "on_surface_variant" to "#5F5F6B",
             "outline" to "#777783", "outline_variant" to "#C7C7D1",
@@ -121,7 +121,7 @@ object AppStyle {
         dark = mapOf(
             "primary" to "#BEC2FF", "primary_container" to "#34358B",
             "on_primary" to "#20205F", "on_primary_container" to "#E1E0FF",
-            "secondary" to "#8AB8E8", "background" to "#101016", "surface" to "#19191F",
+            "background" to "#101016", "surface" to "#19191F",
             "surface_container" to "#23232B", "surface_variant" to "#2E2E38",
             "on_surface" to "#E5E1EA", "on_surface_variant" to "#B5B3C0",
             "outline" to "#8B8B97", "outline_variant" to "#3A3A44",
@@ -142,7 +142,7 @@ object AppStyle {
         light = mapOf(
             "primary" to "#3F4754", "primary_container" to "#DDE2EA",
             "on_primary" to "#FFFFFF", "on_primary_container" to "#191C22",
-            "secondary" to "#4A5568", "background" to "#ECEDEF", "surface" to "#FFFFFF",
+            "background" to "#ECEDEF", "surface" to "#FFFFFF",
             "surface_container" to "#F4F5F7", "surface_variant" to "#E2E4E8",
             "on_surface" to "#16181D", "on_surface_variant" to "#55595F",
             "outline" to "#6E737B", "outline_variant" to "#C6C9CE",
@@ -153,7 +153,7 @@ object AppStyle {
         dark = mapOf(
             "primary" to "#B8C2D0", "primary_container" to "#2A313C",
             "on_primary" to "#1A2028", "on_primary_container" to "#DCE2EA",
-            "secondary" to "#9AA6B5", "background" to "#101215", "surface" to "#17191D",
+            "background" to "#101215", "surface" to "#17191D",
             "surface_container" to "#1F2227", "surface_variant" to "#272B31",
             "on_surface" to "#E3E5E9", "on_surface_variant" to "#A9AEB6",
             "outline" to "#868C95", "outline_variant" to "#34383E",
@@ -174,7 +174,7 @@ object AppStyle {
         light = mapOf(
             "primary" to "#2F6C46", "primary_container" to "#D6EFDD",
             "on_primary" to "#FFFFFF", "on_primary_container" to "#0E2416",
-            "secondary" to "#4A7C59", "background" to "#F4F7F2", "surface" to "#FFFFFF",
+            "background" to "#F4F7F2", "surface" to "#FFFFFF",
             "surface_container" to "#EDF3EA", "surface_variant" to "#DFE9DD",
             "on_surface" to "#131A15", "on_surface_variant" to "#4F5B52",
             "outline" to "#6C7A6F", "outline_variant" to "#C3CFC2",
@@ -185,7 +185,7 @@ object AppStyle {
         dark = mapOf(
             "primary" to "#8FD5A6", "primary_container" to "#1D3A28",
             "on_primary" to "#0D2A18", "on_primary_container" to "#CDEBD8",
-            "secondary" to "#A9C9AF", "background" to "#0F1410", "surface" to "#161C17",
+            "background" to "#0F1410", "surface" to "#161C17",
             "surface_container" to "#1E251F", "surface_variant" to "#262E27",
             "on_surface" to "#E1E8E1", "on_surface_variant" to "#AAB7AC",
             "outline" to "#8A978A", "outline_variant" to "#333B33",
@@ -206,7 +206,7 @@ object AppStyle {
         light = mapOf(
             "primary" to "#A8431A", "primary_container" to "#FFE2D4",
             "on_primary" to "#FFFFFF", "on_primary_container" to "#3A1406",
-            "secondary" to "#8A5A2B", "background" to "#FDF7F3", "surface" to "#FFFFFF",
+            "background" to "#FDF7F3", "surface" to "#FFFFFF",
             "surface_container" to "#F8EFE9", "surface_variant" to "#EFE2DA",
             "on_surface" to "#211711", "on_surface_variant" to "#5C4A3E",
             "outline" to "#7D6A5D", "outline_variant" to "#D6C5B8",
@@ -217,7 +217,7 @@ object AppStyle {
         dark = mapOf(
             "primary" to "#FFB59B", "primary_container" to "#6E2607",
             "on_primary" to "#571D06", "on_primary_container" to "#FFDBCB",
-            "secondary" to "#E0B58C", "background" to "#17110D", "surface" to "#1F1813",
+            "background" to "#17110D", "surface" to "#1F1813",
             "surface_container" to "#291F18", "surface_variant" to "#33261D",
             "on_surface" to "#EFE1D9", "on_surface_variant" to "#C4B0A3",
             "outline" to "#9C8A7C", "outline_variant" to "#45372C",
@@ -293,19 +293,35 @@ object AppStyle {
      *
      * 取不到时回退 `on_surface` —— **绝不能返回 0**：那是全透明，文字会直接看不见。
      * （色表齐全由 [selfCheck] 在启动时保证，这里的回退只是二道保险。）
+     *
+     * 解析结果按「风格 × 亮暗 × 键」缓存：建一页 UI 要查几百次色，
+     * 每次都 `Color.parseColor` 是纯字符串浪费；换风格/换亮暗时整表失效重建。
      */
+    private val colorCache = HashMap<String, Int>()
+
     fun color(name: String): Int {
-        val pal = current.palette(night)
-        return parse(pal[name] ?: pal[FALLBACK] ?: "#000000")
+        val style = current
+        val key = "${style.id}|$night|$name"
+        synchronized(colorCache) {
+            colorCache[key]?.let { return it }
+        }
+        val pal = style.palette(night)
+        val parsed = parse(pal[name] ?: pal[FALLBACK] ?: "#000000")
+        synchronized(colorCache) { colorCache[key] = parsed }
+        return parsed
     }
 
-    /**
-     * 指定风格的语义色：「外观风格」页的色样预览要用**该风格自己**的色，
-     * 而不是当前风格的（否则四张色样全长一样）。
-     */
+    /** 指定风格的语义色（带缓存，同 [color] 的 key 规则）：「外观风格」页的色样预览要用
+     *  **该风格自己**的色，而不是当前风格的（否则四张色样全长一样）。 */
     fun previewColor(s: Style, name: String, dark: Boolean): Int {
+        val key = "${s.id}|$dark|$name"
+        synchronized(colorCache) {
+            colorCache[key]?.let { return it }
+        }
         val pal = s.palette(dark)
-        return parse(pal[name] ?: pal[FALLBACK] ?: "#000000")
+        val parsed = parse(pal[name] ?: pal[FALLBACK] ?: "#000000")
+        synchronized(colorCache) { colorCache[key] = parsed }
+        return parsed
     }
 
     private const val FALLBACK = "on_surface"
