@@ -330,40 +330,14 @@ object CreditMonitor {
     /**
      * 取指定账号的可用 access token；必要时续期。
      *
-     * **不复用 [TraeAuthApi.restartWithValidToken]**：那个函数只认"当前账号"，
-     * 且会 `TraeRegion.current = cred.region` 翻全局区域（用户正复制的国际服登录链接会被串区），
-     * 续期成功还走 `save()` 把 active 抢回去。这里按账号自己的区域换、写回不动 active。
+     * 续期实现已收进 [TraeAuthApi.validTokenForUid]（批量签到也要走同一条路）：
+     * 锁内续期、不碰 active、不翻全局区域。这里只做"失败时退回旧 token 继续用"的兜底。
      */
-    private fun tokenFor(ctx: Context, uid: String): String? {
-        val c = TraeAuthStore.loadByUid(ctx, uid) ?: return null
-        val usable = c.accessToken.isNotBlank() && !TraeAuthApi.expiredWithin(c.expiresAt, SKEW_SEC)
-        if (usable) return c.accessToken
-        if (c.refreshToken.isBlank()) return c.accessToken.takeIf { it.isNotBlank() }
-        return try {
-            renew(ctx, uid)
-        } catch (e: Exception) {
-            Log.w(TAG, "续期失败 $uid: ${e.javaClass.simpleName}: ${e.message}")
-            c.accessToken.takeIf { it.isNotBlank() }
-        }
-    }
-
-    /** 锁内续期：进锁后**再判一次**是否还需要换（这几十毫秒里别人可能已经换过）。 */
-    private fun renew(ctx: Context, uid: String): String? = Gateway.locked {
-        val c = TraeAuthStore.loadByUid(ctx, uid) ?: return@locked null
-        if (c.accessToken.isNotBlank() && !TraeAuthApi.expiredWithin(c.expiresAt, SKEW_SEC)) {
-            return@locked c.accessToken
-        }
-        if (c.refreshToken.isBlank()) return@locked null
-        val ex = TraeAuthApi.exchangeToken(c.refreshToken, c.region) // 显式传区域，不读全局
-        val nc = c.copy(
-            accessToken = ex.accessToken,
-            refreshToken = ex.refreshToken ?: c.refreshToken,
-            expiresAt = ex.expiresAt ?: c.expiresAt,
-        )
-        TraeAuthStore.updateTokens(ctx, nc)   // 不切 active
-        // expiresAt 存在索引里，必须一起回写：不然下一轮还会再"续期"一次，白耗一个 refresh
-        TraeAuthStore.updateMeta(ctx, nc.toMeta())
-        nc.accessToken
+    private fun tokenFor(ctx: Context, uid: String): String? = try {
+        TraeAuthApi.validTokenForUid(ctx, uid, SKEW_SEC)
+    } catch (e: Exception) {
+        Log.w(TAG, "取 token 异常 $uid: ${e.javaClass.simpleName}: ${e.message}")
+        TraeAuthStore.loadByUid(ctx, uid)?.accessToken?.takeIf { it.isNotBlank() }
     }
 
     private fun publish(snapshot: Snapshot) {

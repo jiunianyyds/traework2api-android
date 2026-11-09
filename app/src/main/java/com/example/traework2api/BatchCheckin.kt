@@ -35,11 +35,10 @@ import java.util.concurrent.atomic.AtomicBoolean
  *   但白发请求）；成功判据用 [TraeUpstream.checkinSucceeded]（成功码 ∧ 状态跃迁）。
  * - **续期写回走 [TraeAuthStore.updateTokens]**（不碰 active）—— [TraeAuthStore.save] 会
  *   把保存的账号设为当前账号，后台批量续期会偷偷切号。
+ * - **锁边界（v0.4.15 修正）**：整批**不持** `Gateway.locked`。那把锁与转发路径的
+ *   `credProvider` 是同一把，整批持锁等于签到期间所有对话请求零字节挂死。只有"续期"
+ *   这一步需要串行（refresh 是轮换的），已收进 [TraeAuthApi.validTokenForUid]。
  * - **互斥**：[busy] 挡住「手动签到」与「定时签到」同时跑（两个入口可能撞在同一时刻）。
- * - **续期与网关共用 Gateway.locked**：refresh token 是**轮换**的，同一账号被两条路径
- *   并发续期，先换到的会被后换到的作废（Gateway.kt credProvider 注释原话）。[runAll]
- *   全程持这把锁。代价是批量期间转发请求恰好要续期时得等一下；不持锁的代价是 token
- *   静默作废——不对称，必须持。
  *
  * ## 每日闹钟（[scheduleNext]）
  *  生命周期四条：开启时挂 → 每次触发自续 → 进 App 自愈重挂（[maybeCatchUp] 顺带做）→
@@ -187,10 +186,17 @@ object BatchCheckin {
      * 对**全部已保存账号**执行签到。**阻塞调用** —— 必须在后台线程跑
      * （手动入口在 MainActivity 的 thread 里；定时入口在 CheckinReceiver 的 goAsync 里）。
      *
+     * ⚠️ **不持 `Gateway.locked` 跑整批**（v0.4.14 的写法，已修）：
+     * 那把锁同时被 `LocalFakeServer` 的 `credProvider` 持着，而它在**每个** `/v1/chat/completions`
+     * 写响应头之前同步调用。整批持锁 = 签到期间所有对话请求零字节挂死，10 个账号能堵几十分钟
+     * （单次 ug 请求读超时就有 180s）。锁只保留在**真正需要串行**的地方 —— 续期，
+     * 见 [TraeAuthApi.validTokenForUid]。
+     *
      * 返回结果并持久化；跑完把 last_run_date 记为今天。
      */
-    fun runAll(ctx: Context): BatchResult = Gateway.locked {
-        val metas = TraeAuthStore.list(ctx).filter { it.region.isSupported }   // 国际服跳过
+    fun runAll(ctx: Context): BatchResult {
+        // 只是本地索引读取（毫秒级），短锁即可
+        val metas = Gateway.locked { TraeAuthStore.list(ctx) }.filter { it.region.isSupported }
         val results = mutableListOf<PerAccount>()
         for ((i, meta) in metas.withIndex()) {
             if (i > 0) Thread.sleep(PER_ACCOUNT_DELAY_MS)
@@ -204,7 +210,7 @@ object BatchCheckin {
         val r = BatchResult(results, today)
         Log.i(TAG, "批量签到完成: ${results.count { it.ok }} 成功 / ${results.size} 国服账号")
         // 通知由调用方决定发不发（定时路径发、手动路径不发——用户就在界面上）。
-        r
+        return r
     }
 
     /** 对单个账号执行完整签到流程。失败不抛 —— 一人失败不拖垮整批。 */
@@ -215,28 +221,21 @@ object BatchCheckin {
             return PerAccount(meta.uid, name, "unsupported", -1, "该区域未支持签到")
         }
         return try {
-            var cred = TraeAuthStore.loadByUid(ctx, meta.uid)
-                ?: return PerAccount(meta.uid, name, "fail", -1, "凭据读取失败")
-            // 临近/已过期先续期（按账号自己的区域换 token；写回不碰 active）
-            if (cred.accessToken.isBlank() || expiredWithin(cred.expiresAt, 3600)) {
-                if (cred.refreshToken.isBlank()) {
-                    return PerAccount(meta.uid, name, "fail", -1, "token 已过期且无 refreshToken，需重新登录")
-                }
-                val ex = TraeAuthApi.exchangeToken(cred.refreshToken, reg)
-                cred = cred.copy(accessToken = ex.accessToken, refreshToken = ex.refreshToken ?: cred.refreshToken,
-                    expiresAt = ex.expiresAt ?: cred.expiresAt)
-                TraeAuthStore.updateTokens(ctx, cred)
-                // expiresAt 存在索引（元数据）里，必须跟着更新：不更新的话下次批量会拿
-                // 陈旧到期时间再"续期"一次，白白多消耗一个 refresh token（轮换制）。
-                TraeAuthStore.updateMeta(ctx, cred.toMeta())
+            // 续期/取 token 走后台统一入口：锁内续期、不切 active、不翻全局区域。
+            // 以前这里自己抄了一份"过期就 exchangeToken 再 updateTokens/updateMeta"，
+            // 与 CreditMonitor 里那份重复，且必须在 runAll 的大锁里才不会撞轮换。
+            val token = TraeAuthApi.validTokenForUid(ctx, meta.uid, 3600)
+            if (token.isNullOrBlank()) {
+                return PerAccount(meta.uid, name, "fail", -1,
+                    "取不到有效 token（已过期且无法自动续期），需重新登录")
             }
             // 先查状态再决定发不发 claim（照抄单账号路径的纪律）
-            val before = TraeUpstream.fetchCheckin(cred.accessToken, cred.uid, reg)
+            val before = TraeUpstream.fetchCheckin(token, meta.uid, reg)
                 ?: return PerAccount(meta.uid, name, "fail", -1, "拉取签到状态失败（网络或上游异常）")
             if (before.checkedIn) return PerAccount(meta.uid, name, "already", before.credits, "")
             if (!before.enable) return PerAccount(meta.uid, name, "disabled", -1, "该账号未开放签到")
-            val code = TraeUpstream.claimCheckin(cred.accessToken, cred.uid, reg)
-            val after = TraeUpstream.fetchCheckin(cred.accessToken, cred.uid, reg)
+            val code = TraeUpstream.claimCheckin(token, meta.uid, reg)
+            val after = TraeUpstream.fetchCheckin(token, meta.uid, reg)
             when {
                 TraeUpstream.checkinSucceeded(before, after, code) ->
                     PerAccount(meta.uid, name, "ok", after!!.credits, "")
@@ -251,12 +250,6 @@ object BatchCheckin {
             Log.w(TAG, "账号 ${meta.uid} 签到异常: ${e.javaClass.simpleName}: ${e.message}")
             PerAccount(meta.uid, name, "fail", -1, "签到异常：${e.message ?: e.javaClass.simpleName}")
         }
-    }
-
-    /** 与 TraeAuthApi.expiredWithin 同款判据（0/负数=未知 → 当成已过期）。 */
-    private fun expiredWithin(expiresAt: Long?, skewSec: Long): Boolean {
-        if (expiresAt == null || expiresAt <= 0) return true
-        return System.currentTimeMillis() / 1000 + skewSec >= expiresAt
     }
 
     // ------------------------------------------------------------------
@@ -381,10 +374,13 @@ object BatchCheckin {
     * 结果 JSON 往返、 expiredWithin 边界。
     */
     fun selfCheck() {
-        // expiredWithin 边界与 TraeAuthApi 同一套约定（未知=过期 → 才会走续期而不是盲用）
-        check(expiredWithin(0L, 3600)) { "自检失败：exp=0 应判为过期" }
-        check(expiredWithin(null, 3600)) { "自检失败：exp=null 应判为过期" }
-        check(!expiredWithin((System.currentTimeMillis() / 1000) + 7200, 3600)) { "自检失败：远未来 exp 不应判为过期" }
+        // 过期判据与 TraeAuthApi 同一套约定（未知=过期 → 才会走续期而不是盲用）。
+        // 用**同一个函数**而不是本地副本：副本改了这边不改，会出现"这里判过期、那边判有效"。
+        check(TraeAuthApi.expiredWithin(0L, 3600)) { "自检失败：exp=0 应判为过期" }
+        check(TraeAuthApi.expiredWithin(null, 3600)) { "自检失败：exp=null 应判为过期" }
+        check(!TraeAuthApi.expiredWithin((System.currentTimeMillis() / 1000) + 7200, 3600)) {
+            "自检失败：远未来 exp 不应判为过期"
+        }
 
         // 结果 JSON 往返（uid 是主键，串了会把 A 的结果显示给 B）
         val src = listOf(

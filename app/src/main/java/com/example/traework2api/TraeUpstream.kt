@@ -75,6 +75,19 @@ object TraeUpstream {
         .readTimeout(180, TimeUnit.SECONDS)
         .build()
 
+    /**
+     * 额度/签到接口专用 client：**读超时 15 秒**，不是 180。
+     *
+     * 为什么必须分开：`ug()` 是轻请求（一个 JSON 空 body），却一直蹭聊天那个 180s 的 client。
+     * 批量签到时「每账号 3 次 ug」× 180s = 单账号最坏 9 分钟，10 个账号直接超出
+     * `CheckinReceiver` 的 2 分钟唤醒锁与广播预算 —— 签到被系统腰斩，用户第二天发现"漏签"。
+     * 15s 对额度查询极其宽松（实测正常在 1s 内），超时就是真的连不上，早失败更好。
+     */
+    private val ugClient = OkHttpClient.Builder()
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(15, TimeUnit.SECONDS)
+        .build()
+
     /** OpenAI 请求体 → Trae 请求体（原地改写）。 */
     fun prepareBody(raw: JSONObject): JSONObject {
         raw.put("stream", true)
@@ -222,7 +235,8 @@ object TraeUpstream {
             .header("X-User-Region", region.userRegionHeader.ifBlank { "CN" })
         val req = b.build()
         return try {
-            client.newCall(req).execute().use { r ->
+            // 用 ugClient（15s 读超时）而不是聊天那个 180s 的：见 ugClient 注释
+            ugClient.newCall(req).execute().use { r ->
                 if (!r.isSuccessful || r.body == null) null else JSONObject(r.body!!.string())
             }
         } catch (_: Exception) { null }
@@ -387,9 +401,10 @@ object TraeUpstream {
      *
      * token 只进内存与请求头，绝不落日志。
      */
-    fun fetchModels(tok: String, uid: String = ""): JSONArray? {
-        // 区域分派交给调用方判断？不 —— 表也走同一个 SOLO 端点，只有 CN 实测过。
-        val reg = TraeRegion.current   // 快照：见文件头 region 说明
+    fun fetchModels(tok: String, uid: String = "", region: TraeRegion = TraeRegion.current): JSONArray? {
+        // 区域由调用方显式传（UI 传当前账号的 cred.region）；缺省沿用全局只为兼容旧调用。
+        // 表也走同一个 SOLO 端点，只有 CN 实测过。
+        val reg = region
         if (!reg.canQueryQuota) return null
         val body = JSONObject()
             .put("function", FUNCTION)
@@ -505,6 +520,20 @@ object TraeUpstream {
      * 每个 check 对应一个真实踩过/差点踩到的坑。
      */
     fun selfCheck() {
+        // 流内错误帧必须是 OpenAI 形状（`data: {"error":…}` + `[DONE]`），不能是
+        // `event: error` + 字符串 data：后者到客户端只会解析失败并被静默丢弃。
+        run {
+            val f = errorFrame("boom", "http_500")
+            val lines = f.trim().split("\n").filter { it.isNotBlank() }
+            check(lines.size == 2 && lines[0].startsWith("data: ") && lines[1] == "data: [DONE]") {
+                "自检失败：错误帧必须是 一条 data:{…} + 一条 data:[DONE]，得到 $f"
+            }
+            val obj = JSONObject(lines[0].removePrefix("data: ").trim())
+            check(obj.getJSONObject("error").getString("message") == "boom") { "自检失败：错误帧缺 message" }
+            check(obj.getJSONObject("error").getString("code") == "http_500") { "自检失败：错误帧缺 code" }
+            check(!f.contains("event:")) { "自检失败：错误帧不该带 event: 前缀（客户端不认）" }
+        }
+
         // 设备身份派生必须与参考实现（trae-mate `device_map.rs` 的 Python 对标向量）**逐位一致**：
         // 派生错了设备身份就不独立，领取会被判"共用设备"→ 9074。改派生逻辑必先过这里。
         check(deviceIdFor("1234567890123456") == "413174708280782") { "自检失败：device_id 派生不符" }
@@ -646,31 +675,38 @@ object TraeUpstream {
      * 转发到 Trae 并流式转换。每产生一块要写给客户端的内容就调用 [out]（已是完整 `data: ...\n\n`）。
      * 流转结束后（成功/出错）调用 [onResult]：参数为 最终 usage（可能 null）与 错误类型（null=成功）。
      * 上游 HTTP 出错时也通过 [out] 输出 error 事件 + [DONE]。
+     *
+     * @param region **必须是本次请求所用 token 所属的区域**（`cred.region`），由调用方显式传入。
+     *   以前这里是入口快照 `TraeRegion.current`，但那个全局量会被并发路径改写
+     *   （切账号 / 自动换号 / `restartWithValidToken`），而快照点与真正使用点之间
+     *   隔着可达 180s 的流式窗口 —— 窗口内翻面就会**把 CN 的 token 发到 SG 的 host**
+     *   （账号区域串号）。显式传参后这类竞态从根上不存在。
      */
-    fun chatStream(prepared: JSONObject, traeToken: String, uid: String = "", out: (String) -> Unit, onResult: (JSONObject?, String?) -> Unit) {
-        // **区域只在此处快照一次**，后续 host/header/协议分支全部用局部值。
-        // 不这么做的话：:614 判定与 :619 取 host 是两次独立读取，中间夹着可达 180s 的
-        // 流式窗口；用户在此期间切账号就会让 `current` 翻面 —— 一次已按 CN 协议发出的请求
-        // 会把 CN 的 token 发到 SG host，属**账号区域串号**，不只是显示问题。
-        val reg = TraeRegion.current
+    fun chatStream(
+        prepared: JSONObject,
+        traeToken: String,
+        uid: String,
+        region: TraeRegion,
+        out: (String) -> Unit,
+        onResult: (JSONObject?, String?) -> Unit,
+    ) {
         // 区域分派：两个区域都已支持聊天，但协议完全不同 ——
         //   CN：单次 POST llm_utils_chat
         //   SG：建会话 → commit → 订阅 events 三段式（见 TraeIntlUpstream）
-        if (reg != TraeRegion.CN) {
+        if (region != TraeRegion.CN) {
             TraeIntlUpstream.chatStream(prepared, traeToken, uid, out, onResult)
             return
         }
         val req = Request.Builder()
-            .url(reg.agentHost + EP_CHAT)
+            .url(region.agentHost + EP_CHAT)
             .post(prepared.toString().toRequestBody("application/json".toMediaType()))
-            .solo(traeToken, stream = true, uid = uid, region = reg)
+            .solo(traeToken, stream = true, uid = uid, region = region)
             .build()
 
         client.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) {
                 val err = (resp.body?.string() ?: "").take(200)
-                out("event: error\ndata: ${jsonEscape("upstream http ${resp.code}: $err")}\n\n")
-                out("data: [DONE]\n\n")
+                out(errorFrame("upstream http ${resp.code}: $err", "http_${resp.code}"))
                 onResult(null, "http:${resp.code}")
                 return
             }
@@ -735,8 +771,8 @@ object TraeUpstream {
                     writeChunk(JSONObject(), fin); writeDONE(); sawDone = true; settle(lastUsage, null)
                 }
                 "error" -> {
-                    out("event: error\ndata: ${jsonEscape("solo error code=${v.errorCode} msg=${v.errorMessage}")}\n\n")
-                    writeDONE(); sawDone = true; settle(null, "solo:${v.errorCode}")
+                    out(errorFrame("solo error code=${v.errorCode} msg=${v.errorMessage}", "solo_${v.errorCode}"))
+                    sawDone = true; settle(null, "solo:${v.errorCode}")
                 }
             }
         }
@@ -769,7 +805,17 @@ object TraeUpstream {
         return out
     }
 
-    private fun jsonEscape(s: String): String = JSONObject.quote(s)
+    /**
+     * OpenAI 规范的流内错误帧：`data: {"error":{…}}` + `[DONE]`。
+     *
+     * ⚠️ **不能改回 `event: error` + 字符串 data**：客户端按 SSE 的 `data:` 行做 JSON 解析，
+     * 解析失败就静默丢掉那一帧 —— 用户看到的是 HTTP 200 + 空气泡，既不报错也不会重试。
+     * 自带 `[DONE]`，调用方不要再补。
+     */
+    internal fun errorFrame(msg: String, code: String = "upstream_error"): String =
+        "data: " + JSONObject()
+            .put("error", JSONObject().put("message", msg).put("type", "api_error").put("code", code))
+            .toString() + "\n\ndata: [DONE]\n\n"
 
     // ------------------------------------------------------------------
     // SSE 行状态机（复刻 solosse.go::sseState + scanLine + ParseSOLOLine）

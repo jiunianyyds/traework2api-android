@@ -196,7 +196,13 @@ object TraeAuthStore {
     // 导出 / 导入（JSON 明文，换设备一键登录用）
     // ------------------------------------------------------------------
 
-    /** 导出文件的格式标识，导入时用来确认"这是本 App 导出的账号表"。 */
+    /**
+     * 写进导出文件的格式标识，给人和外部工具看的。
+     *
+     * ⚠️ **导入并不校验它**（[parseAccounts] 只看 `accounts` 数组，连"顶层直接是数组"
+     * 的裸格式都收）。这是有意的宽松：用户可能自己拼一份 JSON 导进来。
+     * 所以别把这个常量当成"导入端的安全闸"——它只是一枚标记。
+     */
     const val EXPORT_FORMAT = "traework2api-accounts"
 
     /** uid 会被直接拼进 prefs key（`trae_acc_<uid>_access`），必须收窄成纯数字。 */
@@ -473,8 +479,12 @@ object TraeAuthStore {
     // ------------------------------------------------------------------
 
     /**
-     * @Volatile：新增的 CreditMonitor 会在后台线程调 [list]，与 UI 线程并发的
-     * "首读判定未迁移" 会让 [migrateLegacyIfNeeded] 跑两遍，而它是**整表覆盖** KEY_INDEX。
+     * 旧数据迁移只跑一次的标志。
+     *
+     * ⚠️ 必须是 `synchronized` 块保护的 check-then-act，不能只靠 `@Volatile`：
+     * 迁移是**整表覆盖** KEY_INDEX 的写，两个线程同时判"未迁移"会交错执行，
+     * 可能吞掉并发 `save()` 刚写入的条目。锁对象用本 object 自身（TraeAuthStore
+     * 的所有公开方法本就可能并发，这里串行化一次性的迁移足够）。
      */
     @Volatile
     private var migrated = false
@@ -518,8 +528,14 @@ object TraeAuthStore {
      * 幂等：迁移过一次或没有旧数据时什么都不做。
      */
     private fun migrateLegacyIfNeeded(context: Context) {
-        if (migrated) return
-        migrated = true
+        synchronized(this) {
+            if (migrated) return
+            migrated = true
+            doMigrate(context)
+        }
+    }
+
+    private fun doMigrate(context: Context) {
         val p = prefs(context)
         if (!p.contains(LEGACY_ACCESS)) return
         val access = p.getString(LEGACY_ACCESS, null)?.let { decrypt(it) }
@@ -553,9 +569,20 @@ object TraeAuthStore {
     // AES-GCM（KeyStore 主密钥）
     // ------------------------------------------------------------------
 
+    /**
+     * KeyStore 里的主密钥**缓存一份**。
+     *
+     * 为什么值得缓存：`KeyStore.getInstance().load(null)` + `getKey` 每次都是 Binder 往返，
+     * 导入导出 N 个账号就是 2N 次初始化 —— 真机上肉眼可见的停顿（几十个号能卡住一秒以上）。
+     * 主密钥在进程生命周期内不会变，缓存安全。
+     */
+    @Volatile
+    private var cachedKey: SecretKey? = null
+
     private fun secretKey(): SecretKey {
+        cachedKey?.let { return it }
         val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
-        (ks.getKey(KEY_ALIAS, null) as? SecretKey)?.let { return it }
+        (ks.getKey(KEY_ALIAS, null) as? SecretKey)?.let { cachedKey = it; return it }
         val gen = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
         gen.init(
             KeyGenParameterSpec.Builder(
@@ -567,7 +594,7 @@ object TraeAuthStore {
                 .setKeySize(256)
                 .build()
         )
-        return gen.generateKey()
+        return gen.generateKey().also { cachedKey = it }
     }
 
     private fun encrypt(plain: String): String {
