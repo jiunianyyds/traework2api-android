@@ -32,3 +32,10 @@ out/
 # 其他 AI 工具的本地记忆目录（含个人上下文，不入库）
 .workbuddy/
 
+
+# 内部开发文档 / 本地记忆：一律不入库（2026-11-09 历史重写后补，防复发）
+.workbuddy/
+docs/
+交接文档*.md
+AGENTS.md
+traework2api-android-requirements.md
