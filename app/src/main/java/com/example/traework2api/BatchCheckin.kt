@@ -63,6 +63,14 @@ object BatchCheckin {
 
     /** 账号间隔：上游按设备维度风控，连发容易撞 9074。 */
     private const val PER_ACCOUNT_DELAY_MS = 800L
+
+    /**
+     * 触发时刻的随机抖动上限（秒）。
+     *
+     * 每台设备都在同一个整分签到 → 上游看到同一秒的尖峰，容易撞 `9074 操作过于频繁`。
+     * 3 分钟以内的偏移对用户无感（设置页写的是「08:00 前后几分钟」），但足以把请求摊开。
+     */
+    private const val JITTER_MAX_SEC = 180
     /** 通知渠道。独立于网关渠道：用户关网关通知不应连带关签到通知。 */
     private const val CHANNEL_ID = "traework2api_checkin"
     private const val NOTIFICATION_ID = 8791
@@ -155,6 +163,15 @@ object BatchCheckin {
             cal.set(java.util.Calendar.SECOND, 0)
             cal.set(java.util.Calendar.MILLISECOND, 0)
             if (cal.timeInMillis <= System.currentTimeMillis()) cal.add(java.util.Calendar.DAY_OF_YEAR, 1)
+            // 抖动：在用户设定的时刻上再加 0..JITTER_MAX_SEC 秒随机偏移。
+            //
+            // **为什么需要它**：所有设备都在同一个整分触发，上游看到的是**同一秒的尖峰**，
+            // 这正是 `9074 操作过于频繁` 的诱因之一（签到是多账号顺序打，一台设备就是 N 个请求）。
+            // 加了抖动后，不同机器的请求自然错开，本机多账号之间也错开。
+            //
+            // 抖动只往后推（不加负偏移）：用户设的是"不早于这个点"，提前签到可能被上游判无效。
+            val jitterSec = (0..JITTER_MAX_SEC).random()
+            cal.add(java.util.Calendar.SECOND, jitterSec)
             val canExact = Build.VERSION.SDK_INT < 31 || am.canScheduleExactAlarms()
             if (canExact) {
                 runCatching { am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, cal.timeInMillis, pi) }
@@ -210,6 +227,24 @@ object BatchCheckin {
         val r = BatchResult(results, today)
         Log.i(TAG, "批量签到完成: ${results.count { it.ok }} 成功 / ${results.size} 国服账号")
         // 通知由调用方决定发不发（定时路径发、手动路径不发——用户就在界面上）。
+        return r
+    }
+
+    /**
+     * 对**单个账号**执行签到（账号详情页「单独签到」用）。
+     *
+     * **阻塞调用**，必须后台线程跑。与 [runAll] 共用 [checkinOne]，不另起一套实现；
+     * 结果同样持久化到 last_results（补签去重依赖它），并记 last_run_date 为今天。
+     * uid 不在索引里 / 非国服时返回一条 fail，不抛。
+     */
+    fun runOne(ctx: Context, uid: String): PerAccount {
+        val meta = Gateway.locked { TraeAuthStore.list(ctx) }.firstOrNull { it.uid == uid }
+            ?: return PerAccount(uid, uid, "fail", -1, "账号不存在")
+        val r = checkinOne(ctx, meta)
+        prefs(ctx).edit()
+            .putString(KEY_LAST_RUN_DATE, today())
+            .putString(KEY_LAST_RESULTS, toJson(listOf(r)).toString())
+            .apply()
         return r
     }
 
@@ -357,7 +392,7 @@ object BatchCheckin {
 
     /** 结果状态 → 人话（账号页每行用）。 */
     fun statusLabel(r: PerAccount): String = when (r.status) {
-        "ok" -> "✓ 签到成功 +${r.credits}"
+        "ok" -> "签到成功 +${r.credits}"
         "already" -> "今日已签到"
         "disabled" -> "未开放签到"
         "unsupported" -> "该区域未支持签到"

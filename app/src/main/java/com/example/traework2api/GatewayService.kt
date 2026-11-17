@@ -67,13 +67,13 @@ class GatewayService : Service() {
         private const val WATCHDOG_INTERVAL_MS = 15 * 60_000L
 
         /**
-         * 唤醒锁超时 10 分钟，短于看门狗续期间隔。
-         *
-         * 为什么不无限期持有：死锁不还会被厂商省电策略判为"异常耗电目标"**优先清理**，
-         * 与保活初衷相反。带超时 + 定期续期 = 始终持锁，又不留无人回收的永久锁。
+         * 唤醒锁**永久持有**（不设超时）。
+         * 为什么改成永久持有：真机实测（vivo）wakelock 带 10 分钟超时，到期 release 后
+         * App 掉进 cached 状态被系统 freezer 冻结（isFrozen=true），网关对所有客户端
+         * 静默死亡（curl 000 / 请求不到）。PARTIAL_WAKE_LOCK 持续持有即可避免冻结；
+         * 厂商省电"异常耗电优先清理"主要针对无前台服务的裸锁，我们有 FGS 兜底。
          */
-        private const val WAKELOCK_TIMEOUT_MS = 10 * 60_000L
-
+        private const val WAKELOCK_TIMEOUT_MS = Long.MAX_VALUE
         private const val WATCHDOG_REQUEST = 8789
         private const val TASK_REMOVED_REQUEST = 8790
 
@@ -158,7 +158,7 @@ class GatewayService : Service() {
         // ⚠️ 这行判断用 shouldRun 而不是已落盘的标记：闹钟 Intent 一旦投递出去，
         // cancelWatchdog 拦不住，所以这里必须前置校验用户意图（v0.4.8 踩过）。
         // 必须在数秒内 startForeground，否则系统按 ANR 处理并杀掉服务。
-        startForeground(NOTIFICATION_ID, notification())
+        startForeground(NOTIFICATION_ID, notification(), android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
         acquireWakeLock()
         // ⚠️ Gateway.start() 现在**不抛异常**，失败时返回 false（原因在 Gateway.lastStartError）。
         // 以前端口被占会从这一行抛出去 → 未捕获 → 进程崩溃 → "每次开 App 都闪退"。
@@ -179,6 +179,9 @@ class GatewayService : Service() {
         running = true
         // 每次进入都续期看门狗，防止闹钟一次性触发后再无兜底。
         scheduleWatchdog()
+        // 边缘悬浮签：网关运行期间常驻（持有可见 overlay 的进程是 PERCEPTIBLE，
+        // cached-app freezer 不冻 —— vivo 息屏冻网的治本解）。没有权限时静默不显示。
+        FloatingTag.show(this)
         return START_STICKY
     }
 
@@ -215,6 +218,8 @@ class GatewayService : Service() {
 
     override fun onDestroy() {
         Gateway.stop()
+        // 刻意不 hide：用户要求「服务未运行时红点仍在」，红点本身就是"已停止"的可见提示。
+        FloatingTag.setRunning(false)
         releaseWakeLock()
         running = false
         super.onDestroy()
@@ -226,8 +231,8 @@ class GatewayService : Service() {
         // 必须撤掉看门狗，否则 15 分钟后会被闹钟莫名拉起来（"关了又自己开"）。
         cancelWatchdog()
         Gateway.stop()
+        FloatingTag.setRunning(false)
         releaseWakeLock()
-        stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
         Log.i(TAG, "网关已按用户要求停止")
     }
@@ -302,7 +307,7 @@ class GatewayService : Service() {
             val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
             wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKELOCK_TAG).apply {
                 setReferenceCounted(false)
-                acquire(WAKELOCK_TIMEOUT_MS)
+                acquire()
             }
             Log.i(TAG, "唤醒锁已持有（冻结豁免生效）")
         }.onFailure { Log.w(TAG, "唤醒锁获取失败，保活能力下降", it) }

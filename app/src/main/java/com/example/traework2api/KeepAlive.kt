@@ -160,7 +160,7 @@ object KeepAlive {
         return listOf(
             Item(
                 "电池优化白名单", ignoringBattery,
-                "没加入白名单时，系统省电策略会在息屏后清掉后台服务 —— 这是真机上最致命的一项。",
+                "没加入白名单时，系统省电策略会在息屏后清掉后台服务。",
                 open = ::openBatteryWhitelist,
             ),
             Item(
@@ -179,6 +179,16 @@ object KeepAlive {
                 "精确闹钟", canExact,
                 "服务被厂商强杀后靠它定时唤醒恢复；被禁用时只能退化成非精确闹钟，Doze 下可能延迟数小时。",
                 open = ::openExactAlarm,
+            ),
+            Item(
+                "悬浮窗权限", Settings.canDrawOverlays(ctx),
+                "边缘悬浮签需要它；持有可见悬浮窗的进程不会被系统冻结。",
+                open = { c -> runCatching {
+                    c.startActivity(Intent(
+                        Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                        Uri.parse("package:${c.packageName}")
+                    ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                }.isSuccess },
             ),
             Item(
                 "自启动 / 后台运行", ok = false,

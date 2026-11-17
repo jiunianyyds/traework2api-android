@@ -5,6 +5,8 @@
     <!-- 保活：前台服务 + 常驻通知（Android 8+ 唯一不会被随手回收的服务形态）。 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+<uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <!-- Android 13+ 通知要运行时授权；被拒时服务仍能跑，但用户看不到"正在运行"。 -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- 部分唤醒锁：持有它的进程会被 Cached App Freezer 跳过（冻结豁免）。
@@ -52,7 +54,7 @@
         <service
             android:name=".GatewayService"
             android:exported="false"
-            android:foregroundServiceType="specialUse"
+            android:foregroundServiceType="dataSync"
             android:stopWithTask="false">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"

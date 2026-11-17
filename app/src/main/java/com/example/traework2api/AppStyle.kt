@@ -28,6 +28,9 @@ object AppStyle {
         "background", "surface", "surface_container", "surface_variant",
         "on_surface", "on_surface_variant", "outline", "outline_variant",
         "success", "success_container", "warning", "warning_container", "error", "error_container",
+        // 玻璃质感版新增（对应设计稿 tokens.css 的 --glass* / --tabbar* / --glow-* / --color-accent*）
+        "glass", "glass_strong", "glass_line", "tabbar", "tabbar_line", "tab_indicator",
+        "glow1", "glow2", "accent", "accent_container", "accent_on_soft", "primary_on_soft",
     )
 
     /**
@@ -98,139 +101,76 @@ object AppStyle {
     ) {
         fun palette(night: Boolean): Map<String, String> = if (night) dark else light
     }
-
-    /** 靛蓝：原 `tw_*` 色板，中圆角 + 标准间距 —— 默认风格，视觉与上一轮保持一致。 */
-    private val INDIGO = Style(
-        id = "indigo",
-        label = "靛蓝",
-        note = "经典靛蓝 · 中圆角 · 标准间距",
-        cardRadius = 16f, controlRadius = 12f, pillRadius = 100f,
-        gap = 12, pagePadH = 20, pagePadTop = 16, pagePadBottom = 24, cardPad = 16,
-        barPadTop = 14, barPadBottom = 12, contentMaxDp = 640, elevation = 1,
+    /**
+     * 唯一一套风格：**机架面板**。
+     *
+     * 方向来自产品本身 —— 这是一个「在你手机里悄悄跑着的小服务」，最像的不是温暖的
+     * 消费级 App，而是路由器的指示灯面板、终端里的 `listening on :8787`。
+     *
+     * 三条硬规矩（改色板前先读）：
+     * ① **表面全中性**（石墨），不带色相。旧版背景是蓝灰 `#EAF0F6`、强调卡是暖粉
+     *    `#FBE3DA`，两个色相对撞，整屏读起来像"彩色"而不是"安静"；
+     * ② **一个强调色，用得极少**（余烬橙）—— 只标主操作、选中态和一个关键数字。
+     *    旧版 6 处用 `primary_container`，处处高亮等于没有重点；
+     * ③ 语义色（成功/警告/错误）**只表意**，且压到能坐在中性色阶里。
+     *
+     * `Style` 保留下来是因为 [color] 按语义名查表的机制依赖它：页面代码只写
+     * `color("primary")`，具体色值在这里按亮暗决定，换色板不用动任何页面。
+     */
+    private val GLASS = Style(
+        id = "glass",
+        label = "玻璃质感",
+        note = "柔光底 · 半透明玻璃卡 · 余烬橙",
+        cardRadius = 15f, controlRadius = 12f, pillRadius = 100f,
+        gap = 10, pagePadH = 20, pagePadTop = 6, pagePadBottom = 16, cardPad = 16,
+        barPadTop = 14, barPadBottom = 10, contentMaxDp = 560, elevation = 0,
         light = mapOf(
-            "primary" to "#4F46E5", "primary_container" to "#E6E7FF",
-            "on_primary" to "#FFFFFF", "on_primary_container" to "#17115B",
-            "background" to "#F7F7FC", "surface" to "#FFFFFF",
-            "surface_container" to "#F0F0F8", "surface_variant" to "#E7E7F0",
-            "on_surface" to "#1B1B22", "on_surface_variant" to "#5F5F6B",
-            "outline" to "#777783", "outline_variant" to "#C7C7D1",
-            "success" to "#16794B", "success_container" to "#D7F6E5",
+            // ---- 主色（tokens.css --color-primary #B83A17 系）----
+            "primary" to "#B83A17", "primary_container" to "#FBE3DA",
+            "on_primary" to "#FFFFFF", "on_primary_container" to "#7A2C10",
+            "primary_on_soft" to "#A2351A",
+            // ---- 中性色阶 ----
+            "background" to "#EAF0F6", "surface" to "#F7F9FC",
+            "surface_container" to "#EDF3F9", "surface_variant" to "#D5DEE8",
+            "on_surface" to "#10151C", "on_surface_variant" to "#4F5B69",
+            "outline" to "#8A94A3", "outline_variant" to "#D5DEE8",
+            // ---- 次级信息色（tokens.css --color-accent #2660A0）----
+            "accent" to "#2660A0", "accent_container" to "#DDEAFA", "accent_on_soft" to "#215A96",
+            // ---- 语义色 ----
+            "success" to "#1B7A4B", "success_container" to "#DCF3E7",
             "warning" to "#8A5100", "warning_container" to "#FFE9C2",
             "error" to "#BA1A1A", "error_container" to "#FFDAD6",
+            // ---- 玻璃（rgba → 就近不透明档；真正的半透明在 GlassCard 里叠 alpha）----
+            "glass" to "#F7F9FC", "glass_strong" to "#FFFFFF",
+            "glass_line" to "#FFFFFF",
+            "tabbar" to "#F2F6FA", "tabbar_line" to "#FFFFFF", "tab_indicator" to "#FFFFFF",
+            // ---- 柔光团（glow-1 暖橙 / glow-2 冷蓝）----
+            "glow1" to "#FFD9C7", "glow2" to "#C9E2FF",
         ),
         dark = mapOf(
-            "primary" to "#BEC2FF", "primary_container" to "#34358B",
-            "on_primary" to "#20205F", "on_primary_container" to "#E1E0FF",
-            "background" to "#101016", "surface" to "#19191F",
-            "surface_container" to "#23232B", "surface_variant" to "#2E2E38",
-            "on_surface" to "#E5E1EA", "on_surface_variant" to "#B5B3C0",
-            "outline" to "#8B8B97", "outline_variant" to "#3A3A44",
-            "success" to "#66E3A0", "success_container" to "#1E4A34",
-            "warning" to "#FFD08A", "warning_container" to "#5A3D17",
-            "error" to "#FFB4A8", "error_container" to "#5A2B2B",
+            "primary" to "#FF7A52", "primary_container" to "#3A1C12",
+            "on_primary" to "#20120C", "on_primary_container" to "#FFD9CC",
+            "primary_on_soft" to "#FF7A52",
+            "background" to "#0C1016", "surface" to "#141A22",
+            "surface_container" to "#1A222C", "surface_variant" to "#232C38",
+            "on_surface" to "#E8EDF3", "on_surface_variant" to "#9BA8B7",
+            "outline" to "#5C6878", "outline_variant" to "#232C38",
+            "accent" to "#6FB3E8", "accent_container" to "#17293C", "accent_on_soft" to "#6FB3E8",
+            "success" to "#6BE0A4", "success_container" to "#123024",
+            "warning" to "#FFCF88", "warning_container" to "#37260A",
+            "error" to "#FFB4AC", "error_container" to "#3D1512",
+            "glass" to "#161C24", "glass_strong" to "#1D242D",
+            "glass_line" to "#2A3440",
+            "tabbar" to "#1A212A", "tabbar_line" to "#2A3440", "tab_indicator" to "#2C3540",
+            "glow1" to "#7A2C12", "glow2" to "#16304A",
         ),
     )
 
-    /** 石墨：冷灰近中性、方正小圆角、紧凑间距 —— 与靛蓝拉开"方/圆、紧/松"两维。 */
-    private val GRAPHITE = Style(
-        id = "graphite",
-        label = "石墨",
-        note = "冷灰中性 · 方正小圆角 · 紧凑间距",
-        cardRadius = 6f, controlRadius = 6f, pillRadius = 8f,
-        gap = 10, pagePadH = 16, pagePadTop = 14, pagePadBottom = 18, cardPad = 14,
-        barPadTop = 12, barPadBottom = 10, contentMaxDp = 680, elevation = 0,
-        light = mapOf(
-            "primary" to "#3F4754", "primary_container" to "#DDE2EA",
-            "on_primary" to "#FFFFFF", "on_primary_container" to "#191C22",
-            "background" to "#ECEDEF", "surface" to "#FFFFFF",
-            "surface_container" to "#F4F5F7", "surface_variant" to "#E2E4E8",
-            "on_surface" to "#16181D", "on_surface_variant" to "#55595F",
-            "outline" to "#6E737B", "outline_variant" to "#C6C9CE",
-            "success" to "#14663F", "success_container" to "#D2EEDD",
-            "warning" to "#7A4700", "warning_container" to "#FBE3BC",
-            "error" to "#A81B1B", "error_container" to "#FBDAD8",
-        ),
-        dark = mapOf(
-            "primary" to "#B8C2D0", "primary_container" to "#2A313C",
-            "on_primary" to "#1A2028", "on_primary_container" to "#DCE2EA",
-            "background" to "#101215", "surface" to "#17191D",
-            "surface_container" to "#1F2227", "surface_variant" to "#272B31",
-            "on_surface" to "#E3E5E9", "on_surface_variant" to "#A9AEB6",
-            "outline" to "#868C95", "outline_variant" to "#34383E",
-            "success" to "#7FD9A8", "success_container" to "#12321F",
-            "warning" to "#F5C87A", "warning_container" to "#3A2A06",
-            "error" to "#FFB3AC", "error_container" to "#521413",
-        ),
-    )
+    /** 唯一风格：玻璃质感。查表机制保留（页面代码只写语义名）。 */
+    val STYLES: List<Style> = listOf(GLASS)
 
-    /** 苔绿：自然绿、大圆角、舒展间距 —— 与石墨在"圆/方、松/紧"上正好相反。 */
-    private val MOSS = Style(
-        id = "moss",
-        label = "苔绿",
-        note = "自然苔绿 · 大圆角 · 舒展间距",
-        cardRadius = 24f, controlRadius = 18f, pillRadius = 100f,
-        gap = 16, pagePadH = 24, pagePadTop = 20, pagePadBottom = 28, cardPad = 20,
-        barPadTop = 16, barPadBottom = 14, contentMaxDp = 600, elevation = 2,
-        light = mapOf(
-            "primary" to "#2F6C46", "primary_container" to "#D6EFDD",
-            "on_primary" to "#FFFFFF", "on_primary_container" to "#0E2416",
-            "background" to "#F4F7F2", "surface" to "#FFFFFF",
-            "surface_container" to "#EDF3EA", "surface_variant" to "#DFE9DD",
-            "on_surface" to "#131A15", "on_surface_variant" to "#4F5B52",
-            "outline" to "#6C7A6F", "outline_variant" to "#C3CFC2",
-            "success" to "#1A6B3C", "success_container" to "#D9F2E1",
-            "warning" to "#86530A", "warning_container" to "#FCE8C3",
-            "error" to "#A8261F", "error_container" to "#FBDCD7",
-        ),
-        dark = mapOf(
-            "primary" to "#8FD5A6", "primary_container" to "#1D3A28",
-            "on_primary" to "#0D2A18", "on_primary_container" to "#CDEBD8",
-            "background" to "#0F1410", "surface" to "#161C17",
-            "surface_container" to "#1E251F", "surface_variant" to "#262E27",
-            "on_surface" to "#E1E8E1", "on_surface_variant" to "#AAB7AC",
-            "outline" to "#8A978A", "outline_variant" to "#333B33",
-            "success" to "#8FE0AE", "success_container" to "#12331F",
-            "warning" to "#F7CA80", "warning_container" to "#3B2B06",
-            "error" to "#FFB4AC", "error_container" to "#53140F",
-        ),
-    )
 
-    /** 落日：暖橙、大圆角、宽松内边距 —— 冷暖维度上与前三套明显不同。 */
-    private val SUNSET = Style(
-        id = "sunset",
-        label = "落日",
-        note = "暖橙落日 · 大圆角 · 宽松内边距",
-        cardRadius = 20f, controlRadius = 14f, pillRadius = 100f,
-        gap = 12, pagePadH = 20, pagePadTop = 18, pagePadBottom = 24, cardPad = 18,
-        barPadTop = 14, barPadBottom = 12, contentMaxDp = 640, elevation = 1,
-        light = mapOf(
-            "primary" to "#A8431A", "primary_container" to "#FFE2D4",
-            "on_primary" to "#FFFFFF", "on_primary_container" to "#3A1406",
-            "background" to "#FDF7F3", "surface" to "#FFFFFF",
-            "surface_container" to "#F8EFE9", "surface_variant" to "#EFE2DA",
-            "on_surface" to "#211711", "on_surface_variant" to "#5C4A3E",
-            "outline" to "#7D6A5D", "outline_variant" to "#D6C5B8",
-            "success" to "#1A6B3C", "success_container" to "#D9F2E1",
-            "warning" to "#8A5100", "warning_container" to "#FFE9C2",
-            "error" to "#B3261E", "error_container" to "#FFDAD5",
-        ),
-        dark = mapOf(
-            "primary" to "#FFB59B", "primary_container" to "#6E2607",
-            "on_primary" to "#571D06", "on_primary_container" to "#FFDBCB",
-            "background" to "#17110D", "surface" to "#1F1813",
-            "surface_container" to "#291F18", "surface_variant" to "#33261D",
-            "on_surface" to "#EFE1D9", "on_surface_variant" to "#C4B0A3",
-            "outline" to "#9C8A7C", "outline_variant" to "#45372C",
-            "success" to "#8FE0AE", "success_container" to "#12331F",
-            "warning" to "#F7CA80", "warning_container" to "#3B2B06",
-            "error" to "#FFB4AB", "error_container" to "#5C1412",
-        ),
-    )
-
-    /** 可选风格（顺序即「外观风格」页的展示顺序，第一项是默认）。 */
-    val STYLES: List<Style> = listOf(INDIGO, GRAPHITE, MOSS, SUNSET)
-
-    private var styleId = INDIGO.id
+    private var styleId = GLASS.id
     private var modeId = Mode.SYSTEM.id
     private var night = false
     private var loaded = false
@@ -251,7 +191,7 @@ object AppStyle {
         val savedStyle = sp.getString(KEY_STYLE, null)
         val savedMode = sp.getString(KEY_MODE, null)
         // 校验一遍：偏好里存了已删除的风格 id 时要退回默认，不能拿它去查表。
-        styleId = STYLES.firstOrNull { it.id == savedStyle }?.id ?: INDIGO.id
+        styleId = STYLES.firstOrNull { it.id == savedStyle }?.id ?: GLASS.id
         modeId = Mode.entries.firstOrNull { it.id == savedMode }?.id ?: Mode.SYSTEM.id
         loaded = true
     }
@@ -311,19 +251,6 @@ object AppStyle {
         return parsed
     }
 
-    /** 指定风格的语义色（带缓存，同 [color] 的 key 规则）：「外观风格」页的色样预览要用
-     *  **该风格自己**的色，而不是当前风格的（否则四张色样全长一样）。 */
-    fun previewColor(s: Style, name: String, dark: Boolean): Int {
-        val key = "${s.id}|$dark|$name"
-        synchronized(colorCache) {
-            colorCache[key]?.let { return it }
-        }
-        val pal = s.palette(dark)
-        val parsed = parse(pal[name] ?: pal[FALLBACK] ?: "#000000")
-        synchronized(colorCache) { colorCache[key] = parsed }
-        return parsed
-    }
-
     private const val FALLBACK = "on_surface"
 
     private fun parse(hex: String): Int = Color.parseColor(hex)
@@ -336,7 +263,7 @@ object AppStyle {
      * 与其让用户在界面上看到"看不见的字"，不如在启动时就炸出来。
      */
     fun selfCheck() {
-        check(STYLES.size >= 3) { "至少要有 3 套风格，当前 ${STYLES.size} 套" }
+        check(STYLES.isNotEmpty()) { "至少要有 1 套风格，当前 ${STYLES.size} 套" }
         check(STYLES.map { it.id }.toSet().size == STYLES.size) { "风格 id 有重复" }
 
         val hexRe = Regex("^#[0-9a-fA-F]{6}$")

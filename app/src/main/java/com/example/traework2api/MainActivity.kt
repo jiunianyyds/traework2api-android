@@ -14,15 +14,27 @@ import android.os.Build
 import android.os.Bundle
 import android.text.InputType
 import android.text.TextUtils
+import org.json.JSONObject
 import android.view.Gravity
 import android.view.View
-import android.widget.Button
+import android.view.ViewGroup
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import com.example.traework2api.ui.AuroraBackground
+import com.example.traework2api.ui.CapsuleNavBar
+import com.example.traework2api.ui.CountChip
+import com.example.traework2api.ui.GlassCard
+import com.example.traework2api.ui.ListRow
+import com.example.traework2api.ui.Motion
+import com.example.traework2api.ui.SegmentedControl
+import com.example.traework2api.ui.Switch
+import com.example.traework2api.ui.TextAction
+import com.example.traework2api.ui.Tokens
+import com.example.traework2api.ui.glassCaption
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -31,12 +43,11 @@ import kotlin.concurrent.thread
 /**
  * 阶段3：本地"假服务" + Trae 官方登录入口。
  *
- * 单一 Activity + 底部导航结构（移植 WorkBuddy2API-Android 的纯代码 View 组装方式）：
- * 概览 / 账号 / 模型 / 记录 / 更多 五个持久 Tab（`Page.entries` 驱动），
- * 顶部栏 + 卡片风格 + 选中态胶囊指示器。
+ * 单一 Activity + 漂浮玻璃胶囊导航（对齐设计稿 `ui-v2-app/`，七屏：五 Tab + 账号详情/设置）。
+ * 结构：AuroraBackground 柔光底 → 顶栏（大标题+副标题）→ 滚动内容 → 底部漂浮胶囊。
  *
- * 视觉规则：圆角/间距/字号一律走下面的 design token，不要在页面里再写字面量；
- * 颜色一律走 `tw_*` 资源（`values` / `values-night` 各一套），不要写字面量色值。
+ * 视觉规则：全部走 [Tokens]（对应设计稿 tokens.css）+ [AppStyle.color] 语义色，
+ * 不写字面量尺寸/色值；玻璃卡/行列表/开关/分段控件用 ui/ 组件库。
  */
 class MainActivity : Activity() {
     companion object {
@@ -54,34 +65,23 @@ class MainActivity : Activity() {
         private const val MAX_IMPORT_BYTES = 1_048_576L
         private const val SIXTY_MINUTES_SEC = 3600L
         /** 模型页刷新按钮文案：空状态卡与工具条共用同一份，改一处两边同步。 */
-        private const val REFRESH_MODELS_LABEL = "刷新模型目录"
+        private const val REFRESH_MODELS_LABEL = "刷新"
 
         /** 二级页「保活设置」的 onSaveInstanceState 标记值。 */
         private const val SUB_KEEP_ALIVE = "keepalive"
-        /** 二级页「外观风格」的 onSaveInstanceState 标记值。 */
-        private const val SUB_STYLE = "style"
+        /** 二级页「账号详情」的标记值（值 = uid）。 */
+        private const val SUB_ACCOUNT_DETAIL = "acctdetail"
+        /** 二级页「账号设置」的 onSaveInstanceState 标记值。 */
+        private const val SUB_ACCOUNT_MORE = "acctmore"
         private const val STATE_PAGE = "page"
         private const val STATE_SUB = "sub"
-
-        // ---- design tokens ----
-        // 圆角/间距/内容宽度**不在这里**：它们跟着「外观风格」走，见下面按风格读取的属性。
-        // 这里只留不随风格变的字号 token。
-        private const val FS_TITLE = 22f     // 顶部栏标题
-        private const val FS_SECTION = 14    // 区块标题（小号灰色，与卡片标题拉开层级）
-        private const val FS_CARD_TITLE = 17 // 卡片标题
-        private const val FS_METRIC = 24     // 主指标数值
-        private const val FS_BODY = 15
-        private const val FS_VALUE = 14
-        private const val FS_CAPTION = 13
-        private const val FS_CHIP = 12
+        private const val STATE_SUB_EXTRA = "subextra"
 
         /** 本地 API Key 打码占位（概览页默认显示它，避免截屏直接泄露）。 */
         private const val MASKED_KEY = "sk-••••••••••••••••••••••••"
 
         // ---- 版权信息 ----
-        // 概览页与更多页各出现一次，**共用这一份常量**：改一处两边同步，
-        // 不会出现"概览页写了新邮箱、更多页还是旧的"。文案按「标签 + 值」成对给，
-        // 排版交给 `copyrightLine()`，页面里不再拼字符串。
+        // 概览页与更多页各出现一次，**共用这一份常量**：改一处两边同步。
         private const val AUTHOR_NAME = "玖念"
         private const val AUTHOR_EMAIL = "2820184772@qq.com"
         private const val AUTHOR_LABEL = "作者"
@@ -96,64 +96,29 @@ class MainActivity : Activity() {
 
         /**
          * 本次**进程**是否已经静默补过一次模型表。
-         * 必须是进程级（companion）：放 Activity 实例上时，切风格/切亮暗触发的 recreate()
+         * 必须是进程级（companion）：放 Activity 实例上时，切亮暗触发的 recreate()
          * 会重置它、再刷一次上游，与"每个冷启动恰好一次"的语义不符。
          */
         @Volatile
         private var autoModelsTried = false
     }
 
-    // ------------------------------------------------------------------
-    // design token：圆角 / 间距 / 内容宽度 —— **跟随当前风格**（多风格本轮新增）
-    // 值只写在 AppStyle.Style 里；页面与 helper 只读这些属性，别在页面里写字面量。
-    // 之所以做成读属性的函数而不是 const：切风格时"形态"也要跟着变，const 改不了。
-    // ------------------------------------------------------------------
-    /** 容器类（卡片/搜索框）圆角。 */
-    private val RADIUS_CARD get() = AppStyle.current.cardRadius
-    /** 控件类（按钮）圆角。 */
-    private val RADIUS_CONTROL get() = AppStyle.current.controlRadius
-    /** 胶囊（chip / 导航指示器）圆角：给一个大值即为全圆角。 */
-    private val RADIUS_PILL get() = AppStyle.current.pillRadius
-
-    /** 卡片之间的标准间距；页面里不再手传 8/10/12 混用。 */
-    private val GAP get() = AppStyle.current.gap
-    /** 页面左右内边距。 */
-    private val PAGE_PAD_H get() = AppStyle.current.pagePadH
-    /** 页面上下内边距。 */
-    private val PAGE_PAD_TOP get() = AppStyle.current.pagePadTop
-    private val PAGE_PAD_BOTTOM get() = AppStyle.current.pagePadBottom
-    /** 卡片内边距。 */
-    private val CARD_PAD get() = AppStyle.current.cardPad
-    /** 顶栏上下内边距。 */
-    private val BAR_PAD_TOP get() = AppStyle.current.barPadTop
-    private val BAR_PAD_BOTTOM get() = AppStyle.current.barPadBottom
-    /** 内容最大宽度（dp）：手机竖屏不受影响，平板/横屏下不再让一行文字横跨整屏。 */
-    private val CONTENT_MAX_DP get() = AppStyle.current.contentMaxDp
-
-    private enum class Page(val title: String, val subtitle: String, val icon: Int) {
-        OVERVIEW("概览", "本地服务运行状态", R.drawable.ic_dashboard),
-        ACCOUNT("账号", "当前 Trae 登录状态", R.drawable.ic_account),
-        MODELS("模型", "本地可用的模型表", R.drawable.ic_models),
-        RECORDS("记录", "调用用量与记录", R.drawable.ic_history),
-        MORE("更多", "外观 · 说明 · 保活", R.drawable.ic_more),
-    }
-
     private lateinit var contentHost: FrameLayout
     private lateinit var pageTitle: TextView
     private lateinit var pageSubtitle: TextView
-    /** 顶栏里的「← 返回」，只在二级页可见（见 [render] / [openKeepAlive] / [openStylePage]）。 */
-    private lateinit var backAction: TextView
-    private lateinit var navItems: Map<Page, TextView>
+    /** 二级页的返回箭头：只在 [subPage] 非空时出现（一级页没有"上一级"）。 */
+    private lateinit var backBtn: TextView
+    private lateinit var navBar: CapsuleNavBar
     private var currentPage = Page.OVERVIEW
     /**
-     * 是否正停在二级页（保活设置）。
+     * 是否正停在二级页（保活设置 / 账号详情 / 账号设置）。
      *
-     * 做成二级页而不是第 6 个 Tab：底部导航已有 5 项，再加会挤；且保活是"设置一次就不管"的
-     * 低频页面，不值得占一个常驻 Tab。
+     * 做成二级页而不是第 6 个 Tab：底部导航 5 项已满；且这些都是"设置一次就不管"或
+     * "从列表点进去"的低频页面，不值得占一个常驻 Tab。
      */
-    private var showKeepAlive = false
-    /** 是否正停在外观风格二级页（与保活设置共用同一套二级页机制）。 */
-    private var showStyle = false
+    private var subPage: String? = null
+    /** 账号详情二级页当前展示的账号 uid（[SUB_ACCOUNT_DETAIL] 配套）。 */
+    private var detailUid: String? = null
     private val apiKey: String by lazy { Gateway.apiKey(this) }
     /** 账号页积分/额度缓存（null=未拉到），展示用，不存凭据。 */
     private var accountBalance: Long? = null   // 当前可用积分（= total_amount − consumed_amount）
@@ -162,6 +127,9 @@ class MainActivity : Activity() {
     private var checkinBusy = false
     /** 本地 API Key 明文默认打码（防止截图/旁观泄露），点「显示」才展开。 */
     private var apiKeyVisible = false
+    /** 当前可见的轻提示控件与其自动隐藏任务（同一时刻只留一条，新的顶掉旧的）。 */
+    private var toastView: View? = null
+    private var toastHide: Runnable? = null
     /** 服务启停进行中（"启动中…" / "停止中…"），null = 空闲。启停是异步的，中间得给个状态。 */
     private var serviceBusy: String? = null
     /** 积分刷新进行中：数值位显示「…」，否则用户点了「刷新」会觉得没反应。 */
@@ -204,16 +172,30 @@ class MainActivity : Activity() {
     private val monitorListener: (CreditMonitor.Snapshot) -> Unit = { onMonitorSnapshot(it) }
 
     /**
-     * 「刷新模型」完成后**原地更新模型 Tab**（重建卡片 + 更新计数），不整页 render。
+     * 「刷新模型」完成后**原地更新模型 Tab**（重建列表 + 更新计数），不整页 render。
      *
-     * 与 [quotaApply] 同一个理由：`render()`/`redraw()` 会 `removeAllViews()`，
+     * 与 [quotaApply] 同一个理由：`render()` 会 `removeAllViews()`，
      * 把搜索框内容与滚动位置一起丢掉（这个坑项目里踩过，见 MEMORY「积分刷新」）。
      * 每次 [modelsPage] 构建时重新登记，离开本页后作废。
      */
     private var modelsRefreshApply: (() -> Unit)? = null
 
+    /**
+     * 模型刷新**成功**时的列表淡入（只动 listCard）。
+     *
+     * 与 [modelsRefreshApply] 分开：后者成功失败都会调用（要把按钮从「刷新中…」恢复），
+     * 而"拉到了新表"才该有内容提示 —— 失败还闪一下等于假装更新了。
+     */
+    private var modelsListPulse: (() -> Unit)? = null
+
     /** 模型表刷新进行中：按钮置灰 + 文案变「刷新中…」，否则用户点了没反馈会连点。 */
     private var modelsLoading = false
+
+    /** 账号列表「刷新积分」进行中（与 [BatchCheckin.busy] 互斥，二者都是整批打上游）。 */
+    private val quotaBulkBusy = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /** 工具栏那枚「刷新积分」文字动作（刷完/进行中改文案用，参照 [refreshLabelRef] 的写法）。 */
+    private var quotaBulkLabel: TextAction? = null
 
     /** 版本号取自 PackageManager，避免依赖 AGP 的 BuildConfig 开关。 */
     private val versionName: String by lazy {
@@ -281,83 +263,98 @@ class MainActivity : Activity() {
         // 0.4.8 起**进入 App 默认启动**（用户要求）：除非用户主动停止过（shouldRun=false），
         // 否则一进 App 就把前台服务拉起来 —— 省掉每次手动点「启动服务」。
         autoStartServiceIfWanted()
+        // 悬浮球：App 在运行就该有球（服务停着显示红点）。
+        // 服务启动成功时 GatewayService 会自己 show；这里补的是"服务没启动 / 被划掉后重新进入"
+        // 那条路径。已显示时 show 内部只 applyState，不会重复 addView；没权限时静默跳过。
+        if (!FloatingTag.isShowing()) runCatching { FloatingTag.show(this) }
+        // 把 CreditMonitor 的磁盘余额快照装进内存：网关这次没起来/还没起时，
+        // 账号列表也要能显示上次查到的积分。幂等，重复调无害。
+        runCatching { CreditMonitor.prime(this) }
 
-        val root = FrameLayout(this).apply {
-            setBackgroundColor(color("background"))
-            fitsSystemWindows = true
-        }
+        // 外壳：柔光底铺满整屏（对应设计稿 body 的 radial-gradient），全部层叠在它上面。
+        val root = FrameLayout(this).apply { fitsSystemWindows = true }
+        root.addView(AuroraBackground(this), FrameLayout.LayoutParams(-1, -1))
+
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         root.addView(col, FrameLayout.LayoutParams(-1, -1))
 
-        // 顶部栏（标题 + 副标题 + 1dp 分隔线）
-        // 背景用 `background` 而不是 `surface`：让顶栏"退"到页面底色里、卡片"凸"出来，
-        // 层次只由卡片承载（旧版顶栏和卡片同色，整屏看着一样平）。
-        // 外层全宽撑背景，内层限宽居中，这样平板/横屏下标题与内容左边缘是对齐的
+        // 顶部栏：大标题 + 副标题（tokens.css .topbar；无分隔线，层次由玻璃卡承担）。
+        // 外层全宽撑背景，内层限宽居中 —— 平板/横屏下标题与内容左边缘对齐。
+        // 二级页在最左侧多一个返回箭头（此前只有系统返回手势，页面上没有任何返回入口）。
         col.addView(LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(color("background"))
             addView(LinearLayout(this@MainActivity).apply {
-                orientation = LinearLayout.VERTICAL
-                setPadding(dp(PAGE_PAD_H), dp(BAR_PAD_TOP), dp(PAGE_PAD_H), dp(BAR_PAD_BOTTOM))
-                // 二级页才出现的返回入口。不靠系统返回键：纯小白不一定知道那个键，
-                // 顶栏给一个看得见的出口。放标题**上方**（不是左侧），
-                // 这样标题左边缘始终与内容区对齐。
-                addView(linkAction("← 返回") { render(Page.MORE) }
-                    .also { backAction = it }
-                    .apply { visibility = View.GONE })
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(Tokens.PAGE_PAD_H), dp(Tokens.PAGE_PAD_TOP + 10), dp(Tokens.PAGE_PAD_H), dp(10))
                 addView(TextView(this@MainActivity).apply {
-                    textSize = FS_TITLE
+                    text = "‹"
+                    textSize = 30f
                     setTextColor(color("on_surface"))
-                    typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
-                }.also { pageTitle = it }, top(6))
-                addView(TextView(this@MainActivity).apply {
-                    textSize = FS_CAPTION.toFloat()
-                    setTextColor(color("on_surface_variant"))
-                }.also { pageSubtitle = it }, top(4))
+                    includeFontPadding = false
+                    gravity = Gravity.CENTER
+                    // 触摸区必须自己撑开：「‹」只有一个字符宽，靠文字宽度当点击区点不中
+                    minWidth = dp(44)
+                    minHeight = dp(44)
+                    setPadding(0, 0, dp(10), 0)
+                    visibility = View.GONE
+                    contentDescription = "返回"
+                    setOnClickListener { backFromSub() }
+                    Motion.installPressFeedback(this)
+                }.also { backBtn = it })
+                addView(LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.VERTICAL
+                    addView(TextView(this@MainActivity).apply {
+                        textSize = Tokens.TEXT_XL
+                        setTextColor(color("on_surface"))
+                        typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+                        includeFontPadding = false
+                    }.also { pageTitle = it })
+                    addView(TextView(this@MainActivity).apply {
+                        textSize = Tokens.TEXT_XS
+                        setTextColor(color("on_surface_variant"))
+                        includeFontPadding = false
+                    }.also { pageSubtitle = it }.let { tv ->
+                        tv.setPadding(0, dp(3), 0, 0); tv
+                    })
+                }, LinearLayout.LayoutParams(0, -2, 1f))
             }, LinearLayout.LayoutParams(contentWidth(), -2).apply { gravity = Gravity.CENTER_HORIZONTAL })
         })
-        col.addView(divider())
 
         // 内容区
         contentHost = FrameLayout(this)
         col.addView(contentHost, LinearLayout.LayoutParams(-1, 0, 1f))
 
-        // 底部导航（5 Tab，由 Page.entries 驱动；选中态 = 居中胶囊指示器 + 主色）
-        val navBar = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
-            setBackgroundColor(color("background"))
+        // 底部漂浮玻璃胶囊（tokens.css .tabbar）：悬浮在内容之上，不占布局高度。
+        // 内容列底部留出胶囊高度 + 距底间隙 + 余量，滚到底时最后一张卡不被胶囊压住。
+        navBar = CapsuleNavBar(this, Page.entries.map { CapsuleNavBar.Item(it.title, it.icon) }) { idx ->
+            val target = Page.entries[idx]
+            // 已经在目标一级页（且不在二级页）：不重建、不重播 —— 旧版点当前 Tab 会整页
+            // 重建一次并再播一遍入场，看起来像"点了没反应，但页面自己闪了一下"。
+            if (target != currentPage || subPage != null) render(target, animate = true)
         }
-        navItems = Page.entries.associate { p ->
-            val tv = TextView(this).apply {
-                text = p.title
-                textSize = FS_CHIP.toFloat()
-                gravity = Gravity.CENTER
-                setCompoundDrawablesRelativeWithIntrinsicBounds(0, p.icon, 0, 0)
-                compoundDrawablePadding = dp(3)
-                setPadding(dp(18), dp(6), dp(18), dp(6))
-            }
-            // 外层撑满 1/5 宽（保证点击区足够大），内层 TextView 包住图标+文字，
-            // 选中胶囊因此永远贴合内容：手机竖屏和 3440px 平板横屏都好看。
-            navBar.addView(LinearLayout(this).apply {
-                gravity = Gravity.CENTER
-                setOnClickListener { render(p) }
-                addView(tv, LinearLayout.LayoutParams(-2, -2))
-            }, LinearLayout.LayoutParams(0, dp(64), 1f))
-            p to tv
+        val navLp = FrameLayout.LayoutParams(
+            minOf(resources.displayMetrics.widthPixels - dp(Tokens.NAV_INSET_H * 2), dp(Tokens.NAV_MAX_WIDTH)),
+            dp(Tokens.NAV_HEIGHT)
+        ).apply {
+            gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+            bottomMargin = dp(Tokens.NAV_BOTTOM_MARGIN)
         }
-        col.addView(divider())
-        col.addView(navBar)
+        root.addView(navBar, navLp)
 
         setContentView(root)
-        // 重建时回到原处：切风格/切亮暗（recreate）与系统夜间模式切换都会走到这里，
-        // 不恢复的话用户切一下风格就被弹回「概览」，体验很跳。
+        // 重建时回到原处：切亮暗（recreate）与系统夜间模式切换都会走到这里，
+        // 不恢复的话用户切一下主题就被弹回「概览」，体验很跳。
         val restored = savedInstanceState?.getString(STATE_PAGE)
             ?.let { name -> Page.entries.firstOrNull { it.name == name } } ?: Page.OVERVIEW
         render(restored)
-        when (savedInstanceState?.getString(STATE_SUB)) {
+        when (val sub = savedInstanceState?.getString(STATE_SUB)) {
             SUB_KEEP_ALIVE -> openKeepAlive()
-            SUB_STYLE -> openStylePage()
+            SUB_ACCOUNT_MORE -> openAccountMore()
+            SUB_ACCOUNT_DETAIL -> {
+                detailUid = savedInstanceState?.getString(STATE_SUB_EXTRA)
+                openAccountDetail(detailUid)
+            }
         }
         loadAndRefreshToken()
         // 进 App 静默补新模型表：客户端拉 /v1/models 的数据源重启后来自磁盘缓存，
@@ -382,7 +379,7 @@ class MainActivity : Activity() {
                     if (isFinishing || isDestroyed) return@runOnUiThread
                     toast("定时签到补签完成")
                     // 账号页上每账号结果行是新数据，重绘一次（离开账号页时 render 也会拉到）
-                    if (currentPage == Page.ACCOUNT && !showKeepAlive && !showStyle) render(Page.ACCOUNT)
+                    if (currentPage == Page.ACCOUNT && subPage == null) render(Page.ACCOUNT)
                 }
             }
         }
@@ -392,474 +389,1102 @@ class MainActivity : Activity() {
     // Tab 路由
     // ------------------------------------------------------------------
 
-    private fun render(page: Page) {
+    /** Page 的标题与副标题（对齐设计稿各屏 .topbar）。 */
+    private enum class Page(val title: String, val subtitle: String, val icon: Int) {
+        OVERVIEW("概览", "本地服务运行状态", R.drawable.ic_dashboard),
+        ACCOUNT("账号", "", R.drawable.ic_account),
+        MODELS("模型", "本地可用的模型表", R.drawable.ic_models),
+        RECORDS("记录", "调用用量与记录", R.drawable.ic_history),
+        MORE("更多", "外观 · 保活 · 说明", R.drawable.ic_more),
+    }
+
+    /**
+     * @param animate 只有**真实导航**传 true（点底部 Tab、进二级页、二级页返回）。
+     *   签到完成 / 切号成功 / 服务启停 / Token 续期回写 / 主题 recreate 恢复 / [redraw] /
+     *   [renderKeepingScroll] 一律走默认 false —— 那些是"同页数据变了"，不是"换了一页"，
+     *   整页淡入上浮只会让用户以为 App 在跳页。
+     */
+    private fun render(page: Page, animate: Boolean = false) {
         currentPage = page
-        // 点任意底部 Tab 都算"退出二级页"，否则会卡在保活页/外观风格页上出不去。
-        showKeepAlive = false
-        showStyle = false
-        backAction.visibility = View.GONE
-        // 页面要重建了，旧的"原地刷新"句柄作废（accountPage / modelsPage 构建时会重新登记）
+        // 点任意底部 Tab 都算"退出二级页"，否则会卡在二级页上出不去。
+        subPage = null
+        detailUid = null
+        if (::backBtn.isInitialized) backBtn.visibility = View.GONE
+        // 页面要重建了，旧的"原地刷新"句柄作废（各页构建时会重新登记）
         quotaApply = null
         monitorApply = null
         modelsRefreshApply = null
+        modelsListPulse = null
         pageTitle.text = page.title
-        pageSubtitle.text = page.subtitle
-        contentHost.removeAllViews()
-        contentHost.addView(when (page) {
+        // 账号页副标题是动态的（N 个已保存 · 当前 X）
+        pageSubtitle.text = if (page == Page.ACCOUNT) accountSubtitle() else page.subtitle
+        val newPage = when (page) {
             Page.OVERVIEW -> overviewPage()
             Page.ACCOUNT -> accountPage()
             Page.MODELS -> modelsPage()
             Page.RECORDS -> recordsPage()
             Page.MORE -> morePage()
-        })
+        }
+        // 切页过渡：新内容淡入 + 从下方 6dp 滑到原位（克制，200ms，不喧宾夺主）。
+        // 先挂新页、再摘旧页 —— 顺序反了会露一帧空白（旧版就是那样）。
+        swapContent(newPage, animate)
         // 账号页**自动拉一次**积分/额度：不拉的话三个数值位永远显示「—」，
         // 用户会以为功能坏了（实测就是这个现象），得先手动点「刷新」才有数据。
         // 判据只看 accountCheckin：它是一份拉取里**最后一个**回填的字段，
-        // 拿它当"这个账号是否已经拉过"的单一标志（旧写法要求三个都为 null，
-        // 只要余额先回填成功就会整体跳过 → 签到状态可能一直是 null，按钮变"未登录"却可点）。
-        if (page == Page.ACCOUNT && accountCheckin == null && !quotaLoading) {
+        // 拿它当"这个账号是否已经拉过"的单一标志。
+        // 概览页与账号页都显示积分/签到卡，两页都要自动拉取（真机实测）。
+        if ((page == Page.ACCOUNT || page == Page.OVERVIEW) && accountCheckin == null && !quotaLoading) {
             contentHost.post { refreshQuota(quiet = true) }
         }
-        navItems.forEach { (key, item) ->
-            val active = key == page
-            item.setTextColor(color(if (active) "primary" else "on_surface_variant"))
-            item.typeface = if (active) Typeface.create("sans-serif-medium", Typeface.NORMAL) else Typeface.DEFAULT
-            // 选中态：贴在图标+文字上的胶囊（宽度由内容决定，见 onCreate 的 navBar 组装）
-            item.background = if (active) shape("primary_container", RADIUS_PILL) else null
-            item.compoundDrawables.filterNotNull().forEach { it.mutate().setTint(color(if (active) "primary" else "on_surface_variant")) }
+        // 索引相同时不重设：否则会把刚刚点击启动的指示器位移动画当场掐掉（尺寸变化由
+        // onSizeChanged 兜底）。
+        val navIndex = Page.entries.indexOf(page)
+        if (navBar.current() != navIndex) navBar.select(navIndex, animate = false)
+        // 局部操作（置顶/重命名/移动/删除/切换）后重建页面时恢复滚动位置，
+        // 否则用户每点一次菜单就被弹回顶部，看不到刚改的那一行。
+        if (pendingScrollY >= 0) {
+            val y = pendingScrollY
+            pendingScrollY = -1
+            contentHost.post {
+                (contentHost.getChildAt(0) as? ScrollView)?.scrollTo(0, y)
+            }
         }
     }
 
-    /** 打开保活设置二级页（顶栏换成"返回"，Tab 高亮保持在「更多」）。 */
-    private fun openKeepAlive() {
-        showKeepAlive = true
-        pageTitle.text = "保活设置"
-        pageSubtitle.text = "让服务在后台长期活着"
-        backAction.visibility = View.VISIBLE
-        contentHost.removeAllViews()
-        contentHost.addView(keepAlivePage())
+    /** 下次 render 后要恢复的滚动位置（-1 = 不恢复）。 */
+    private var pendingScrollY = -1
+
+    /** 当前内容区滚动位置（页面不是 ScrollView 时为 0）。 */
+    private fun currentScrollY(): Int =
+        (contentHost.getChildAt(0) as? ScrollView)?.scrollY ?: 0
+
+    /** 重建当前页但**保持滚动位置**（用于账号页的局部操作刷新）。 */
+    private fun renderKeepingScroll(page: Page) {
+        pendingScrollY = currentScrollY()
+        render(page)
     }
 
-    /** 打开「外观风格」二级页（顶栏换标题，Tab 高亮保持在「更多」）。 */
-    private fun openStylePage() {
-        showStyle = true
-        pageTitle.text = "外观风格"
-        pageSubtitle.text = "配色与形态，随你挑"
-        backAction.visibility = View.VISIBLE
-        contentHost.removeAllViews()
-        contentHost.addView(stylePage())
+    /** 账号页副标题：「共 N 个 · 当前 X」；未登录给「还没有账号」。 */
+    private fun accountSubtitle(): String {
+        val s = TraeAuthStore.snapshot(this)
+        if (s.metas.isEmpty()) return "还没有账号"
+        val cur = s.byUid(s.activeUid)
+        val curLabel = cur?.nickname?.ifBlank { null } ?: cur?.uid
+        return if (curLabel == null) "共 ${s.metas.size} 个 · 未选定"
+        else "共 ${s.metas.size} 个 · 当前 $curLabel"
+    }
+
+    /** 导航代次：每次换页自增，过期的那次 post 直接放弃（快速连切只认最后一页）。 */
+    private var pageGeneration = 0
+
+    /**
+     * 内容区换页：**先挂新页、再摘旧页**，可选 6dp / 200ms 的淡入上浮。
+     *
+     * 顺序是硬要求：旧版先 `removeAllViews()` 再 `addView()`，中间会露一帧空白底
+     * （Aurora 柔光底），看起来就是"切页闪一下"。现在旧页在新页挂上去之后再摘，
+     * 帧里至少总有一页内容。
+     *
+     * 只对**新页自己**做 alpha/translationY：容器 contentHost 的属性一旦被动过，
+     * 后续 layout / 滚动恢复都会拿着一个中间值。
+     *
+     * 系统关掉动画时直接落终态：不设 alpha=0、不排 post，避免"页面永远半透明"。
+     */
+    private fun swapContent(newPage: View, animate: Boolean) {
+        pageGeneration++
+        val gen = pageGeneration
+        contentHost.animate().cancel()
+        val play = animate && Motion.animationsEnabled(this)
+        if (play) {
+            newPage.alpha = 0f
+            newPage.translationY = dp(6).toFloat()
+        } else {
+            newPage.alpha = 1f
+            newPage.translationY = 0f
+        }
+        contentHost.addView(newPage)
+        // 摘掉除新页以外的所有子 View（旧页、以及任何历史残页）
+        while (contentHost.childCount > 1) contentHost.removeViewAt(0)
+        if (!play) return
+        animatePageEnter(newPage, gen)
+    }
+
+    /**
+     * 切页/进二级页的入场：整页淡入 + 6dp 上浮，200ms。
+     *
+     * `post` 到下一帧再启动：`addView` 后立刻 animate 时 view 还没 measure，
+     * 位移起点会被首帧 layout 覆盖（真机复现"试不出来"）。post 里先比对代次，
+     * 过期任务直接退出 —— 快速连切时不能让两段动画抢同一页。
+     */
+    private fun animatePageEnter(page: View, gen: Int) {
+        page.post {
+            if (gen != pageGeneration || !page.isAttachedToWindow) return@post
+            contentHost.animate().cancel()
+            page.animate()
+                .alpha(1f)
+                .translationY(0f)
+                .setDuration(200)
+                .setInterpolator(Motion.ease())
+                .start()
+        }
+    }
+
+    /**
+     * 二级页的公共入口：顶栏加返回、副标题固定、页高亮保持在宿主 Tab。
+     *
+     * @param animate 真实入口（设置卡片、列表、"去设置保活"）传 true；
+     *   [redraw] / 系统返回 / 状态恢复走默认 false。
+     */
+    private fun openSub(
+        title: String,
+        subtitle: String,
+        key: String,
+        animate: Boolean = false,
+        build: () -> View,
+    ) {
+        subPage = key
+        quotaApply = null
+        monitorApply = null
+        modelsRefreshApply = null
+        modelsListPulse = null
+        pageTitle.text = title
+        pageSubtitle.text = subtitle
+        if (::backBtn.isInitialized) backBtn.visibility = View.VISIBLE
+        swapContent(build(), animate)
+        val navIndex = Page.entries.indexOf(currentPage)
+        if (navBar.current() != navIndex) navBar.select(navIndex, animate = false)
+    }
+
+    /** 点顶栏返回箭头：退回宿主页。与系统返回键同一条路径（[onBackPressed]）。 */
+    private fun backFromSub() {
+        if (subPage != null) render(currentPage, animate = true) else onBackPressed()
+    }
+
+    /** 打开保活设置二级页（Tab 高亮保持在「更多」）。 */
+    private fun openKeepAlive(animate: Boolean = false) {
+        currentPage = Page.MORE
+        openSub("保活设置", "让服务在后台长期活着", SUB_KEEP_ALIVE, animate) { keepAlivePage() }
+    }
+
+    /** 打开「账号设置」二级页（Tab 高亮保持在「账号」）。 */
+    private fun openAccountMore(animate: Boolean = false) {
+        currentPage = Page.ACCOUNT
+        openSub("账号设置", "添加 · 监测 · 备份", SUB_ACCOUNT_MORE, animate) { accountMorePage() }
+    }
+
+    /** 打开「账号详情」二级页；uid 无效时回落账号页。 */
+    private fun openAccountDetail(uid: String?, animate: Boolean = false) {
+        currentPage = Page.ACCOUNT
+        val meta = TraeAuthStore.list(this).firstOrNull { it.uid == (uid ?: detailUid) }
+        if (meta == null) { render(Page.ACCOUNT); return }
+        detailUid = meta.uid
+        val nick = meta.nickname.ifBlank { meta.uid }
+        openSub(nick, "${regionLabel(meta.region)} · UID ${meta.uid}", SUB_ACCOUNT_DETAIL, animate) {
+            accountDetailPage(meta)
+        }
     }
 
     /**
      * 按"现在所在的位置"重绘：Tab 页或二级页都还原。
      *
-     * ⚠️ 不能拿 `render(currentPage)` 当"刷新界面"用：那会把正停在二级页（保活设置 /
-     * 外观风格）的用户踢回 Tab 页。实测：切完风格重建后状态恢复是对的，但 token 加载
-     * 线程随后又 `render(currentPage)` 一次，人就被送回「更多」了。
+     * ⚠️ 不能拿 `render(currentPage)` 当"刷新界面"用：那会把正停在二级页的用户踢回 Tab 页。
      */
     private fun redraw() {
-        when {
-            showKeepAlive -> openKeepAlive()
-            showStyle -> openStylePage()
+        when (subPage) {
+            SUB_KEEP_ALIVE -> openKeepAlive()
+            SUB_ACCOUNT_MORE -> openAccountMore()
+            SUB_ACCOUNT_DETAIL -> openAccountDetail(detailUid)
             else -> render(currentPage)
         }
     }
 
-    /** 系统返回键：停在任一二级页时先退回「更多」，而不是直接退出 App。 */
+    /** 系统返回键：停在任一二级页时先退回宿主 Tab，而不是直接退出 App。 */
     @Deprecated("Activity.onBackPressed 已废弃，但本项目未引 androidx（无 OnBackPressedDispatcher）")
     override fun onBackPressed() {
-        if (showKeepAlive || showStyle) render(Page.MORE) else @Suppress("DEPRECATION") super.onBackPressed()
+        if (subPage != null) render(currentPage) else @Suppress("DEPRECATION") super.onBackPressed()
     }
 
     /**
      * 记住当前 Tab 与二级页。
      *
-     * 两个场景都靠它才不会"跳页"：① 切风格/亮暗走 [recreate]；
+     * 两个场景都靠它才不会"跳页"：① 切亮暗走 [recreate]；
      * ② 系统夜间模式切换时本 Activity 会被系统重建（manifest 未声明 configChanges）。
      */
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
         outState.putString(STATE_PAGE, currentPage.name)
-        outState.putString(STATE_SUB, when {
-            showKeepAlive -> SUB_KEEP_ALIVE
-            showStyle -> SUB_STYLE
-            else -> ""
-        })
+        outState.putString(STATE_SUB, subPage.orEmpty())
+        outState.putString(STATE_SUB_EXTRA, detailUid.orEmpty())
     }
 
     // ------------------------------------------------------------------
-    // 概览
+    // 概览（对齐设计稿 home.html）
     // ------------------------------------------------------------------
 
     private fun overviewPage(): View = scroll {
         val running = GatewayService.running
         val busy = serviceBusy
-        addView(when {
-            busy != null -> chipInfo(busy)
-            running -> statusChip("服务运行中", "success", true)
-            else -> statusChip("服务已停止", "error", false)
+        // 「端口在听」和「服务可用」是两件事：没登录 / 模型表为空时客户端连得上却用不了。
+        // 状态 chip 必须说清是哪一种，否则用户以为"已就绪"就是能用了（真机踩过）。
+        val loggedIn = TraeAuthStore.activeUid(this@MainActivity) != null
+        val hasModels = ModelsRepo.current().length() > 0
+        // 地址卡左侧标签列宽：跟着系统字体缩放走。写死 40dp 时，「局域网」在 1.3 倍字体下
+        // 会被挤成「局域」+「网」两行，地址也跟着断成两截。
+        val laneW = (40 * resources.configuration.fontScale).toInt().coerceIn(40, 64)
+        // ---- 状态卡：整屏焦点 ----
+        addView(glassCard(topMargin = 2) {
+            addView(row {
+                addView(pulseDot(running), lp(dp(8), dp(8), end = 10))
+                addView(text(
+                    when {
+                        busy != null -> busy
+                        running -> "服务运行中"
+                        else -> "服务已停止"
+                    }, Tokens.TEXT_MD, true
+                ), weighted())
+                addView(when {
+                    busy != null -> chipMute("处理中")
+                    !running -> chipBad("未运行")
+                    !loggedIn -> chipWarn("未登录")
+                    !hasModels -> chipWarn("模型表为空")
+                    else -> chipOk("已就绪")
+                }, lp(-2, -2, start = 8))
+            })
+            addView(captionText(when {
+                !running && Gateway.lastStartError != null -> Gateway.lastStartError ?: "服务启动失败"
+                !running -> "你（或通知栏）停止过服务，端口未在监听，客户端暂时连不上。\n点下面的「启动服务」重新开启。"
+                !loggedIn -> "端口已在监听，但还没登录 Trae —— 客户端拉到的是空模型表、对话走固定假回复。先到「账号」页登录。"
+                !hasModels -> "端口已在监听，但模型表为空 —— 到「模型」页点「刷新」，客户端才能选到模型。"
+                else -> "前台服务常驻，退出 App 或划掉最近任务都不会断。停止请点下方按钮或通知栏的「停止」。"
+            }), top(8))
+            if (running) {
+                addView(LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.VERTICAL
+                    setPadding(0, dp(16), 0, 0)
+                    addView(text("${LocalFakeServer.PORT}", Tokens.TEXT_2XL, true, "accent"))
+                    addView(captionText("监听端口").let { it.setPadding(0, dp(2), 0, 0); it })
+                })
+            }
         })
-        // 服务现在是**默认开启**的（进 App 自动拉起，0.4.8）。走到这个分支基本只有两种：
-        // 用户主动停过，或者启动失败了（典型：8787 被别的 App 占着）。后者以前会
-        // 直接崩进程（异常从 onStartCommand 冒出去），现在改成在这里如实报原因。
-        if (!running) {
-            val failure = Gateway.lastStartError
-            addView(card(tone = CardTone.SOFT) {
-                addView(text(if (failure != null) "服务启动失败" else "服务未启动", FS_CARD_TITLE, true))
-                if (failure != null) {
-                    // 原因照抄底层给的人话：用户唯一能采取的行动就是"关掉占端口的那个 App"
-                    addView(caption(failure), top(8))
-                    addView(caption("端口被占用时：关掉其它占用 ${
-                        LocalFakeServer.PORT
-                    } 端口的应用（常见于同机跑了别的本地网关），再点下面的「启动服务」。"),
-                        top(6))
-                } else {
-                    addView(caption("你（或通知栏）停止过服务，端口未在监听，客户端暂时连不上。\n" +
-                        "点下面的「启动服务」即可重新开启；下次进 App 也会保持关闭，直到你手动启动。"), top(8))
-                }
-            }, top(GAP))
-        } else {
-            addView(card(tone = CardTone.SOFT) {
-                addView(text("后台常驻中", FS_CARD_TITLE, true))
-                addView(caption("服务跑在前台服务里：退出本 App、划掉最近任务都不会断，" +
-                    "你可以切到任意客户端使用。\n停止请点下面的「停止服务」或通知栏的「停止」。"), top(8))
-                // 保活体检：国产 ROM 会无视 START_STICKY 直接强杀，能不能长期活着
-                // 取决于几项系统授权 —— 用户很难自己想到，所以这里给个醒目入口。
-                val pending = KeepAlive.check(this@MainActivity).count { it.needsAction }
-                if (pending > 0) {
-                    addView(caption("⚠️ 还有 $pending 项保活设置未开启，真机上可能被系统清掉"), top(10))
-                }
-                addView(action(if (pending == 0) "保活设置：全部正常" else "去设置保活（$pending 项）",
-                    full = true, outlined = pending == 0) { openKeepAlive() }, top(10))
-            }, top(GAP))
-        }
-        // 服务地址是本页核心信息：强调卡（有底色、无阴影）+ 等宽主色地址 + 一键复制。
-        // 两行分别是「本机用」与「局域网其它设备用」——都带 /v1（客户端 Base URL 的格式），
-        // 不带 /v1 的裸地址此前最容易踩：复制粘贴进客户端后拼接路径就错了。
-        addView(card(tone = CardTone.EMPHASIS) {
-            addView(caption("服务地址（本机使用）"))
-            addView(row(8) {
-                addView(mono("http://127.0.0.1:${LocalFakeServer.PORT}/v1", FS_BODY, true, "primary"), weighted())
-                // 卡底本身就是 primary_container，按钮底要换成 surface 才看得见
-                addView(linkAction("复制", overContainer = true) { copyServerUrl() })
-            }, top(6))
+
+        // ---- 服务地址：本页核心信息（强调卡，对应设计稿 .card.tint）----
+        // 每段一行：区域标签 + 地址 + 复制。原来「本机使用」单独占一行标题、复制按钮又是
+        // 44dp 高，三段叠起来卡片有半屏高，地址文字还悬在按钮中间（看着像错位）。
+        addView(glassCard(GlassCard.Tone.TINT) {
+            addView(row {
+                addView(text("服务地址", Tokens.TEXT_MD, true), weighted())
+                // 服务没跑时地址仍然展示（用户要能复制），但必须标明"现在连不上"
+                if (!running) addView(chipBad("服务未运行"), lp(-2, -2, start = 8))
+            })
+            addView(row(top = 12) {
+                addView(captionText("本机").apply { includeFontPadding = false; maxLines = 1 }, lp(dp(laneW), -2))
+                addView(mono("http://127.0.0.1:${LocalFakeServer.PORT}/v1", Tokens.TEXT_XS, true, "primary_on_soft")
+                    .apply { maxLines = 1; ellipsize = TextUtils.TruncateAt.END }, weighted(start = 4))
+                addView(ghostBtn("复制", heightDp = 30, textSize = Tokens.TEXT_XS) { copyServerUrl() },
+                    lp(-2, -2, start = 8))
+            })
             // 局域网行：拿不到 IP（未连 WiFi、只连了蜂窝）时整行不出现，不显示一个假地址
             lanAddress()?.let { lan ->
-                addView(caption("局域网其它设备使用"), top(12))
-                addView(row(8) {
-                    addView(mono(lan, FS_VALUE, true, "primary"), weighted())
-                    addView(linkAction("复制", overContainer = true) { copyLanUrl(lan) })
-                }, top(6))
-                addView(caption("同一 WiFi 下的电脑/平板/手机等设备，base URL 填这一条；" +
-                    "API Key 不变，用下面同一个。"), top(8))
-            } ?: addView(caption("（未检测到局域网 IP：连上 WiFi 后此处会显示可直接给其它设备用的地址）"), top(12))
-            addView(caption("base URL 填进任意 OpenAI 兼容客户端"), top(8))
-        }, top(GAP))
-        addView(action(busy ?: if (running) "停止服务" else "启动服务", full = true, outlined = running || busy != null) { toggleService() }
-            .apply {
-                // 处理中禁用：不给点第二次，也不让用户以为"没点动"
-                if (busy != null) { isEnabled = false; alpha = 0.6f }
-            }, top(GAP))
-        addView(card { addTraeCard(includeLogin = true) })
-        addView(card {
-            addView(caption("本地 API Key"))
-            addView(row(8) {
-                addView(text(if (apiKeyVisible) apiKey else MASKED_KEY, FS_VALUE).apply {
-                    setTextIsSelectable(apiKeyVisible)
-                }, weighted())
-                addView(linkAction(if (apiKeyVisible) "隐藏" else "显示") {
+                addView(row(top = 6) {
+                    addView(captionText("局域网").apply { includeFontPadding = false; maxLines = 1 }, lp(dp(laneW), -2))
+                    addView(mono(lan, Tokens.TEXT_XS, true, "primary_on_soft")
+                        .apply { maxLines = 1; ellipsize = TextUtils.TruncateAt.END }, weighted(start = 4))
+                    addView(ghostBtn("复制", heightDp = 30, textSize = Tokens.TEXT_XS) { copyLanUrl(lan) },
+                        lp(-2, -2, start = 8))
+                })
+                addView(captionText("同一 WiFi 下的电脑/平板填这条；API Key 与下面同一个。"), top(8))
+            } ?: addView(captionText("（未检测到局域网 IP：连上 WiFi 后此处会显示可直接给其它设备用的地址）"), top(10))
+        })
+
+        // ---- 启停按钮（busy 时禁用，不给点第二次）----
+        addView(glassButton(
+            busy ?: if (running) "停止服务" else "启动服务",
+            style = if (running || busy != null) BtnStyle.GHOST else BtnStyle.PRIMARY,
+            enabled = busy == null,
+        ) { toggleService() })
+
+        // ---- 当前账号卡 ----
+        addView(sectionRow("当前账号", 0))
+        addView(glassCard(topMargin = 0) { addTraeCard() })
+
+        // ---- 积分卡（概览页与账号页共用 quotaCardView）----
+        addView(quotaCardView(loggedIn))
+
+        // ---- 本地 API Key ----
+        addView(glassCard {
+            addView(row {
+                addView(iconBadge("key", "accent_container", "accent"), lp(dp(30), dp(30)))
+                addView(text("本地 API Key", Tokens.TEXT_MD, true), weighted(start = 10))
+            })
+            // key 独占一行 + maxLines=2：360dp 下 44 字符的 key 与按钮挤同一行会被截断（真机实测）
+            addView(mono(if (apiKeyVisible) apiKey else MASKED_KEY, Tokens.TEXT_XS, colorName = "on_surface_variant")
+                .apply { maxLines = 2; setPadding(0, dp(12), 0, 0) })
+            addView(row(top = 4) {
+                addView(TextAction(this@MainActivity, if (apiKeyVisible) "隐藏" else "显示") {
                     apiKeyVisible = !apiKeyVisible
-                    render(currentPage)
-                }, lp(-2, -2, start = 8))
-                addView(linkAction("复制") { copyApiKey() }, lp(-2, -2, start = 8))
-            }, top(6))
-            addView(caption("供任意 OpenAI 客户端连接鉴权使用"), top(8))
+                    redraw()
+                }, lp(-2, -2))
+                addView(TextAction(this@MainActivity, "复制") { copyApiKey() }, lp(-2, -2, start = 8))
+                addView(View(this@MainActivity), weighted())
+            })
+            addView(captionText("供任意 OpenAI 客户端连接鉴权使用。"), top(8))
         })
-        addView(card(tone = CardTone.SOFT) {
-            addView(text("使用引导", FS_CARD_TITLE, true))
-            addView(caption("把上面的地址与 API Key 填进任意 OpenAI 兼容客户端。要单独测某个端点，点右边的「复制」："), top(8))
-            ENDPOINTS.forEach { (method, path) ->
-                addView(row(8) {
-                    addView(mono("$method $path", FS_CAPTION, colorName = "on_surface"), weighted())
-                    addView(linkAction("复制") { copyEndpoint(path) })
-                }, top(8))
-            }
+
+        // ---- 使用引导 ----
+        addView(sectionRow("使用引导", 0))
+        addView(glassCard(GlassCard.Tone.SOFT, topMargin = 0) {
+            addView(captionText("把上面的地址与 API Key 填进任意 OpenAI 兼容客户端。单独测端点时点右侧复制："))
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(0, dp(8), 0, 0)
+                ENDPOINTS.forEachIndexed { i, (method, path) ->
+                    addView(row {
+                        addView(chipStatic(method, if (method == "POST") "info" else "mute"), lp(dp(52), -2))
+                        addView(mono(path, Tokens.TEXT_XS), weighted(start = 8))
+                        addView(TextAction(this@MainActivity, "复制") { copyEndpoint(path) }, lp(-2, -2))
+                    })
+                    if (i < ENDPOINTS.lastIndex) addView(rowDivider())
+                }
+            })
         })
-        addView(action("登录 / 切换 Trae 账号", full = true) { openLogin() }, top(GAP))
-        addView(copyrightCard())
+
+        // ---- 保活提醒：只有存在待处理项时才出现（设计稿 home.html 尾卡）----
+        val pending = KeepAlive.check(this@MainActivity).count { it.needsAction }
+        if (pending > 0) {
+            addView(glassCard(GlassCard.Tone.WARN, topMargin = Tokens.CARD_GAP + Tokens.SPACE_2) {
+                addView(row {
+                    addView(text("$pending 项保活设置未开启", Tokens.TEXT_MD, true, "warning"), weighted())
+                    addView(chipWarn("建议处理"), lp(-2, -2, start = 8))
+                })
+                addView(captionText("国产 ROM 会无视前台服务直接强杀，真机上服务可能被系统清掉。"), top(8))
+                addView(TextAction(this@MainActivity, "去设置保活") { openKeepAlive(animate = true) }, lp(-2, -2, top = 8))
+            })
+        }
+
+        addView(captionText("$AUTHOR_LABEL $AUTHOR_NAME · $AUTHOR_EMAIL")
+            .apply { gravity = Gravity.CENTER; setPadding(0, dp(28), 0, dp(90)) })
     }
 
-    private fun LinearLayout.addTraeCard(includeLogin: Boolean) {
+    /** 概览页的当前账号卡（设计稿 home.html「当前账号」）：头像行 + Token 到期。 */
+    private fun LinearLayout.addTraeCard() {
         val cred = TraeAuthStore.load(this@MainActivity)
         if (cred == null) {
-            addView(text("未登录 Trae", FS_CARD_TITLE, true))
-            addView(caption("已登录后走真实 Trae 转发；当前返回固定假回复"), top(6))
-            if (includeLogin) addView(action("立即登录", full = true) { openLogin() }, top(14))
+            addView(row {
+                addView(iconBadge("user", "primary_container", "primary_on_soft"), lp(dp(36), dp(36)))
+                addView(LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.VERTICAL
+                    addView(text("未登录 Trae", Tokens.TEXT_MD, true))
+                    addView(captionText("已登录后走真实 Trae 转发；当前返回固定假回复").let { it.setPadding(0, dp(2), 0, 0); it })
+                }, weighted(start = 10))
+            })
             return
         }
-        val hasToken = !cred.accessToken.isBlank()
+        val hasToken = cred.accessToken.isNotBlank()
         addView(row {
-            addView(text(cred.nickname.ifBlank { "Trae 账号" }, FS_CARD_TITLE, true), weighted())
-            addView(if (hasToken) statusChip("转发 已启用", "success", true) else statusChip("转发 未配置", "warning", false))
+            addView(avatar(cred.nickname), lp(dp(36), dp(36)))
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                addView(text(cred.nickname.ifBlank { "Trae 账号" }, Tokens.TEXT_MD, true))
+                val sub = buildString {
+                    if (cred.uid.isNotBlank()) append("UID ${cred.uid} · ")
+                    append(regionLabel(cred.region))
+                }
+                addView(captionText(sub).let { it.setPadding(0, dp(2), 0, 0); it })
+            }, weighted(start = 10))
+            addView(if (hasToken) chipMute("转发已启用") else chipWarn("未配置"), lp(-2, -2, start = 8))
         })
-        if (cred.uid.isNotBlank()) addView(caption("UID: ${cred.uid} · ${regionLabelFull(cred.region)}"), top(6))
-        if (!cred.region.isSupported) addView(caption(TraeRegion.SG.unsupportedNote), top(4))
-        if (cred.expiresAt > 0L) addView(caption("Token 到期: ${formatExp(cred.expiresAt)}"), top(4))
-        val accountCount = TraeAuthStore.list(this@MainActivity).size
-        if (accountCount > 1) addView(caption("已保存 $accountCount 个账号（在「账号」页切换）"), top(4))
-    }
-
-    // ------------------------------------------------------------------
-    // 账号
-    // ------------------------------------------------------------------
-
-    private fun accountPage(): View = scroll {
-        addView(section("Trae 账号"))
-        val metas = TraeAuthStore.list(this@MainActivity)
-        val activeUid = TraeAuthStore.activeUid(this@MainActivity)
-        if (metas.isEmpty()) {
-            addView(card(tone = CardTone.SOFT) {
-                addView(text("未登录", FS_CARD_TITLE, true))
-                addView(caption("登录后使用 Trae 账号进行真实转发"), top(6))
-                addView(action("立即登录", full = true) { openLogin() }, top(14))
-            })
-        } else {
-            val cred = TraeAuthStore.load(this@MainActivity)
-            // 当前账号详情
-            addView(card {
-                addView(row {
-                    addView(text(cred?.nickname?.ifBlank { null } ?: "Trae 账号", FS_CARD_TITLE, true), weighted())
-                    addView(chipOk("当前使用"))
-                })
-                if (cred != null) {
-                    addView(labelValue("UID", cred.uid), top(12))
-                    addView(labelValue("区域", regionLabelFull(cred.region)), top(4))
-                    if (!cred.region.isSupported) addView(caption(TraeRegion.SG.unsupportedNote), top(6))
-                    addView(labelValue("Access Token", "已持久化（加密存储）"), top(4))
-                    addView(labelValue("Token 状态", tokenRenewLabel(cred.expiresAt)), top(4))
-                    if (cred.expiresAt > 0L) addView(labelValue("到期时间", formatExp(cred.expiresAt)), top(4))
-                }
-            })
-            // 其它账号：点击切换，长按/按钮删除
-            val others = metas.filter { it.uid != activeUid }
-            if (others.isNotEmpty()) {
-                addView(section("其它账号（共 ${metas.size} 个已保存）"))
-                others.forEach { m ->
-                    addView(card {
-                        addView(row {
-                            addView(text(m.nickname.ifBlank { m.uid }, FS_BODY, true), weighted())
-                            if (m.region.isSupported) {
-                                addView(chipInfo(regionLabel(m.region)))
-                            } else {
-                                addView(chipWarn("${regionLabel(m.region)} · 未开发"))
-                            }
-                        })
-                        addView(caption("UID: ${m.uid} · Token: ${tokenRenewLabel(m.expiresAt)}"), top(6))
-                        addView(row(8) {
-                            addView(action("切换到此账号", outlined = true) { switchAccount(m.uid) }, weighted())
-                            addView(action("删除", outlined = true) { confirmRemoveAccount(m) }, weighted(start = 8))
-                        }, top(10))
-                    })
-                }
-            }
+        if (!cred.region.isSupported) {
+            addView(captionText(TraeRegion.SG.unsupportedNote).let { it.setPadding(0, dp(6), 0, 0); it })
         }
-        // 登录只有这一条路：**浏览器 + 粘贴回调**。
-        // （原内置 WebView 登录窗已移除：它依赖页面 JS 回调，第三方 SDK 一超时就等不到回调，
-        //  部分网络下必失败；这条不依赖 WebView/页面 JS，是实测可用路径。）
-        addView(card {
-            addView(text("登录（浏览器 + 粘贴回调）", FS_CARD_TITLE, true))
-            addView(caption(
-                "1. 按区域复制登录链接\n" +
-                "2. 在电脑或手机浏览器打开并登录\n" +
-                "3. 登录后地址栏停在 127.0.0.1:18080 打不开是正常的\n" +
-                "4. 复制地址栏那条完整链接，回到这里粘贴"), top(8))
-            addView(action("复制国服登录链接", outlined = true) { copyLoginUrl(TraeRegion.CN) }, top(12))
-            addView(action("复制国际服登录链接（未开发）", outlined = true) {
-                toast(TraeRegion.SG.unsupportedNote)
-                copyLoginUrl(TraeRegion.SG)
-            }, top(8))
-            addView(caption(TraeRegion.SG.unsupportedNote), top(6))
-            addView(action("粘贴回调链接完成登录", full = true) { promptPasteCallback() }, top(12))
-        })
-        addView(section("积分与用量"))
-        // 登录状态在这里算一次，供签到文案用（避免在文案函数里重复 KeyStore 解密）
-        val loggedIn = TraeAuthStore.activeUid(this@MainActivity) != null
-        addView(card {
-            // 内边距加宽：linkAction 默认左右各 14dp，"刷新"两字只有 ~54dp 宽，
-            // 配 48dp 高就成了一个正圆。让它随文字自适应撑成胶囊（"刷新中…"也不会被截断）。
-            val refreshLabel = linkAction(if (quotaLoading) "刷新中…" else "刷新") { refreshQuota() }
-                .apply { setPadding(dp(24), 0, dp(24), 0) }
-            // 刻意**不用 action()（Button）**：Material Button 的默认 style 自带
-            // minHeight=48dp 与 inset 阴影，minimumHeight 压不下去 —— 已签时想把它缩成
-            // 一枚 32dp 小 chip 根本做不到（实测仍是 48dp 的砖）。TextView + 自绘背景
-            // 高度完全可控，也和项目里其它胶囊（linkAction / chip）同一套做法。
-            val checkinAction = TextView(this@MainActivity).apply {
-                gravity = Gravity.CENTER
-                setOnClickListener { claimCheckin() }
-            }
-            // 未登录时 accountCheckin 为 null，quotaApply 不会被调用，所以这里先按初值同步一次状态
-            refreshCheckinButton(checkinAction, loggedIn)
-            val balanceView = text(quotaValue(accountBalance?.toString()), FS_METRIC, true, "primary")
-            // 奖励说明（补充信息）：按钮已经说了"今日已签到"，这里不再重复状态，只说能领多少
-            val rewardView = caption(quotaValue(checkinRewardLabel())).apply {
-                gravity = Gravity.CENTER_VERTICAL
-            }
-            // 登记"怎么把最新数据刷进这几个控件"，刷新时直接调用（见 quotaApply 的注释）
-            quotaApply = {
-                refreshLabel.text = if (quotaLoading) "刷新中…" else "刷新"
-                balanceView.text = quotaValue(accountBalance?.toString())
-                rewardView.text = quotaValue(checkinRewardLabel())
-                refreshCheckinButton(checkinAction, loggedIn)
-            }
-            addView(row {
-                addView(caption("当前可用积分"), weighted())
-                addView(refreshLabel, lp(-2, -2))
-            })
-            // 主数值独占一行：原先它和两个胶囊挤在同一行，行高被 48dp 按钮撑开，数值反被压住
-            addView(balanceView, top(2))
-            // 签到单独一行：按钮（仅在可签时是主色）+ 右侧奖励说明。
-            // 高度留给 refreshCheckinButton 用 minimumHeight 控制（已签时会缩成一枚小 chip），
-            // 这里不能写死 dp(48)，否则固定高度会盖掉它的收缩。
-            addView(row {
-                addView(checkinAction, lp(-2, -2))
-                addView(rewardView, lp(-2, -2, start = 12))
-            }, top(14))
-        })
-        addView(section("积分监测 · 自动换号"))
-        addView(card {
-            var autoLabel: TextView? = null
-            var thresholdLabel: TextView? = null
-            val statusView = caption(monitorStatusText())
-
-            autoLabel = linkAction(autoSwitchLabel()) {
-                val next = !CreditMonitor.isAutoSwitchEnabled(this@MainActivity)
-                CreditMonitor.setAutoSwitchEnabled(this@MainActivity, next)
-                autoLabel?.text = autoSwitchLabel()
-            }
-            thresholdLabel = linkAction(thresholdLabelText()) {
-                promptThreshold { thresholdLabel?.text = thresholdLabelText() }
-            }
-            addView(row(top = 2) {
-                addView(autoLabel!!, weighted())
-                addView(thresholdLabel!!, weighted(start = 8))
-            })
-            addView(caption(
-                "服务运行中每 ${CreditMonitor.TICK_MS / 1000} 秒查一次当前账号的剩余积分；" +
-                    "低于阈值就自动切到余额最多的另一个国服账号。"), top(10))
-            addView(statusView, top(8))
-            // 监测器每 30 秒回调一次，只改这一行文字（重建页面会把滚动位置弹回去）
-            monitorApply = { statusView.text = monitorStatusText() }
-        })
-
-        addView(section("账号备份"))
-        addView(card {
-            addView(text("导出 / 导入（JSON）", FS_CARD_TITLE, true))
-            addView(caption(
-                "导出内容含「明文」access / refresh token，等于账号钥匙：只在本机与自己的设备之间传，" +
-                    "别发到公开地方。换设备时在新机导入即可，不用重新登录。\n" +
-                    "导出前可以勾选要带走哪几个账号；导入会先列出「新增 / 更新 / 跳过」，勾完再导。\n" +
-                    "同一份文件别在多台设备同时用 —— refresh token 是轮换的，后来的会让先前的失效。"), top(6))
-            addView(row(top = 12) {
-                addView(action("导出为文件", outlined = true) { promptExportAccounts() }, weighted())
-                addView(action("从文件导入", outlined = true) { importFromFile() }, weighted(start = 8))
-            })
-        })
-        addView(section("批量签到"))
-        addView(batchCheckinCard())
-        addView(section("每日定时签到"))
-        addView(scheduleCard())
+        if (cred.expiresAt > 0L) {
+            addView(labelValue("Token 到期", formatExp(cred.expiresAt)), top(12))
+        }
+        val accountCount = TraeAuthStore.list(this@MainActivity).size
+        if (accountCount > 1) {
+            addView(captionText("已保存 $accountCount 个账号（在「账号」页切换）").let { it.setPadding(0, dp(6), 0, 0); it })
+        }
     }
 
     /**
-     * 「批量签到」卡：一键签到全部账号 + 上轮每账号结果。
+     * 积分与用量卡（账号页与概览页共用；对齐设计稿 home.html 的「当前可用积分」卡）：
+     * 「当前可用积分 + 刷新」行、主数值行、签到 chip 行。
+     *
+     * 三个会被原地刷新改掉的控件（刷新文字 / 数值 / 奖励说明 / 签到按钮）在 [quotaApply]
+     * 里统一更新 —— **必须在这里赋值**：只置 null 不赋值的话回调永远是 no-op，
+     * refreshQuota 拉到数据页面也看不到（模拟器实测）。
+     */
+    private fun quotaCardView(loggedIn: Boolean): View {
+        val card = glassCard {}
+        // 刻意**不用 Button**：Material Button 的默认 style 自带 minHeight=48dp 与 inset 阴影，
+        // 已签时想缩成一枚 32dp 小 chip 做不到（实测仍是 48dp 的砖）。TextView + 自绘背景
+        // 高度完全可控，也和项目里其它胶囊同一套做法。
+        val checkinAction = TextView(this@MainActivity).apply {
+            gravity = Gravity.CENTER
+            setOnClickListener { claimCheckin() }
+        }
+        // 未登录时 accountCheckin 为 null，quotaApply 不会被调用，所以这里先按初值同步一次状态
+        refreshCheckinButton(checkinAction, loggedIn)
+        val balanceView = text(quotaValue(accountBalance?.toString()), Tokens.TEXT_2XL, true, "primary")
+            .apply { includeFontPadding = false }
+        // 奖励说明（补充信息）：按钮已经说了"今日已签到"，这里不再重复状态，只说能领多少
+        val rewardView = captionText(quotaValue(checkinRewardLabel())).apply {
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        // 登记"怎么把最新数据刷进这几个控件"，刷新时直接调用（见 quotaApply 的注释）
+        quotaApply = {
+            refreshLabelRef?.text = if (quotaLoading) "刷新中…" else "刷新"
+            balanceView.text = quotaValue(accountBalance?.toString())
+            rewardView.text = quotaValue(checkinRewardLabel())
+            refreshCheckinButton(checkinAction, loggedIn)
+            // 数据先写、再淡入：刷新开始时数值变「…」、回来变数字，各闪一次（0.65 → 1）。
+            // 只在原地更新的这几个控件上做 —— 重建整页会把滚动位置弹回页首。
+            Motion.fadeState(balanceView)
+            Motion.fadeState(rewardView)
+            Motion.fadeState(checkinAction)
+        }
+        val refreshLabel = TextAction(this@MainActivity, if (quotaLoading) "刷新中…" else "刷新") { refreshQuota() }
+            .also { refreshLabelRef = it }
+        card.addView(row {
+            addView(captionText("当前可用积分"), weighted())
+            addView(refreshLabel, lp(-2, -2))
+        })
+        // 主数值独占一行
+        card.addView(balanceView, top(6))
+        // 签到单独一行：按钮（仅在可签时是主色）+ 右侧奖励说明
+        card.addView(row {
+            addView(checkinAction, lp(-2, -2))
+            addView(rewardView, lp(-2, -2, start = 12))
+        }, top(Tokens.SPACE_3))
+        return card
+    }
+
+    /** 「刷新」TextAction 的引用：quotaApply 原地改它的文字（View 在卡构建后才创建，先留槽位）。 */
+    private var refreshLabelRef: TextView? = null
+
+    // ------------------------------------------------------------------
+    // 账号（对齐设计稿 account.html）
+    // ------------------------------------------------------------------
+
+    private fun accountPage(): View = scroll {
+        // 一次拿一致快照：metas / activeUid / 健康状态 来自同一时刻（旧写法分别调
+        // list() + activeUid() + load()，三次读之间账号可能已被删）。
+        val snap = TraeAuthStore.snapshot(this@MainActivity)
+        val metas = snap.metas
+        val activeUid = snap.activeUid
+        val cred = TraeAuthStore.load(this@MainActivity)
+
+        // 存储异常警示条（可关闭；关闭只影响显示，不解除写入闸门）
+        if (TraeAuthStore.shouldShowHealthBanner()) {
+            addView(storeHealthBanner())
+        }
+
+        if (metas.isEmpty()) {
+            // 空态：一张卡说清两条路——要么登录、要么从备份文件导入（核心功能，未登录必须可见）。
+            addView(glassCard(GlassCard.Tone.SOFT, topMargin = 2) {
+                addView(text("未登录 Trae", Tokens.TEXT_MD, true))
+                addView(captionText("登录后即可多账号转发、批量签到与积分监测。已有备份文件也可以直接导入。"), top(6))
+                addView(row(top = Tokens.SPACE_3) {
+                    addView(ghostBtn("立即登录", full = true) { openLogin() },
+                        LinearLayout.LayoutParams(0, -2, 1f))
+                    addView(View(this@MainActivity), lp(dp(8), 1))
+                    addView(ghostBtn("从文件导入", full = true) { importFromFile() },
+                        LinearLayout.LayoutParams(0, -2, 1f))
+                })
+            })
+        } else {
+            // ---- 当前账号卡（瘦身：删掉「国服总积分」块，避免和「当前账号积分」两个大数字打架）----
+            addView(glassCard(topMargin = 2) {
+                val activeMeta = metas.firstOrNull { it.uid == activeUid }
+                val expSoon = cred?.expiresAt?.takeIf { it > 0 }?.let {
+                    it - System.currentTimeMillis() / 1000 < 86400 * 3
+                } == true
+                addView(row {
+                    addView(avatar(activeMeta?.nickname ?: cred?.nickname), lp(dp(44), dp(44)))
+                    addView(LinearLayout(this@MainActivity).apply {
+                        orientation = LinearLayout.VERTICAL
+                        addView(text((cred?.nickname ?: activeMeta?.nickname)?.ifBlank { null } ?: "Trae 账号",
+                            Tokens.TEXT_MD, true))
+                        val sub = buildString {
+                            append(regionLabel(cred?.region ?: activeMeta?.region ?: TraeRegion.CN))
+                            if (cred?.uid?.isNotBlank() == true) append(" · UID ${cred.uid}")
+                            cred?.expiresAt?.takeIf { it > 0 }?.let {
+                                append(" · Token ${tokenShortLabel(it)}")
+                            }
+                        }
+                        addView(captionText(sub).let { it.setPadding(0, dp(2), 0, 0); it })
+                    }, weighted(start = 10))
+                    // 状态 chip 按真实状态变色：Token 即将过期 → 黄，正常在线 → 绿
+                    if (expSoon) {
+                        addView(chip("Token 将到期", "warning_container", "warning"), lp(-2, -2, start = 8))
+                    } else {
+                        addView(chipWithDot("在线"), lp(-2, -2, start = 8))
+                    }
+                    // 当前账号的管理入口：与列表行同一套菜单（详情/置顶/重命名/签到/删除），
+                    // 但没有「切换」和「上下移」（已是当前账号，也不在可排序列表里）。
+                    activeMeta?.let { m ->
+                        addView(TextAction(this@MainActivity, "⋯") {
+                            showAccountMenu(m, isActive = true, canMove = false, moveUp = null, moveDown = null)
+                        }, lp(-2, -2, start = 6))
+                    }
+                })
+                addView(row(top = Tokens.SPACE_3) {
+                    addView(LinearLayout(this@MainActivity).apply {
+                        orientation = LinearLayout.VERTICAL
+                        addView(text(quotaValue(accountBalance?.toString()), Tokens.TEXT_2XL, true, "primary_on_soft")
+                            .apply { includeFontPadding = false })
+                        addView(captionText("可用积分").let { it.setPadding(0, dp(2), 0, 0); it })
+                    }, weighted())
+                    addView(TextAction(this@MainActivity, if (quotaLoading) "刷新中…" else "刷新") { refreshQuota() },
+                        lp(-2, -2))
+                })
+                addView(LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    setPadding(0, dp(2), 0, 0)
+                    addView(TextAction(this@MainActivity, "查看详情与 Token") {
+                        activeMeta?.let { openAccountDetail(it.uid, animate = true) }
+                    }, lp(-2, -2).apply { marginStart = dp(-10) })
+                })
+            })
+
+            // ---- 签到卡上提：最高频收益动作紧跟「当前账号」（设计稿 account.html 签到区）----
+            addView(sectionRow("签到", Tokens.CARD_GAP))
+            addView(batchCheckinCard())
+
+            // ---- 全部账号：搜索 + 分类筛选（计数排除当前账号）+ 列表 ----
+            addView(sectionRow("其他账号", Tokens.CARD_GAP))
+            addView(accountListSection(snap))
+
+            // ---- 设置入口沉底：从独立玻璃卡降为文字链，首屏让位给核心信息 ----
+            addView(glassCard(topMargin = Tokens.CARD_GAP, padH = 0, padV = 0) {
+                addView(subPageRow("账号设置", "积分监测 · 添加账号 · 导入导出") { openAccountMore(animate = true) })
+            })
+        }
+        // 登录只有这一条路：**浏览器 + 粘贴回调**（原内置 WebView 登录窗已移除，实测可用路径）。
+        if (metas.isEmpty()) {
+            addView(sectionRow("登录", 0))
+            addView(glassCard(topMargin = 0) {
+                // 说明默认折叠成一行「如何登录？」，点开才展开 4 步；不展开时只留 3 个按钮
+                val steps = TextView(this@MainActivity).apply {
+                    text = "1. 按区域复制登录链接\n" +
+                        "2. 在电脑或手机浏览器打开并登录\n" +
+                        "3. 登录后地址栏停在 127.0.0.1:18080 打不开是正常的\n" +
+                        "4. 复制地址栏那条完整链接，回到这里粘贴"
+                    setTextColor(color("on_surface_variant"))
+                    textSize = Tokens.TEXT_XS
+                    visibility = View.GONE
+                    alpha = 0f
+                    setPadding(0, dp(Tokens.SPACE_2), 0, 0)
+                }
+                // 展开态用**显式布尔**判断，不看 visibility：动画进行中 visibility 已经是
+                // VISIBLE/VISIBLE 之外的值不可靠，连点会读出错误的状态。
+                var stepsOpen = false
+                // 文字动作本身要在 setStepsOpen 之前声明：setStepsOpen 会改它的文案
+                var toggle: TextAction? = null
+                // 在跑的高度动画：连点时先 cancel，否则两段 ValueAnimator 会同时改同一个
+                // layoutParams.height（视觉上是"卡一下然后跳到终值"）。
+                var stepsAnim: android.animation.ValueAnimator? = null
+                // 收起时的目标高度按"卡片内可用宽度"实测：不依赖 post 时机，
+                // 首帧就能算出准确高度（懒测量会在宽度还是 0 时算出 1 行高）。
+                fun measuredStepsHeight(): Int {
+                    val w = (contentWidth() - dp(Tokens.PAGE_PAD_H) * 2 - dp(Tokens.CARD_PAD) * 2)
+                        .coerceAtLeast(dp(120))
+                    steps.measure(
+                        View.MeasureSpec.makeMeasureSpec(w, View.MeasureSpec.EXACTLY),
+                        View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
+                    )
+                    return steps.measuredHeight
+                }
+                fun setStepsOpen(open: Boolean) {
+                    stepsOpen = open
+                    toggle?.text = if (open) "收起说明" else "如何登录？"
+                    val lp = steps.layoutParams as LinearLayout.LayoutParams
+                    stepsAnim?.cancel()
+                    stepsAnim = null
+                    if (!Motion.animationsEnabled(this@MainActivity)) {
+                        lp.height = if (open) LinearLayout.LayoutParams.WRAP_CONTENT else 0
+                        steps.layoutParams = lp
+                        steps.visibility = if (open) View.VISIBLE else View.GONE
+                        steps.alpha = if (open) 1f else 0f
+                        return
+                    }
+                    if (open) {
+                        val target = measuredStepsHeight()
+                        steps.visibility = View.VISIBLE
+                        steps.alpha = 0f
+                        lp.height = 0
+                        steps.layoutParams = lp
+                        val a = android.animation.ValueAnimator.ofInt(0, target)
+                        a.duration = 160L
+                        a.interpolator = Motion.ease()
+                        a.addUpdateListener {
+                            lp.height = it.animatedValue as Int
+                            steps.requestLayout()
+                        }
+                        a.addListener(object : android.animation.AnimatorListenerAdapter() {
+                            override fun onAnimationEnd(animation: android.animation.Animator) {
+                                // 结束恢复 WRAP_CONTENT：写死像素高度在字体缩放/换行变化后会把字裁掉
+                                if (stepsOpen) {
+                                    lp.height = LinearLayout.LayoutParams.WRAP_CONTENT
+                                    steps.requestLayout()
+                                }
+                            }
+                        })
+                        stepsAnim = a
+                        a.start()
+                        steps.animate().alpha(1f).setDuration(160).setInterpolator(Motion.ease()).start()
+                    } else {
+                        val from = if (steps.height > 0) steps.height else measuredStepsHeight()
+                        steps.animate().alpha(0f).setDuration(120).setInterpolator(Motion.ease()).start()
+                        val a = android.animation.ValueAnimator.ofInt(from, 0)
+                        a.duration = 120L
+                        a.interpolator = Motion.ease()
+                        a.addUpdateListener {
+                            lp.height = it.animatedValue as Int
+                            steps.requestLayout()
+                        }
+                        a.addListener(object : android.animation.AnimatorListenerAdapter() {
+                            override fun onAnimationEnd(animation: android.animation.Animator) {
+                                if (stepsOpen) return
+                                steps.visibility = View.GONE
+                                lp.height = LinearLayout.LayoutParams.WRAP_CONTENT
+                                steps.layoutParams = lp
+                            }
+                        })
+                        stepsAnim = a
+                        a.start()
+                    }
+                }
+                toggle = TextAction(this@MainActivity, "如何登录？") {
+                    setStepsOpen(!stepsOpen)
+                }
+                addView(toggle, lp(-2, -2))
+                addView(steps)
+                addView(ghostBtn("复制国服登录链接", full = true) { copyLoginUrl(TraeRegion.CN) }, top(Tokens.SPACE_3))
+                addView(ghostBtn("复制国际服登录链接", full = true) {
+                    toast(TraeRegion.SG.unsupportedNote)
+                    copyLoginUrl(TraeRegion.SG)
+                }, top(Tokens.SPACE_2))
+                addView(glassButton("粘贴回调链接完成登录", style = BtnStyle.PRIMARY) { promptPasteCallback() },
+                    top(Tokens.SPACE_3))
+            })
+        }
+        addView(View(this@MainActivity), lp(-1, dp(84)))
+    }
+
+    /** 账号列表区：筛选 chip 行 + 一张卡装全部账号行（滚动限高，账号多也不撑长页面）。 */
+    /** 账号排序模式（**UI 偏好**，存 prefs 的 `account_sort_mode`，不进 AccountMeta）。 */
+    private enum class AccountSort(val label: String) {
+        RECENT("最近使用"), CREATED("添加时间"), CUSTOM("自定义顺序")
+    }
+
+    private fun sortMode(): AccountSort {
+        val id = getSharedPreferences("traework2api_prefs", Context.MODE_PRIVATE)
+            .getString("account_sort_mode", null)
+        return AccountSort.entries.firstOrNull { it.name == id } ?: AccountSort.CUSTOM
+    }
+
+    private fun saveSortMode(m: AccountSort) {
+        getSharedPreferences("traework2api_prefs", Context.MODE_PRIVATE)
+            .edit().putString("account_sort_mode", m.name).apply()
+    }
+
+    /**
+     * 可切换账号（排除当前账号）按模式排序，置顶恒在最前。
+     *
+     * `sortedByDescending` 是稳定排序：`createdAt` / `lastUsedAt` 为 0 的历史账号排在
+     * 有值的之后，且**彼此保持原数组相对顺序** —— 不伪造历史时间，也不打乱既有顺序。
+     */
+    private fun orderedSwitchable(
+        snap: TraeAuthStore.Snapshot,
+        mode: AccountSort,
+    ): List<TraeAuthStore.AccountMeta> {
+        val base = snap.metas.filter { it.uid != snap.activeUid }
+        val sorted = when (mode) {
+            AccountSort.CUSTOM -> base
+            AccountSort.CREATED -> base.sortedByDescending { it.createdAt }
+            AccountSort.RECENT -> base.sortedByDescending { it.lastUsedAt }
+        }
+        val (pinned, normal) = sorted.partition { it.pinned }
+        return pinned + normal
+    }
+
+    /** 存储异常警示条（可关闭；关闭只影响显示，**不**解除写入闸门）。 */
+    private fun storeHealthBanner(): View = glassCard(GlassCard.Tone.SOFT, topMargin = 2) {
+        addView(row {
+            addView(chip("存储异常", "warning_container", "warning"), lp(-2, -2))
+            addView(View(this@MainActivity), weighted())
+            addView(TextAction(this@MainActivity, "关闭") {
+                TraeAuthStore.dismissHealthBanner()
+                renderKeepingScroll(Page.ACCOUNT)
+            }, lp(-2, -2))
+        })
+        addView(captionText("存储写入失败，本次改动可能未保存。为避免数据错乱，账号相关修改已暂停；请清理存储空间后重启 App 恢复。"), top(6))
+    }
+
+    /** 可切换账号行的副标题：区域 · 积分 · 置顶/到期提示。 */
+    private fun switchableSubtitle(m: TraeAuthStore.AccountMeta): String = buildString {
+        append(regionLabel(m.region))
+        // 积分来自 CreditMonitor 的读数表（含磁盘快照），**不做保鲜期过滤**：
+        // 列表要看的是"上次查到多少"，所以旧值也照显，超过 30 分钟补一句"多久之前"。
+        // 国际服根本查不了余额（canQueryQuota=false），明确写「不支持查询」而不是留空或 "—"。
+        val known = CreditMonitor.lastKnown(m.uid)
+        if (known != null) {
+            append(" · ${formatNumber(known.first)}")
+            if (System.currentTimeMillis() - known.second > 30 * 60_000L) {
+                append("（${agoLabel(known.second)}）")
+            }
+        } else {
+            // 判据用 isSupported（= 仅国服），不是 canQueryQuota：
+            // 本工程里 SG 的 ugHost 非空（`https://ug-normal.trae.ai`），canQueryQuota 对国际服
+            // 也是 true —— 但国际服链路已冻结为「未开发」，批量刷新与展示都按 isSupported 走，
+            // 与 TraeRegion.selfCheck / 签到跳过国际服的口径一致。
+            if (m.region.isSupported) append(" · 积分未刷新") else append(" · 不支持查询")
+        }
+        if (m.pinned) append(" · 置顶")
+        if (m.expiresAt > 0 && m.expiresAt - System.currentTimeMillis() / 1000 < 86400 * 3) {
+            append(" · Token 将到期")
+        }
+    }
+
+    /** 读数距今多久（只用于列表副标题的括号提示）。 */
+    private fun agoLabel(atMs: Long): String {
+        val minutes = (System.currentTimeMillis() - atMs) / 60_000L
+        return when {
+            minutes < 1 -> "刚刚"
+            minutes < 60 -> "${minutes} 分钟前"
+            else -> "${minutes / 60} 小时前"
+        }
+    }
+
+    /**
+     * 可切换账号列表：搜索 + 分类（计数**排除当前账号**）+ 排序 + 更多菜单。
+     *
+     * 整页统一滚动（不套内层 ScrollView）：嵌套滚动的触摸仲裁太容易出错，
+     * 账号行本身紧凑，几十个账号也只是正常的一页长内容。
+     */
+    private fun accountListSection(snap: TraeAuthStore.Snapshot): View {
+        val switchable = snap.metas.filter { it.uid != snap.activeUid }
+        val cnCount = switchable.count { it.region.isSupported }
+        val intlCount = switchable.size - cnCount
+
+        val host = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
+
+        if (switchable.isEmpty()) {
+            host.addView(glassCard(GlassCard.Tone.SOFT, topMargin = 0) {
+                addView(captionText("暂无其他账号。需要登录新账号时，从账号设置进入。"))
+            })
+            return host
+        }
+
+        val edit = searchInput("搜索账号名或 UID…")
+        host.addView(edit, lp(-1, -2, top = 0))
+
+        var filter = "all"
+        var mode = sortMode()
+
+        val chips = linkedMapOf(
+            "all" to CountChip(this@MainActivity, "全部").apply { setCount(switchable.size) },
+            "cn" to CountChip(this@MainActivity, "国服").apply { setCount(cnCount) },
+            "intl" to CountChip(this@MainActivity, "国际服").apply { setCount(intlCount) },
+        )
+        val listHost = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
+        val listCard = glassCard(GlassCard.Tone.NORMAL, topMargin = Tokens.SPACE_2, padH = 0, padV = 0) {}
+        listCard.addView(listHost, LinearLayout.LayoutParams(-1, -2))
+
+        var sortBtn: TextAction? = null
+        val emptyHint = captionText("没有匹配的账号，换个关键词或切换分类。").apply {
+            visibility = View.GONE
+            setPadding(0, dp(10), 0, 0)
+        }
+
+        fun rebuild(animate: Boolean = false) {
+            listHost.removeAllViews()
+            val ordered = orderedSwitchable(snap, mode)
+            val q = edit.text?.toString()?.trim().orEmpty()
+            val visible = ordered.filter { m ->
+                val regionOk = when (filter) {
+                    "cn" -> m.region.isSupported
+                    "intl" -> !m.region.isSupported
+                    else -> true
+                }
+                regionOk && (q.isBlank() || m.nickname.contains(q, true) || m.uid.contains(q, true))
+            }
+            // 上下移**只在**「自定义顺序 + 全部分类 + 无搜索词」时提供：
+            // 筛选/搜索后的可见序列只是原数组的子集，在那里移动会让整体顺序变得不可预期。
+            val canMove = mode == AccountSort.CUSTOM && filter == "all" && q.isBlank()
+            val visibleUids = ordered.map { it.uid }
+            for (m in visible) {
+                val more = TextAction(this@MainActivity, "⋯") {
+                    showAccountMenu(
+                        m, isActive = false, canMove = canMove,
+                        moveUp = if (canMove) ({ moveAccountBy(m, -1, visibleUids) }) else null,
+                        moveDown = if (canMove) ({ moveAccountBy(m, +1, visibleUids) }) else null,
+                    )
+                }
+                val row = ListRow.account(
+                    this@MainActivity,
+                    avatarInitial(m.nickname.ifBlank { m.uid }),
+                    m.nickname.ifBlank { m.uid },
+                    switchableSubtitle(m),
+                    active = false,
+                    trailing = more,
+                ) { doSwitchAccount(m) }
+                row.tag = m.uid
+                row.setOnLongClickListener {
+                    showAccountMenu(
+                        m, isActive = false, canMove = canMove,
+                        moveUp = if (canMove) ({ moveAccountBy(m, -1, visibleUids) }) else null,
+                        moveDown = if (canMove) ({ moveAccountBy(m, +1, visibleUids) }) else null,
+                    )
+                    true
+                }
+                listHost.addView(row, LinearLayout.LayoutParams(-1, -2))
+            }
+            emptyHint.visibility = if (visible.isEmpty()) View.VISIBLE else View.GONE
+            chips.forEach { (k, c) -> c.setChecked(k == filter) }
+            sortBtn?.text = "排序：${mode.label}"
+            // 只有用户主动换筛选/排序才轻淡入；搜索逐字符调用的是 rebuild() 默认值 false，
+            // 否则每敲一个字整块列表都闪一下（这是"列表更新"与"输入过滤"的区别）。
+            if (animate) Motion.fadeState(listHost, 0.75f, 120L)
+        }
+
+        val sortAction = TextAction(this@MainActivity, "排序：${mode.label}") {
+            val dlg = AlertDialog.Builder(this@MainActivity)
+                .setTitle("排序方式")
+                .setItems(AccountSort.entries.map { it.label }.toTypedArray()) { _, i ->
+                    val picked = AccountSort.entries[i]
+                    saveSortMode(picked)
+                    mode = picked
+                    rebuild(animate = true)
+                }
+                .create()
+            trackDialog(dlg)
+            Motion.applyDialogMotion(dlg)
+            dlg.show()
+        }
+        sortBtn = sortAction
+
+        val toolbar = row(top = Tokens.SPACE_2) {
+            chips.forEach { (key, chip) ->
+                addView(chip, lp(-2, -2, end = 6))
+                chip.setOnClickListener { filter = key; rebuild(animate = true) }
+            }
+            addView(View(this@MainActivity), weighted())
+            addView(sortAction, lp(-2, -2))
+        }
+        // 「刷新积分」单独占一行：三个计数 chip + 「排序：最近使用」已经把这行占满，
+        // 再塞第四块会被压成 30px 宽（实测文字直接看不见）。换行比挤爆更清楚。
+        val refreshQuotaAll = TextAction(this@MainActivity, "刷新积分") { refreshAllQuotas() }
+        quotaBulkLabel = refreshQuotaAll
+        val refreshRow = row(top = 0) {
+            addView(View(this@MainActivity), weighted())
+            addView(refreshQuotaAll, lp(-2, -2))
+        }
+
+        edit.addTextChangedListener(object : android.text.TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+            override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+            override fun afterTextChanged(s: android.text.Editable?) = rebuild()
+        })
+
+        rebuild()
+        host.addView(toolbar)
+        host.addView(refreshRow)
+        host.addView(listCard)
+        host.addView(emptyHint)
+        return host
+    }
+
+    /** 通用条目菜单（AlertDialog 列表）。 */
+    private fun showItemMenu(title: String, items: List<Pair<String, () -> Unit>>) {
+        if (items.isEmpty()) return
+        val dlg = AlertDialog.Builder(this)
+            .setTitle(title)
+            .setItems(items.map { it.first }.toTypedArray()) { _, i -> items[i].second() }
+            .create()
+        trackDialog(dlg)
+        Motion.applyDialogMotion(dlg)
+        dlg.show()
+    }
+
+    /**
+     * 账号「⋯」菜单。当前账号与普通账号**能力一致**，区别只有：
+     * - 当前账号没有「切换到该账号」（已经是了）
+     * - 当前账号**永远**没有上移/下移（它不在可排序列表里）
+     */
+    private fun showAccountMenu(
+        m: TraeAuthStore.AccountMeta,
+        isActive: Boolean,
+        canMove: Boolean,
+        moveUp: (() -> Unit)?,
+        moveDown: (() -> Unit)?,
+    ) {
+        val items = mutableListOf<Pair<String, () -> Unit>>()
+        items += "查看详情" to { openAccountDetail(m.uid, animate = true) }
+        items += (if (m.pinned) "取消置顶" else "置顶") to { togglePinned(m) }
+        items += "重命名" to { renameAccountDialog(m) }
+        items += "单独签到" to { checkinSingle(m) }
+        if (canMove && !isActive) {
+            moveUp?.let { items += "上移一位" to it }
+            moveDown?.let { items += "下移一位" to it }
+        }
+        items += "删除" to { confirmRemoveAccount(m) }
+        showItemMenu(m.nickname.ifBlank { m.uid }, items)
+    }
+
+    /** 置顶/取消置顶（后台写 + 回来重建页面）。 */
+    private fun togglePinned(m: TraeAuthStore.AccountMeta) {
+        thread(name = "account-pin") {
+            val r = TraeAuthStore.setPinned(this@MainActivity, m.uid, !m.pinned)
+            runOnUiThread {
+                when (r) {
+                    TraeAuthStore.StoreResult.Success -> renderKeepingScroll(Page.ACCOUNT)
+                    TraeAuthStore.StoreResult.PersistenceLocked ->
+                        toast("存储异常，已暂停修改。请重启 App 后重试")
+                    else -> toast("置顶失败（${r.javaClass.simpleName}）")
+                }
+            }
+        }
+    }
+
+    /** 重命名账号（复用 updateMeta 同一套写事务）。 */
+    private fun renameAccountDialog(m: TraeAuthStore.AccountMeta) {
+        val input = EditText(this).apply {
+            setText(m.nickname)
+            hint = "账号名称"
+            isSingleLine = true
+            setTextColor(color("on_surface"))
+            setHintTextColor(color("on_surface_variant"))
+            background = shape("surface_container", Tokens.RADIUS_CONTROL)
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+        }
+        confirmDialog(
+            title = "重命名账号",
+            message = "只改本地显示名，不影响账号本身。",
+            content = input,
+            okText = "保存",
+        ) {
+            val name = input.text?.toString().orEmpty().trim()
+            if (name.isBlank()) { toast("名称不能为空"); return@confirmDialog }
+            thread(name = "account-rename") {
+                val r = TraeAuthStore.renameAccount(this@MainActivity, m.uid, name)
+                runOnUiThread {
+                    when (r) {
+                        TraeAuthStore.StoreResult.Success -> { toast("已重命名"); renderKeepingScroll(Page.ACCOUNT) }
+                        TraeAuthStore.StoreResult.PersistenceLocked ->
+                            toast("存储异常，已暂停修改。请重启 App 后重试")
+                        else -> toast("重命名失败")
+                    }
+                }
+            }
+        }
+    }
+
+    /** 在可见序列里上移/下移一位（底层交换，隐藏的当前账号不动）。 */
+    private fun moveAccountBy(
+        m: TraeAuthStore.AccountMeta,
+        delta: Int,
+        visibleUids: List<String>,
+    ) {
+        thread(name = "account-move") {
+            val r = TraeAuthStore.moveAccount(this@MainActivity, m.uid, delta, visibleUids)
+            runOnUiThread {
+                when (r) {
+                    TraeAuthStore.StoreResult.Success -> renderKeepingScroll(Page.ACCOUNT)
+                    TraeAuthStore.StoreResult.NoChange -> toast(if (delta < 0) "已经在最前面了" else "已经在最后面了")
+                    TraeAuthStore.StoreResult.PersistenceLocked ->
+                        toast("存储异常，已暂停修改。请重启 App 后重试")
+                    else -> toast("移动失败")
+                }
+            }
+        }
+    }
+
+    /** Token 剩余时间的短文案（列表行用；「14 天后到期」/「即将过期」）。 */
+    private fun tokenShortLabel(expiresAt: Long): String {
+        if (expiresAt <= 0L) return "到期未知"
+        val days = (expiresAt - System.currentTimeMillis() / 1000) / 86400
+        return when {
+            days >= 1 -> "${days}天后到期"
+            else -> "即将过期"
+        }
+    }
+
+    /**
+     * 「签到」卡（对齐设计稿 account.html「签到」区）：
+     * 图标行（N 个国服账号 · 今天已签 M 个）+ 主按钮 + 定时开关一行。
      *
      * 结果持久化在 [BatchCheckin]（跨进程存活），进账号页总是显示**上一次**批量的事实，
      * 不是当前内存态 —— 所以"今天签没签"的权威判据是每行的状态文案（ok/already），
      * 与单账号卡里的 accountCheckin 各自独立、互不污染。
      */
-    private fun batchCheckinCard(): View = card {
+    private fun batchCheckinCard(): View {
         val metas = TraeAuthStore.list(this@MainActivity)
         val supported = metas.count { it.region.isSupported }
         val skipped = metas.size - supported
-        val batchBtn = action(if (BatchCheckin.busy.get()) "签到中…" else "一键签到全部账号", full = true) {
-            runBatchCheckin()
-        }
-        if (metas.isEmpty()) {
-            addView(caption("还没有账号，先登录一个再说。"))
-        } else {
-            addView(caption(
-                "对全部 ${supported} 个国服账号逐个签到（不限于当前使用的那个）" +
-                    (if (skipped > 0) "；另有 $skipped 个国际服账号不支持签到，已跳过。" else "。")))
-            addView(batchBtn, top(10))
-            // 定时开关在卡片里只给入口级提示，完整设置在下面的定时卡
-            if (BatchCheckin.isEnabled(this@MainActivity) && BatchCheckin.lastRunToday(this@MainActivity)) {
-                addView(caption("今天已由定时/补签跑过一轮，重复点击也只会补漏（已签的账号自动跳过）。"), top(8))
-            }
+        val last = BatchCheckin.lastResults(this@MainActivity)
+        val doneToday = last?.results?.count { it.ok || it.status == "already" } ?: 0
+
+        val card = glassCard {}
+        card.addView(row {
+            addView(iconBadge("gift", "primary_container", "primary_on_soft"), lp(dp(30), dp(30)))
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                addView(text("今日签到", Tokens.TEXT_MD, false))
+                addView(captionText(when {
+                    metas.isEmpty() -> "还没有账号，先登录一个再说"
+                    supported == 0 -> "没有支持签到的国服账号"
+                    else -> "$supported 个国服账号 · 今天已签 $doneToday 个" +
+                        (if (supported > doneToday) "，${supported - doneToday} 个待签" else "")
+                }).let { it.setPadding(0, dp(2), 0, 0); it })
+            }, weighted(start = 10))
+            if (doneToday > 0) addView(chipOk("+${last?.results?.filter { it.ok }?.sumOf { it.credits.coerceAtLeast(0) } ?: 0}"),
+                lp(-2, -2, start = 8))
+        })
+        val batchBtn = glassButton(
+            if (BatchCheckin.busy.get()) "签到中…" else if (doneToday in 1 until supported) "补齐剩余账号" else "一键签到全部账号",
+            style = BtnStyle.PRIMARY,
+        ) { runBatchCheckin() }
+        card.addView(batchBtn, top(Tokens.SPACE_3))
+        // 国际服跳过说明（有国际服账号才出现，不占空间）
+        if (skipped > 0) {
+            card.addView(captionText("另有 $skipped 个国际服账号不支持签到，已自动跳过。"), top(6))
         }
         // 上轮结果行（无结果时不显示这块，不编造）
-        val last = BatchCheckin.lastResults(this@MainActivity)
         if (last != null && last.results.isNotEmpty()) {
-            addView(caption("上次批量（${last.date}${if (BatchCheckin.lastRunToday(this@MainActivity)) " · 今天" else ""}）："), top(12))
+            card.addView(captionText("上次批量（${last.date}${if (BatchCheckin.lastRunToday(this@MainActivity)) " · 今天" else ""}）："),
+                top(Tokens.SPACE_3))
             last.results.forEach { r ->
-                addView(row(6) {
-                    addView(text(r.nickname.ifBlank { r.uid }, FS_VALUE, true), weighted())
-                    addView(text(BatchCheckin.statusLabel(r), FS_CAPTION, false,
-                        if (r.ok || r.status == "already") "success" else "on_surface_variant"))
+                card.addView(row(top = 4) {
+                    addView(text(r.nickname.ifBlank { r.uid }, Tokens.TEXT_XS, true), weighted())
+                    addView(text(BatchCheckin.statusLabel(r), Tokens.TEXT_XS, false,
+                        if (r.ok || r.status == "already") "success" else "on_surface_variant"), lp(-2, -2))
                 })
             }
         }
-    }
-
-    /**
-     * 「每日定时签到」设置卡。**默认关闭**（用户要求：需要手动开启）。
-     *
-     * 开启即挂次日 HH:mm 的精确闹钟（独立 receiver，见 [CheckinReceiver]）；
-     * 到点没执行成（进程被杀/重启/ROM 拦截）的场景由进 App 补签兜底 ——
-     * 文案里说清这条，用户才知道"关机重开后会不会漏签"（不会，打开就补）。
-     */
-    private fun scheduleCard(): View = card {
-        val enabled = BatchCheckin.isEnabled(this@MainActivity)
-        val time = BatchCheckin.timeText(this@MainActivity)
-        // 开关用 TextView 自绘胶囊（项目无 androidx Switch；且这风格与其它胶囊一致）。
-        // 点击 = 翻转开关 + 挂/取消闹钟 + 重绘本卡（重建本页即可，状态都从 BatchCheckin 读）。
-        val toggle = TextView(this@MainActivity).apply {
-            gravity = Gravity.CENTER
-            text = if (enabled) "已开启" else "已关闭"
-            textSize = FS_VALUE.toFloat()
-            setTypeface(Typeface.DEFAULT, Typeface.BOLD)
-            background = shape(if (enabled) "success_container" else "surface_variant", RADIUS_PILL)
-            setTextColor(color(if (enabled) "success" else "on_surface_variant"))
-            setPadding(dp(16), dp(6), dp(16), dp(6))
-            minimumHeight = dp(32)
-            setOnClickListener {
-                if (BatchCheckin.isEnabled(this@MainActivity)) {
-                    BatchCheckin.disable(this@MainActivity)
-                    toast("定时签到已关闭")
-                } else {
-                    BatchCheckin.enable(this@MainActivity, BatchCheckin.timeText(this@MainActivity))
-                    toast("定时签到已开启：每天 ${BatchCheckin.timeText(this@MainActivity)}")
-                }
-                render(currentPage)
-            }
-        }
-        addView(row {
-            addView(text("定时自动签到", FS_VALUE, true), weighted())
-            addView(toggle, lp(-2, -2))
-        })
-        addView(caption(
-            "开启后每天 $time 自动为全部国服账号签到。\n" +
-            "到点若 App 没在后台（手机重启/被系统清理），下次打开本 App 时会自动补签。\n" +
-            "手机重启后闹钟需要重新挂：打开一次本 App 即可恢复。"), top(8))
-        // 用户明确要的一句说明：定时签到签的是**全部**账号，不存在"只签某一个"的隐忧
-        addView(caption("签到范围：App 里已登录的全部国服账号，逐个都签一遍，不会只签当前使用的那个；" +
-            "国际服账号不支持签到，会跳过。"), top(6))
-        // 时刻选择：仅开启时显示（关着改时刻没意义，开启时也存了值）
-        if (enabled) {
-            addView(row(8) {
-                addView(caption("触发时刻：$time"), weighted())
-                addView(linkAction("修改时刻") { promptPickTime() })
-            }, top(4))
-        }
+        // 定时开关一行（卡内分隔；完整设置在「账号设置」二级页）
+        val schedOn = BatchCheckin.isEnabled(this@MainActivity)
+        card.addView(topLineSection(14) {
+            addView(row(top = 0) {
+                addView(LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.VERTICAL
+                    addView(text("每日定时签到", Tokens.TEXT_MD, false))
+                    addView(captionText("每天 ${BatchCheckin.timeText(this@MainActivity)} · 覆盖全部国服账号")
+                        .let { it.setPadding(0, dp(2), 0, 0); it })
+                }, weighted())
+                addView(Switch(this@MainActivity, schedOn) {
+                    if (BatchCheckin.isEnabled(this@MainActivity)) {
+                        BatchCheckin.disable(this@MainActivity)
+                        toast("定时签到已关闭")
+                    } else {
+                        BatchCheckin.enable(this@MainActivity, BatchCheckin.timeText(this@MainActivity))
+                        toast("定时签到已开启：每天 ${BatchCheckin.timeText(this@MainActivity)}")
+                    }
+                    redraw()
+                }, lp(-2, -2))
+            })
+        }, top(Tokens.SPACE_3))
+        return card
     }
 
     /** 选定时时刻：TimePickerDialog（系统组件，风格差异可接受；本地时区）。 */
@@ -871,6 +1496,8 @@ class MainActivity : Activity() {
             toast("定时时刻已设为 $t")
             render(currentPage)
         }, cur.getOrElse(0) { 8 }, cur.getOrElse(1) { 0 }, true)
+        trackDialog(dlg)
+        Motion.applyDialogMotion(dlg)
         dlg.show()
     }
 
@@ -906,7 +1533,40 @@ class MainActivity : Activity() {
                     alreadyCount > 0 -> "全部账号今日已签到"
                     else -> "批量签到未生效，详见账号页结果"
                 })
-                if (currentPage == Page.ACCOUNT && !showKeepAlive && !showStyle) render(Page.ACCOUNT)
+                if (currentPage == Page.ACCOUNT && subPage == null) render(Page.ACCOUNT)
+            }
+        }
+    }
+
+    /**
+     * 账号详情页「单独签到」：对单个账号跑一次签到（复用 [BatchCheckin.runOne]）。
+     *
+     * 之前这里是个 toast 死胡同（"请到账号页操作"）——放了个不能用的按钮等于骗用户。
+     * 现在真执行：后台线程跑，结果 toast 报 ok/already/fail，并原地刷新详情页。
+     */
+    private fun checkinSingle(meta: TraeAuthStore.AccountMeta) {
+        if (!BatchCheckin.busy.compareAndSet(false, true)) { toast("签到正在进行中…"); return }
+        toast("正在签到 ${meta.nickname.ifBlank { meta.uid }}…")
+        thread(name = "checkin-single") {
+            val r = try {
+                BatchCheckin.runOne(this@MainActivity, meta.uid)
+            } catch (e: Exception) {
+                android.util.Log.w("MainActivity", "单账号签到异常: ${e.javaClass.simpleName}: ${e.message}")
+                null
+            } finally {
+                BatchCheckin.busy.set(false)
+            }
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                val rv = r ?: run { toast("签到异常，请重试"); return@runOnUiThread }
+                toast(when (rv.status) {
+                    "ok" -> "签到成功 +${rv.credits.coerceAtLeast(0)}"
+                    "already" -> "该账号今日已签到"
+                    "disabled" -> "该账号未开放签到"
+                    "unsupported" -> rv.message.ifBlank { "该区域不支持签到" }
+                    else -> rv.message.ifBlank { "签到失败" }
+                })
+                if (currentPage == Page.ACCOUNT) render(Page.ACCOUNT)
             }
         }
     }
@@ -940,35 +1600,32 @@ class MainActivity : Activity() {
         val st = accountCheckin
         val actionable = !checkinBusy && st != null && !st.checkedIn && st.enable
         val done = st?.checkedIn == true
-        btn.text = if (done) "\u2713 " + checkinActionLabel(loggedIn) else checkinActionLabel(loggedIn)
+        btn.text = checkinActionLabel(loggedIn)
         btn.isEnabled = actionable
         btn.alpha = 1f
         // 三态三种外观，**用颜色和尺寸一起表达语义**，而不是只靠一个 alpha：
         //   可签  = 主色实心按钮（能点，最醒目）
         //   已签  = 缩成 success 小胶囊（是**状态**不是操作，占位小、颜色是"已完成"）
         //   其它  = 浅底灰字（加载中/未登录/未开放，弱化）
-        //
-        // 原先三种状态都是主色实心、只靠 alpha 0.5 区分，于是**不可点的「今日已签到」
-        // 比旁边可点的「刷新」还抢眼**（主次颠倒）。已签还额外占着 48dp 高、5 个字的宽度，
-        // 一个纯状态坨在那里像块砖。
         btn.background = when {
-            actionable -> shape("primary", RADIUS_CONTROL)
-            done -> shape("success_container", RADIUS_PILL)
-            else -> shape("surface_variant", RADIUS_PILL)
+            actionable -> shape("primary", Tokens.RADIUS_PILL)
+            done -> shape("success_container", Tokens.RADIUS_PILL)
+            else -> shape("surface_container", Tokens.RADIUS_PILL)
         }
         btn.setTextColor(color(when {
             actionable -> "on_primary"
             done -> "success"
             else -> "on_surface_variant"
         }))
-        // 已签收成一枚小 chip（32dp 高、12sp 粗体）；可签/其它仍是 48dp 主按钮尺寸。
-        // 32dp 只用于**不可点**的状态展示 —— 可点时必须 ≥48dp 满足无障碍触控目标下限。
-        val h = if (done) 32 else 48
+        // 已签收成一枚小 chip（32dp 高、11sp 粗体）；可签/其它仍是 44dp 主按钮尺寸。
+        // 32dp 只用于**不可点**的状态展示 —— 可点时必须 ≥44dp 满足无障碍触控目标下限。
+        val h = if (done) 32 else 44
         val pad = if (done) 14 else 18
         btn.minimumHeight = dp(h)
         btn.setPadding(dp(pad), 0, dp(pad), 0)
-        btn.textSize = (if (done) FS_CHIP else FS_BODY).toFloat()
+        btn.textSize = (if (done) Tokens.TEXT_XS else Tokens.TEXT_MD)
         btn.setTypeface(Typeface.DEFAULT, if (done) Typeface.BOLD else Typeface.NORMAL)
+        btn.includeFontPadding = false
     }
 
     /**
@@ -1011,61 +1668,69 @@ class MainActivity : Activity() {
     }
 
     // ------------------------------------------------------------------
-    // 模型
+    // 模型（对齐设计稿 models.html：搜索 + 工具条 + 一张卡里的行式列表）
     // ------------------------------------------------------------------
 
     private fun modelsPage(): View = scroll {
         // 走同一个 scroll{} 容器：原先这里自己抄了一遍内边距，改 scroll 时会漏掉它
-        val edit = searchInput("搜索模型…")
-        addView(edit, lp(-1, -2))
+        val edit = searchInput("搜索模型名或 ID…")
+        addView(edit, lp(-1, -2, top = 2))
 
-        // 刷新按钮 + 计数。计数是"刷新真的起作用了"的证据 —— 否则点了没新增时用户会以为没生效。
-        val countView = caption("")
+        // 工具条：刷新按钮 + 计数。计数是"刷新真的起作用了"的证据 —— 否则点了没新增时用户会以为没生效。
+        val countView = captionText("")
         fun refreshCountLabel() {
-            countView.text = "已加载 · ${ModelsRepo.current().length()} 个模型"
+            countView.text = "已加载 ${ModelsRepo.current().length()} 个"
         }
-        val refreshBtn = action(REFRESH_MODELS_LABEL) { refreshModels() }
+        val refreshBtn = glassButton(REFRESH_MODELS_LABEL, style = BtnStyle.GHOST, compact = true) { refreshModels() }
+        // 空态卡里那枚刷新按钮：与工具条那枚必须同步禁用/改文案 ——
+        // 业务守卫（modelsLoading）本来就会挡住重复请求，但只有工具条那枚会变灰，
+        // 空态这枚点了没任何变化，用户会以为没点动。
+        val emptyRefreshBtn = glassButton(REFRESH_MODELS_LABEL, style = BtnStyle.PRIMARY) { refreshModels() }
         // 刷新中：按钮置灰 + 文案变「刷新中…」（照抄记录页/积分刷新那套，别新造轮子）
         fun refreshButtonLabel() {
             refreshBtn.isEnabled = !modelsLoading
             refreshBtn.text = if (modelsLoading) "刷新中…" else REFRESH_MODELS_LABEL
+            emptyRefreshBtn.isEnabled = !modelsLoading
+            emptyRefreshBtn.text = if (modelsLoading) "刷新中…" else REFRESH_MODELS_LABEL
+            emptyRefreshBtn.alpha = if (modelsLoading) 0.5f else 1f
         }
         // 工具条（计数 + 按钮）：只在"已加载"时显示 —— 空状态下列表还没有，
         // 顶上摆一个计数「已加载 · 0 个模型」纯属添乱，刷新按钮统一放到空状态卡里。
-        val toolbar = row(top = GAP) {
-            addView(refreshBtn)
-            addView(countView, weighted(start = GAP))
+        val toolbar = row(top = Tokens.SPACE_3) {
+            addView(refreshBtn, lp(-2, -2))
+            addView(countView, weighted(start = Tokens.SPACE_3))
         }
         addView(toolbar)
 
         // 未加载：整页只有一张说明卡 + 刷新按钮（用户要的"空状态"，见 CHANGELOG 0.4.3）
-        val notLoaded = card {
-            addView(text("模型目录尚未加载", FS_CARD_TITLE, true))
-            addView(caption("连接账号后点击「$REFRESH_MODELS_LABEL」，将从上游加载真实可用模型。"), top(8))
-            addView(action(REFRESH_MODELS_LABEL, full = true) { refreshModels() }, top(12))
+        val notLoaded = glassCard(GlassCard.Tone.SOFT, topMargin = Tokens.SPACE_3) {
+            addView(text("模型目录尚未加载", Tokens.TEXT_MD, true))
+            addView(captionText("连接账号后点「$REFRESH_MODELS_LABEL」，将从上游加载真实可用模型。"), top(8))
+            addView(emptyRefreshBtn, top(Tokens.SPACE_3))
         }
         addView(notLoaded)
 
         // 搜不到时的空态。没有它，用户打错一个字就是**整页空白**，会以为 App 坏了。
-        val empty = card(tone = CardTone.SOFT) {
-            addView(caption("没有匹配的模型。换个关键词，或清空搜索框看看全部。"))
+        val empty = glassCard(GlassCard.Tone.SOFT, topMargin = Tokens.SPACE_3) {
+            addView(captionText("没有匹配的模型。换个关键词，或清空搜索框看看全部。"))
         }.apply { visibility = View.GONE }
         addView(empty)
 
         // 卡片容器：刷新时**只清空并重塞它的子项**，不动搜索框/按钮/空态（原地更新，滚动位置不丢）
-        val cardHost = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }
-        addView(cardHost)
+        val listCard = glassCard(GlassCard.Tone.NORMAL, topMargin = Tokens.SPACE_3, padH = 0, padV = 0) {}
+            .apply { visibility = View.GONE }
+        addView(listCard)
 
         // 过滤逻辑收成一个函数：刷新重塞后也要重跑一次，否则过滤会作用在已失效的旧 View 上
-        var cards = HashMap<String, View>()
+        var rows = ArrayList<Pair<String, View>>()
         fun applyFilter() {
             val f = edit.text.toString().trim()
-            cards.forEach { (key, v) -> v.visibility = if (f.isBlank() || key.contains(f, true)) View.VISIBLE else View.GONE }
-            empty.visibility = if (f.isNotBlank() && cards.values.none { it.visibility == View.VISIBLE }) View.VISIBLE else View.GONE
+            rows.forEach { (key, v) -> v.visibility = if (f.isBlank() || key.contains(f, true)) View.VISIBLE else View.GONE }
+            empty.visibility = if (f.isNotBlank() && rows.none { it.second.visibility == View.VISIBLE }) View.VISIBLE else View.GONE
         }
-        fun rebuildCards() {
-            cardHost.removeAllViews()
-            cards = buildModelCards(cardHost)
+        fun rebuildRows() {
+            listCard.removeAllViews()
+            rows = buildModelRows(listCard)
             applyFilter()
         }
         /** 未加载时藏起搜索框/工具条/列表，只留说明卡；加载后反过来。 */
@@ -1074,7 +1739,7 @@ class MainActivity : Activity() {
             notLoaded.visibility = if (loaded) View.GONE else View.VISIBLE
             edit.visibility = if (loaded) View.VISIBLE else View.GONE
             toolbar.visibility = if (loaded) View.VISIBLE else View.GONE
-            cardHost.visibility = if (loaded) View.VISIBLE else View.GONE
+            listCard.visibility = if (loaded) View.VISIBLE else View.GONE
             if (!loaded) empty.visibility = View.GONE
         }
 
@@ -1086,132 +1751,313 @@ class MainActivity : Activity() {
         })
 
         // 刷新回调交给 build 完之后的代码用：本页重建后句柄要跟着换，不能留旧的
+        modelsListPulse = { Motion.fadeState(listCard, 0.72f, 140L) }
         modelsRefreshApply = {
-            rebuildCards()
+            rebuildRows()
             refreshCountLabel()
             refreshButtonLabel()
             applyLoadedState()
+            // 按钮与计数是原地改文字的：改完轻淡入一次，让人看见"它真的响应了"
+            Motion.fadeState(refreshBtn)
+            Motion.fadeState(countView)
         }
-        rebuildCards()
+        rebuildRows()
         refreshCountLabel()
         refreshButtonLabel()
         applyLoadedState()
+
+        addView(captionText("点「$REFRESH_MODELS_LABEL」从上游重拉完整模型表")
+            .apply { gravity = Gravity.CENTER; setPadding(0, dp(20), 0, dp(90)); layoutParams = lp(-1, -2, top = 0) })
     }
 
-    /** 用当前内存模型表构建卡片；返回 (匹配词→View) 供过滤。 */
-    private fun buildModelCards(container: LinearLayout): HashMap<String, View> {
-        val cards = HashMap<String, View>()
+    /** 用当前内存模型表构建行式列表（一张卡装完，行间 1px 分隔线）；返回 (匹配词→View) 供过滤。 */
+    private fun buildModelRows(container: LinearLayout): ArrayList<Pair<String, View>> {
+        val rows = ArrayList<Pair<String, View>>()
         val arr = ModelsRepo.current()
         for (i in 0 until arr.length()) {
             val m = arr.optJSONObject(i) ?: continue
-            val id = m.optString("id", "")
-            val c = modelCard(m)
-            cards[id] = c
-            container.addView(c, top(GAP))
+            val id = m.optString("id", "").ifBlank { m.optString("config_name", "") }
+            val name = m.optString("name", "").ifBlank { id }
+            val ctx = m.optInt("context_length", 0)
+            val rate = if (m.has("rate")) m.optDouble("rate") else null
+            // 副标题只留「id · 上下文」，不再拼「思考/多模态」——那些塞进去会把一行挤爆
+            // （ellipsize 截断成 …），能力详情放到点开后的展开卡里。
+            val sub = "$id · ${if (ctx > 0) "${ctx / 1000}K" else "?"}"
+            val row = ListRow.model(this@MainActivity, name,
+                sub, rate = rate, onClick = { toggleModelDetail(container, m) }, onCopy = { copyModelId(id) })
+            // 行 tag 存模型 id，供 toggleModelDetail 定位（详情卡另存 tag_region）
+            row.tag = id
+            // 匹配词 = 名称 + id（搜索命中任一即显示）
+            rows.add("$name $id" to row)
+            container.addView(row, LinearLayout.LayoutParams(-1, -2))
         }
-        return cards
+        return rows
     }
 
-    private fun modelCard(m: org.json.JSONObject): View = card {
+    /**
+     * 点模型行 → 在它下面插入一张详情卡（倍率/原价/折扣/上下文/多模态/思考），再点收起。
+     *
+     * 详情卡挂在行的 [View.getTag] 上（tag 存的是详情卡 View），点第二次把它移除并清 tag。
+     * 展开/收起都用 `animate()` 做高度 + 透明度过渡，不做生硬的 add/remove 跳变。
+     *
+     * 字段全部来自 [ModelsRepo] 里 [TraeUpstream.parseModels] 落好的条目，不重新解析上游。
+     */
+    private fun toggleModelDetail(container: LinearLayout, m: JSONObject) {
         val id = m.optString("id", "").ifBlank { m.optString("config_name", "") }
-        val name = m.optString("name", "").ifBlank { id }
-        addView(text(name, FS_CARD_TITLE, true))
-        addView(row(4) {
-            addView(mono(id, FS_CHIP, colorName = "on_surface_variant").apply {
-                maxLines = 1
-                ellipsize = android.text.TextUtils.TruncateAt.END
-            }, weighted())
-            addView(linkAction("复制") { copyModelId(id) })
-        })
-        addView(caption("context ${m.optInt("context_length", 0)} · trae-solo"), top(4))
+        // 找到这个模型对应的行（container 的直接子视图里，用 tag 存 id 定位）
+        val row = (0 until container.childCount)
+            .mapNotNull { container.getChildAt(it) as? ListRow }
+            .firstOrNull { it.tag == id }
+            ?: return
+        val existing = row.getTag(R.id.tag_region) as? View
+        if (existing != null) {
+            // 详情卡还挂着：按它当前的目标态决定这次是"反向展开"还是"收起"。
+            // isSelected 存的就是目标态（true=该展开）。这样快速连点不会出现
+            // "旧卡在淡出、新卡已插入"的两张卡叠在一起。
+            val opening = !existing.isSelected
+            existing.isSelected = opening
+            if (opening) {
+                Motion.reveal(existing, show = true, durationMs = 180L, offsetYPx = -dp(4).toFloat())
+            } else {
+                Motion.reveal(existing, show = false, durationMs = 120L, offsetYPx = -dp(4).toFloat()) {
+                    // 结束回调必须核对身份：期间用户可能已经又点开了一张新的
+                    if (!existing.isSelected && row.getTag(R.id.tag_region) === existing) {
+                        container.removeView(existing)
+                        row.setTag(R.id.tag_region, null)
+                    }
+                }
+            }
+            return
+        }
+        // 展开：构建详情卡，插入到行下方，再淡入 + 从上方 4dp 落位。
+        // 刻意**不做高度动画**：详情卡高由 WRAP_CONTENT 决定，逐帧改高度会让整页 layout
+        // 抖一下（列表在 ScrollView 里），只做透明度 + 短位移看起来更安静。
+        val detail = buildModelDetailCard(m)
+        detail.isSelected = true
+        val idx = container.indexOfChild(row) + 1
+        container.addView(detail, idx, LinearLayout.LayoutParams(-1, -2))
+        row.setTag(R.id.tag_region, detail)
+        Motion.reveal(detail, show = true, durationMs = 180L, offsetYPx = -dp(4).toFloat())
     }
+
+    /** 模型详情卡：倍率（含原价/折扣）、上下文、多模态、思考。字段缺失的行不显示。 */
+    private fun buildModelDetailCard(m: JSONObject): View {
+        val ctx = this@MainActivity
+        return glassCard(GlassCard.Tone.SOFT, topMargin = 0, padH = Tokens.CARD_PAD, padV = Tokens.CARD_PAD) {
+            // 倍率行
+            val rate = if (m.has("rate")) m.optDouble("rate") else -1.0
+            if (rate >= 0.0) {
+                addView(labelValue("倍率", "${formatRate(rate)}×"))
+                val orig = if (m.has("original_rate")) m.optDouble("original_rate") else -1.0
+                val disc = if (m.has("discount")) m.optInt("discount") else -1
+                if (orig > 0 && disc > 0) {
+                    // discount 是百分比（50 = 50%），折数 = discount / 10（50 → 5 折）
+                    addView(captionText("原价 ${formatRate(orig)}× · 补贴 ${disc / 10} 折").let {
+                        it.setPadding(0, dp(2), 0, 0); it
+                    })
+                }
+            }
+            // 上下文
+            val c = m.optInt("context_length", 0)
+            if (c > 0) addView(labelValue("上下文", "${c / 1000}K"))
+            // 多模态 / 思考（能力，只有 true 才显示）
+            if (m.optBoolean("multimodal", false)) addView(labelValue("多模态", "支持"))
+            if (m.optBoolean("thinking", false)) addView(labelValue("思考", "支持"))
+        }
+    }
+
+    /** 倍率数字格式化：`0.06` / `0.2` / `1.83`（整数不带小数点）。 */
+    private fun formatRate(r: Double): String =
+        if (r == r.toLong().toDouble()) r.toLong().toString() else r.toString()
 
     private fun copyModelId(id: String) = copyToClipboard("modelId", id, "已复制模型 ID: $id")
 
     // ------------------------------------------------------------------
-    // 记录
+    // 记录（对齐设计稿 records.html：汇总卡（数字行 + 条形）+ 一张卡的流水行）
     // ------------------------------------------------------------------
 
     private fun recordsPage(): View = scroll {
         val records = UsageStore.all(this@MainActivity)
         if (records.isEmpty()) {
-            addView(section("消耗汇总"))
-            addView(card(tone = CardTone.SOFT) { addView(caption("暂无记录 —— 发一次聊天请求后这里会显示用量与汇总")) })
+            addView(glassCard(GlassCard.Tone.SOFT, topMargin = 2) {
+                addView(captionText("还没有调用记录。"))
+                addView(captionText("发一次聊天请求后，这里会显示用量与汇总。").let { it.setPadding(0, dp(4), 0, 0); it })
+            })
+            addView(View(this@MainActivity), lp(-1, dp(84)))
             return@scroll
         }
-        addView(card {
-            addView(text("模型消耗汇总", FS_CARD_TITLE, true))
+        // ---- 今日概览 + 汇总合一张卡（设计稿 records.html 首卡）----
+        addView(glassCard(topMargin = 2) {
+            val totalTokens = records.sumOf { it.total.toLong() }
+            val okCount = records.count { it.ok }
+            val rate = if (records.isEmpty()) "—" else "${okCount * 100 / records.size}%"
+            addView(row {
+                // 三组数字：今日 tokens（大）/ 调用 / 成功率
+                addView(statColumn(formatTokens(totalTokens), "今日 tokens", Tokens.TEXT_2XL), weighted())
+                addView(statColumn("${records.size}", "调用", Tokens.TEXT_MD), weighted())
+                addView(statColumn(rate, "成功率", Tokens.TEXT_MD), weighted())
+            })
+            // 分模型条形（按相对最大那组画，模型一多每条都剩一小截反而看不出差别）
             val groups = UsageStore.aggregate(this@MainActivity)
-            // 条形按**相对最大的那组**画（不是占总量）：模型一多的话每条都只剩一小截，反而看不出差别
-            val max = groups.maxOfOrNull { it.total } ?: 0L
-            for (g in groups) {
-                addView(row(8) {
-                    addView(text(g.model.ifBlank { "?" }, FS_VALUE, true), weighted())
-                    addView(mono("总 ${g.total} · 输出 ${g.output}", FS_CAPTION, colorName = "on_surface_variant"))
-                }, top(12))
-                addView(shareBar(g.total, max), top(6))
+            if (groups.isNotEmpty()) {
+                addView(topLineSection(14) {
+                    val max = groups.maxOfOrNull { it.total } ?: 0L
+                    groups.take(4).forEachIndexed { i, g ->
+                        addView(row(top = if (i > 0) 12 else 0) {
+                            addView(text(g.model.ifBlank { "?" }, Tokens.TEXT_MD), weighted())
+                            addView(mono("${formatTokens(g.total)} · 出 ${formatTokens(g.output)}",
+                                Tokens.TEXT_XS, colorName = "on_surface_variant"), lp(-2, -2, start = 8))
+                        })
+                        addView(shareBar(g.total, max, i), top(6))
+                    }
+                }, top(16))
             }
         })
-        addView(section("调用记录（最近 ${records.size} 条）"))
-        for (r in records.asReversed()) addView(recordCard(r))
+
+        // ---- 流水：一行一条，一张卡装完 ----
+        addView(sectionRow("调用记录", 0))
+        val listCard = glassCard(topMargin = 0, padH = 0, padV = 0) {}
+        // 取最近 30 条（旧记录继续留在磁盘上，不给 UI 装太多行）
+        records.asReversed().take(30).forEachIndexed { i, r ->
+            val detail = buildString {
+                append("${r.prompt} · ${r.completion} · ${r.durationMs}ms")
+                if (r.errorType.isNotBlank()) append(" · ${r.errorType}")
+            }
+            val row = ListRow.record(this@MainActivity, r.ok, r.model.ifBlank { "?" }, detail,
+                SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(r.ts)))
+            row.showDivider(i > 0)
+            listCard.addView(row, LinearLayout.LayoutParams(-1, -2))
+        }
+        addView(listCard)
+        addView(captionText("仅保留最近 ${UsageStore.all(this@MainActivity).size} 条 · 清空不影响账号")
+            .apply { gravity = Gravity.CENTER; setPadding(0, dp(16), 0, dp(90)); layoutParams = lp(-1, -2, top = 0) })
     }
 
-    private fun recordCard(r: UsageStore.UsageRecord): View = card {
-        addView(row {
-            addView(if (r.ok) statusChip("OK", "success", true) else statusChip("ERR", "error", false))
-            addView(text(r.model.ifBlank { "?" }, FS_VALUE), weighted(start = 10))
-            // 时间戳用等宽字体，一列扫下来是对齐的
-            addView(mono(SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(r.ts)), FS_CHIP,
-                colorName = "on_surface_variant"))
-        })
-        val detail = StringBuilder()
-            .append("in ${r.prompt} · out ${r.completion} · 总 ${r.total} · ${r.durationMs}ms")
-        if (r.errorType.isNotBlank()) detail.append(" · ").append(r.errorType)
-        addView(caption(detail.toString()), top(6))
+    /** 一列统计数字（数值 + 标签），对齐设计稿 records.html 的三列。 */
+    private fun statColumn(value: String, label: String, size: Float): LinearLayout =
+        LinearLayout(this@MainActivity).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(text(value, size, true).apply { includeFontPadding = false })
+            addView(captionText(label).let { it.setPadding(0, dp(2), 0, 0); it })
+        }
+
+    /** token 数的人话格式：184.2K / 3.4M / 812。 */
+    private fun formatTokens(n: Long): String = when {
+        n >= 1_000_000 -> "%.1fM".format(n / 1_000_000.0)
+        n >= 1_000 -> "%.1fK".format(n / 1_000.0)
+        else -> "$n"
     }
 
+    /** 千分位（积分用）：2480 → 2,480。 */
+    private fun formatNumber(n: Long): String = java.text.DecimalFormat("#,###").format(n)
+
     // ------------------------------------------------------------------
-    // 更多
+    // 更多（对齐设计稿 more.html：外观分段 + 保活 + 关于 + 维护）
     // ------------------------------------------------------------------
+
+    /** 切亮暗：持久化 → 重建（重建会重新走 attachBaseContext 覆写 uiMode）。 */
+    private fun switchMode(m: AppStyle.Mode) {
+        if (m.id == AppStyle.mode.id) return
+        AppStyle.setMode(this, m)
+        // 悬浮窗是独立 window，recreate 不会重建它 —— 不主动刷就留一块旧主题的卡片。
+        runCatching { FloatingTag.refresh() }
+        recreate()
+    }
 
     private fun morePage(): View = scroll {
-        // 外观入口放在最上面：这是"改长相"的地方，也顺带告诉用户当前在用什么风格。
-        addView(section("外观"))
-        addView(card {
+        // ---- 外观：只保留深浅（多风格机制已删）----
+        addView(sectionRow("外观", 0))
+        addView(glassCard(topMargin = 0) {
             addView(row {
-                addView(text("外观风格", FS_CARD_TITLE, true), weighted())
-                addView(chipInfo(AppStyle.current.label))
+                addView(iconBadge("moon", "primary_container", "primary"), lp(dp(30), dp(30)))
+                addView(text("深浅模式", Tokens.TEXT_MD, true), weighted(start = 10))
             })
-            addView(caption("当前：${AppStyle.current.label} · ${AppStyle.mode.label}。" +
-                "可切换多套配色与形态，亮/暗可单独设置。"), top(8))
-            addView(action("打开外观风格", full = true) { openStylePage() }, top(12))
+            addView(SegmentedControl(this@MainActivity,
+                AppStyle.Mode.entries.map { it.label },
+                onPick = { i -> switchMode(AppStyle.Mode.entries[i]) }
+            ).apply { setSelected(AppStyle.Mode.entries.indexOf(AppStyle.mode)) }, top(Tokens.SPACE_3))
+            addView(captionText("切换立即生效并记住选择，重开 App 仍是这一套。"), top(8))
         })
-        addView(section("关于"))
-        addView(card(tone = CardTone.SOFT) {
-            addView(text("应用说明", FS_CARD_TITLE, true))
-            addView(caption("本应用针对 Trae 当前协议的个人学习自用适配，不保证长期兼容，不代表官方支持。"), top(8))
-            addView(labelValue("版本", versionName), top(12))
-        })
-        addView(card(tone = CardTone.SOFT) {
-            addView(text("版权与免责声明", FS_CARD_TITLE, true))
-            addView(caption("仅供个人学习与研究使用。使用本项目与 Trae 账号存在风险，请自行评估并遵守相关服务条款。"), top(8))
-            // 与概览页同一份常量 + 同一个 [copyrightLine]，两处排版一致
-            addView(divider(), top(14))
-            addView(copyrightLine(AUTHOR_LABEL, AUTHOR_NAME), top(12))
-            addView(copyrightLine(CONTACT_LABEL, AUTHOR_EMAIL, monoValue = true,
-                onCopy = { copyEmail() }), top(6))
-        })
-        addView(section("保活"))
-        addView(card {
+
+        // ---- 保活 ----
+        addView(sectionRow("保活", 0))
+        addView(glassCard(topMargin = 0) {
+            val pending = KeepAlive.check(this@MainActivity).count { it.needsAction }
             addView(row {
-                addView(text("后台保活设置", FS_CARD_TITLE, true), weighted())
-                val pending = KeepAlive.check(this@MainActivity).count { it.needsAction }
-                addView(if (pending == 0) chipOk("已就绪") else chipWarn("$pending 项待开启"))
+                addView(iconBadge("shield", "warning_container", "warning"), lp(dp(30), dp(30)))
+                addView(LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.VERTICAL
+                    addView(text("后台保活设置", Tokens.TEXT_MD, false))
+                    addView(captionText(if (pending == 0) "全部就绪，服务可长期存活"
+                        else "还有 $pending 项需要开启").let { it.setPadding(0, dp(2), 0, 0); it })
+                }, weighted(start = 10))
+                addView(if (pending == 0) chipOk("已就绪") else chipWarn("待处理"), lp(-2, -2, start = 8))
             })
-            addView(caption("让网关在息屏、被系统回收后仍能存活。国产 ROM 会强杀前台服务，" +
-                "需要在系统里放开几项权限。"), top(8))
-            addView(action("打开保活设置", full = true) { openKeepAlive() }, top(12))
+            addView(captionText("国产 ROM 会强杀前台服务，需要在系统里放开几项权限才能长期存活。"), top(8))
+            // 更多页只是入口：实心主按钮留在保活设置页内（unslop 审计 P7）
+            addView(ghostBtn("打开保活设置", full = true) { openKeepAlive(animate = true) }, top(Tokens.SPACE_3))
         })
+
+        // ---- 关于 ----
+        addView(sectionRow("关于", 0))
+        addView(glassCard(GlassCard.Tone.SOFT, topMargin = 0) {
+            addView(text("应用说明", Tokens.TEXT_MD, true))
+            addView(captionText("本应用针对 Trae 当前协议的个人学习自用适配，不保证长期兼容，不代表官方支持。"), top(6))
+            addView(labelValue("版本", versionName), top(Tokens.SPACE_3))
+        })
+        addView(glassCard(GlassCard.Tone.SOFT, topMargin = Tokens.CARD_GAP) {
+            addView(text("版权与免责声明", Tokens.TEXT_MD, true))
+            addView(captionText("仅供个人学习与研究使用。使用本项目与 Trae 账号存在风险，请自行评估并遵守相关服务条款。"), top(6))
+            addView(topLineSection(12) {
+                addView(labelValue(AUTHOR_LABEL, AUTHOR_NAME))
+                addView(labelValue(CONTACT_LABEL, AUTHOR_EMAIL, monoValue = true).apply {
+                    setOnClickListener { copyEmail() }
+                }, top(6))
+            }, top(14))
+        })
+
+        // ---- 维护 ----
+        addView(sectionRow("维护", 0))
+        addView(glassCard(topMargin = 0, padH = 0, padV = 0) {
+            addView(subPageRow("清空调用记录", "不影响账号与模型缓存", icon = "trash") {
+                confirmDialog(
+                    title = "清空调用记录",
+                    message = "将删除全部调用用量记录（不影响账号与模型缓存）。",
+                    okText = "清空",
+                    danger = true,
+                ) {
+                    UsageStore.clear(this@MainActivity)
+                    toast("已清空调用记录")
+                    redraw()
+                }
+            })
+            addView(subPageRow("查看服务日志", "最近的请求与错误", icon = "info") { showServiceLog() })
+        })
+        addView(View(this@MainActivity), lp(-1, dp(84)))
+    }
+
+    /** 服务日志查看（logcat 里本进程最近的相关行）。最新在最上面，可一键复制带走。 */
+    private fun showServiceLog() {
+        val lines = runCatching {
+            val proc = Runtime.getRuntime().exec(arrayOf("logcat", "-d", "-t", "200"))
+            proc.inputStream.bufferedReader().readLines()
+                .filter { it.contains("LocalFakeServer") || it.contains("Gateway") || it.contains("TraeUpstream") }
+                .takeLast(60)
+                .reversed()   // logcat 是时间正序；排障要看的是「刚刚发生了什么」，放顶上
+        }.getOrDefault(listOf("（读不到系统日志）"))
+        val scroller = ScrollView(this).apply {
+            addView(mono(lines.joinToString("\n"), Tokens.TEXT_XS, colorName = "on_surface_variant")
+                .apply { setPadding(dp(12), dp(12), dp(12), dp(12)) })
+        }
+        val body = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(scroller, LinearLayout.LayoutParams(-1, dp(340)))
+            addView(ghostBtn("复制全部日志") {
+                copyToClipboard("serviceLog", lines.joinToString("\n"), "日志已复制")
+            }, lp(-2, -2, top = 10))
+        }
+        confirmDialog(title = "服务日志", message = "共 ${lines.size} 行 · 最新在上", okText = "关闭",
+            cancelText = null, content = body) {}
     }
 
     // ------------------------------------------------------------------
@@ -1231,13 +2077,14 @@ class MainActivity : Activity() {
         val rom = KeepAlive.rom()
 
         // 顶部总状态（首卡不留上间距，紧跟页面顶部）
-        addView(card(topMargin = 0) {
+        addView(glassCard(topMargin = 2) {
             addView(row {
                 addView(text(if (pending.isEmpty()) "保活已就绪" else "还有 ${pending.size} 项待开启",
-                    FS_CARD_TITLE, true), weighted())
-                addView(if (pending.isEmpty()) chipOk("✓ 全部正常") else chipWarn("⚠ 需要处理"))
+                    Tokens.TEXT_MD, true), weighted())
+                addView(if (pending.isEmpty()) chipOk("全部正常") else chipWarn("需要处理"),
+                    lp(-2, -2, start = 8))
             })
-            addView(caption(if (pending.isEmpty())
+            addView(captionText(if (pending.isEmpty())
                 "网关已能在后台长期运行，切到别的 App、息屏都不会断。"
             else
                 "下面标 ⚠ 的项会让服务在真机上被系统清掉，建议逐项开启。"), top(8))
@@ -1245,53 +2092,66 @@ class MainActivity : Activity() {
 
         // 一键配置
         val autoCount = pending.count { it.autoOpenable }
-        addView(card {
-            addView(text("一键配置", FS_CARD_TITLE, true))
-            addView(caption(if (autoCount == 0)
+        addView(glassCard {
+            addView(text("一键配置", Tokens.TEXT_MD, true))
+            addView(captionText(if (autoCount == 0)
                 "能自动跳转的项都已就绪。"
             else
                 "有 $autoCount 项可以自动打开系统页面，你点「允许」即可。"), top(8))
-            addView(action("开始自动配置${if (autoCount > 0) "（$autoCount 项）" else ""}",
-                full = true) { runAutoConfig() }, top(12))
+            // 全就绪时不再挂一个"开始自动配置"的大按钮 —— 那会让人以为还有事没做。
+            if (autoCount > 0) {
+                addView(glassButton("开始自动配置（$autoCount 项）", style = BtnStyle.PRIMARY) {
+                    runAutoConfig()
+                }, top(Tokens.SPACE_3))
+            } else {
+                addView(glassButton("重新检查", style = BtnStyle.GHOST) { openKeepAlive() }, top(Tokens.SPACE_3))
+            }
         })
 
         // 逐项清单
-        addView(section("逐项检查"))
-        addView(card {
+        addView(sectionRow("逐项检查", 0))
+        addView(glassCard(topMargin = 0, padH = 0, padV = 0) {
             items.forEachIndexed { i, it ->
-                if (i > 0) addView(divider(), top(12))
+                if (i > 0) addView(rowDivider())
                 // 三态：✓ 已就绪 / ⚠ 需处理 / — 查不到。
                 // 「查不到」既不能打勾（编造事实），也不能打⚠（会永远挂在待办上，见 Item.detectable）。
                 val glyph = if (!it.detectable) "—" else if (it.ok) "✓" else "⚠"
                 val tone = if (!it.detectable) "on_surface_variant" else if (it.ok) "success" else "warning"
-                addView(row(top = if (i > 0) 12 else 0) {
-                    addView(text(glyph, FS_BODY, true, tone), lp(-2, -2, end = 8))
-                    addView(text(it.title, FS_VALUE, true), weighted())
-                    when {
-                        !it.detectable -> addView(chipInfo("无法检测"))
-                        it.needsAction -> addView(if (it.autoOpenable) chipInfo("可一键") else chipWarn("需手动"))
+                addView(LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.VERTICAL
+                    setPadding(dp(Tokens.CARD_PAD), dp(12), dp(Tokens.CARD_PAD), dp(12))
+                    addView(row {
+                        addView(text(glyph, Tokens.TEXT_MD, true, tone), lp(-2, -2, end = 10))
+                        addView(text(it.title, Tokens.TEXT_MD, true), weighted())
+                        when {
+                            !it.detectable -> addView(chipMute("无法检测"), lp(-2, -2, start = 8))
+                            it.needsAction -> addView(
+                                if (it.autoOpenable) chipMute("可一键") else chipWarn("需手动"),
+                                lp(-2, -2, start = 8))
+                        }
+                    })
+                    addView(captionText(it.why), top(4))
+                    if (it.needsAction && it.autoOpenable) {
+                        addView(ghostBtn("去开启") { openAutoItem(it) }, top(8))
                     }
                 })
-                addView(caption(it.why), top(4))
-                if (it.needsAction && it.autoOpenable) {
-                    addView(action("去开启", outlined = true) { openAutoItem(it) }, top(8))
-                }
             }
         })
 
         // 厂商私有路径（系统查不到、跳不了）
-        addView(section("本机需要手动确认的项"))
-        addView(card {
-            addView(text("检测到：${rom.label}", FS_CARD_TITLE, true))
-            addView(caption("以下页面系统不开放跳转，需要你按路径自己找一下。"), top(6))
+        addView(sectionRow("本机需要手动确认的项", 0))
+        addView(glassCard(topMargin = 0) {
+            addView(text("检测到：${rom.label}", Tokens.TEXT_MD, true))
+            addView(captionText("以下页面系统不开放跳转，需要你按路径自己找一下。"), top(6))
             KeepAlive.romGuide(rom).forEach { line ->
-                addView(caption("• $line"), top(6))
+                addView(captionText("• $line"), top(6))
             }
-            addView(action("复制这些路径", outlined = true) {
+            addView(ghostBtn("复制这些路径") {
                 copyToClipboard("keepAliveGuide", KeepAlive.romGuide(rom).joinToString("\n"),
                     "路径已复制，可到系统设置里照着找")
-            }, top(12))
+            }, top(Tokens.SPACE_3))
         })
+        addView(View(this@MainActivity), lp(-1, dp(84)))
     }
 
     /** 「一键配置」：按顺序跳到**第一个**未就绪且可自动打开的项。 */
@@ -1318,119 +2178,183 @@ class MainActivity : Activity() {
         // 界面若已销毁就不要再重建视图树（用户此时在系统设置页，回来也不会看这个实例）。
         contentHost.postDelayed({
             if (isFinishing || isDestroyed) return@postDelayed
-            if (showKeepAlive) openKeepAlive()
+            // 走 redraw()（不播入场）：这是"从系统设置页回来重读一遍"，不是导航到新页；
+            // 旧版写 openKeepAlive()，会把用户正在看的保活页重建并整页淡入一次。
+            if (subPage == SUB_KEEP_ALIVE) redraw()
         }, 800)
     }
 
     // ------------------------------------------------------------------
-    // 外观风格（二级页）
+    // 账号二级页（对齐设计稿 account-detail.html / account-more.html）
     // ------------------------------------------------------------------
 
-    /**
-     * 「外观风格」页：风格 + 亮暗两组，全部用**当前风格实时渲染**（选中项主色描边 + ✓）。
-     *
-     * 点一下即持久化并重建生效 —— 颜色/圆角/间距散在几十个控件上（还有 chip、矢量图标
-     * tint、间距），逐个回刷既长又容易漏；重建则一定是完整、正确的一套。
-     */
-    private fun stylePage(): View = scroll {
-        addView(section("风格"))
-        AppStyle.STYLES.forEach { s -> addView(styleOption(s), top(GAP)) }
-
-        addView(section("亮暗模式"))
-        addView(card {
-            AppStyle.Mode.entries.forEachIndexed { i, m ->
-                if (i > 0) addView(divider(), top(12))
-                addView(modeOption(m), top(if (i > 0) 12 else 0))
-            }
+    /** 账号详情：KV 表 + 切换/签到/删除 + 最近调用（设计稿 account-detail.html）。 */
+    private fun accountDetailPage(meta: TraeAuthStore.AccountMeta): View = scroll {
+        val isActive = meta.uid == TraeAuthStore.activeUid(this@MainActivity)
+        val balance = CreditMonitor.balanceOf(meta.uid)
+        val checkinLabel = when {
+            isActive && accountCheckin?.checkedIn == true -> "今日已签"
+            isActive && accountCheckin != null && !accountCheckin!!.enable -> "未开放"
+            else -> "—"
+        }
+        addView(glassCard(topMargin = 2) {
+            addView(labelValue("UID", meta.uid, monoValue = true), top(0))
+            addView(labelValue("区域", "${regionLabel(meta.region)}（${meta.region.id.uppercase()}）"), top(6))
+            addView(labelValue("积分", (balance?.let { formatNumber(it) } ?: "—") +
+                (if (checkinLabel != "—" && balance != null) " · $checkinLabel +100" else "")), top(6))
+            addView(labelValue("Token", tokenRenewLabel(meta.expiresAt), colorValue =
+                if (meta.expiresAt > 0 && tokenRenewLabel(meta.expiresAt) == "有效") "success" else null), top(6))
+            addView(labelValue("到期", formatExp(meta.expiresAt), monoValue = true), top(6))
+            addView(labelValue("存储", "AndroidKeyStore 加密"), top(6))
         })
-        addView(caption("切换后立即生效，并会记住你的选择；重开 App 仍是这套。"), top(12))
-    }
 
-    /** 风格卡：左侧色样 + 名称说明，选中项 = 主色 2dp 描边 + ✓ 标记。 */
-    private fun styleOption(s: AppStyle.Style): LinearLayout {
-        val selected = s.id == AppStyle.current.id
-        return LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(CARD_PAD), dp(14), dp(CARD_PAD), dp(14))
-            // 选中用主色加粗描边：不靠颜色单独传达（色盲也能从描边粗细 + ✓ 分辨）
-            background = shape("surface", RADIUS_CARD,
-                if (selected) "primary" else "outline_variant", if (selected) 2 else 1)
-            elevation = dp(AppStyle.current.elevation + (if (selected) 1 else 0)).toFloat()
-            addView(styleSwatch(s), lp(dp(48), dp(48)))
-            addView(LinearLayout(this@MainActivity).apply {
-                orientation = LinearLayout.VERTICAL
-                addView(text(s.label, FS_CARD_TITLE, true, if (selected) "primary" else "on_surface"))
-                addView(caption(s.note), top(3))
-            }, weighted(start = 14))
-            if (selected) addView(chipInfo("✓ 使用中"), lp(-2, -2, start = 10))
-            minimumHeight = dp(56)   // 触控目标 ≥ 48dp
-            setOnClickListener { switchStyle(s) }
-        }
-    }
+        addView(glassButton(
+            if (isActive) "当前使用中" else "切换到此账号",
+            style = BtnStyle.PRIMARY, enabled = !isActive,
+        ) { switchAccount(meta) })
 
-    /**
-     * 色样：用**该风格自己**的主色与圆角画一个小方块，内部一条 on_primary 短胶囊。
-     * 不这么做的话，没被选中的风格只能靠文字去猜它长什么样。
-     */
-    private fun styleSwatch(s: AppStyle.Style): View = FrameLayout(this).apply {
-        val dark = AppStyle.isNight
-        background = GradientDrawable().apply {
-            shape = GradientDrawable.RECTANGLE
-            setColor(AppStyle.previewColor(s, "primary", dark))
-            // 圆角上限 = 方块边长的一半（24dp）：让"方正"与"大圆角"在色样上就分得出来
-            cornerRadius = dp(minOf(s.cardRadius, 24f)).toFloat()
-            setStroke(dp(1), AppStyle.previewColor(s, "outline_variant", dark))
-        }
-        addView(View(this@MainActivity).apply {
-            background = GradientDrawable().apply {
-                shape = GradientDrawable.RECTANGLE
-                setColor(AppStyle.previewColor(s, "on_primary", dark))
-                cornerRadius = dp(minOf(s.controlRadius, 8f)).toFloat()
+        addView(row(top = Tokens.SPACE_2) {
+            addView(ghostBtn("单独签到", full = true) { checkinSingle(meta) },
+                LinearLayout.LayoutParams(0, -2, 1f))
+            addView(View(this@MainActivity), lp(dp(8), 1))
+            addView(ghostBtn("删除", full = true, danger = true) { confirmRemoveAccount(meta) },
+                LinearLayout.LayoutParams(0, -2, 1f))
+        })
+
+        // 最近调用：只显示这个账号的（UsageStore 记录带 uid；升级前旧记录无归属，不塞给任何账号）
+        addView(sectionRow("最近调用", 0))
+        val recent = UsageStore.recentFor(this@MainActivity, meta.uid, 5)
+        val recentCard = glassCard(topMargin = 0, padH = 0, padV = 0) {}
+        if (recent.isEmpty()) {
+            val pad = dp(Tokens.CARD_PAD)
+            recentCard.addView(captionText(
+                if (UsageStore.hasLegacyRecords(this@MainActivity))
+                    "这个账号还没有调用记录。升级前的旧记录没有账号归属，不会显示在这里。"
+                else "这个账号还没有调用记录。"
+            ).apply { setPadding(pad, pad, pad, pad) })
+        } else {
+            recent.forEachIndexed { i, r ->
+                val row = ListRow.record(this@MainActivity, r.ok, r.model,
+                    "${r.prompt} · ${r.completion} · ${r.durationMs}ms",
+                    SimpleDateFormat("MM-dd HH:mm", Locale.getDefault()).format(Date(r.ts)))
+                row.showDivider(i > 0)
+                recentCard.addView(row, LinearLayout.LayoutParams(-1, -2))
             }
-        }, FrameLayout.LayoutParams(dp(24), dp(7), Gravity.CENTER))
+        }
+        addView(recentCard)
+        addView(View(this@MainActivity), lp(-1, dp(84)))
     }
 
-    /** 亮暗模式选项：整行可点（高 ≥ 52dp），右侧圆形单选标记。 */
-    private fun modeOption(m: AppStyle.Mode): LinearLayout {
-        val selected = m.id == AppStyle.mode.id
-        return LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            minimumHeight = dp(52)
+    /** 账号设置：添加账号、自动换号、备份、定时签到（设计稿 account-more.html）。 */
+    private fun accountMorePage(): View = scroll {
+        // ---- 添加账号 ----
+        addView(sectionRow("添加账号", 0))
+        addView(glassCard(topMargin = 0) {
+            addView(captionText(
+                "1. 复制对应区域的登录链接\n" +
+                "2. 在浏览器打开并完成登录\n" +
+                "3. 登录后页面打不开，这是正常的（地址栏停在下面这个地址）\n" +
+                "4. 复制整条链接，回到 App 粘贴"))
+            addView(mono("127.0.0.1:18080", Tokens.TEXT_XS).apply {
+                setPadding(dp(8), dp(4), dp(8), dp(4))
+                background = shape("surface_container", Tokens.RADIUS_SMALL)
+            }, top(Tokens.SPACE_1))
+            addView(ghostBtn("复制国服登录链接", full = true) { copyLoginUrl(TraeRegion.CN) }, top(Tokens.SPACE_3))
+            addView(ghostBtn("复制国际服登录链接", full = true) {
+                toast(TraeRegion.SG.unsupportedNote)
+                copyLoginUrl(TraeRegion.SG)
+            }, top(Tokens.SPACE_2))
+            addView(captionText("国际服链路尚未开发，登录后不会生效。", "warning"), top(Tokens.SPACE_2))
+            addView(glassButton("粘贴回调链接完成登录", style = BtnStyle.PRIMARY) { promptPasteCallback() },
+                top(Tokens.SPACE_3))
+        })
+
+        // ---- 积分监测 · 自动换号 ----
+        addView(sectionRow("积分监测 · 自动换号", 0))
+        addView(glassCard(topMargin = 0) {
+            val autoOn = CreditMonitor.isAutoSwitchEnabled(this@MainActivity)
+            addView(toggleRow("自动换号", "余额低于阈值时切到余额最多的国服账号", autoOn) {
+                val next = !CreditMonitor.isAutoSwitchEnabled(this@MainActivity)
+                CreditMonitor.setAutoSwitchEnabled(this@MainActivity, next)
+                toast(if (next) "自动换号已开启" else "自动换号已关闭")
+                redraw()
+            })
+            addView(topLineSection(4) {
+                addView(row {
+                    addView(LinearLayout(this@MainActivity).apply {
+                        orientation = LinearLayout.VERTICAL
+                        addView(text("触发阈值", Tokens.TEXT_MD, false))
+                        addView(captionText("当前 ${CreditMonitor.threshold(this@MainActivity)} 积分")
+                            .let { it.setPadding(0, dp(2), 0, 0); it })
+                    }, weighted())
+                    addView(TextAction(this@MainActivity, "修改") { promptThreshold { redraw() } }, lp(-2, -2))
+                })
+            }, top(Tokens.SPACE_2))
+            addView(captionText(monitorStatusText()).also { statusView ->
+                // 监测器每 30 秒回调一次，只改这一行文字（重建页面会把滚动位置弹回去）
+                monitorApply = { statusView.text = monitorStatusText(); Motion.fadeState(statusView) }
+            }.let { it.setPadding(0, dp(10), 0, 0); it })
+        })
+
+        // ---- 备份 ----
+        addView(sectionRow("备份", 0))
+        addView(glassCard(topMargin = 0) {
+            addView(captionText(
+                "导出内容含明文 access / refresh token，等于账号钥匙 —— 只在本机与自己的设备之间传。" +
+                    "同一份文件别在多台设备同时用：refresh token 是轮换的，后来的会让先前的失效。"))
+            addView(row(top = Tokens.SPACE_3) {
+                addView(ghostBtn("导出为文件", full = true) { promptExportAccounts() },
+                    LinearLayout.LayoutParams(0, -2, 1f))
+                addView(View(this@MainActivity), lp(dp(8), 1))
+                addView(ghostBtn("从文件导入", full = true) { importFromFile() },
+                    LinearLayout.LayoutParams(0, -2, 1f))
+            })
+        })
+
+        // ---- 签到时间 ----
+        addView(sectionRow("签到时间", 0))
+        addView(glassCard(topMargin = 0) {
+            val schedOn = BatchCheckin.isEnabled(this@MainActivity)
+            val time = BatchCheckin.timeText(this@MainActivity)
+            addView(toggleRow("每日定时签到", "每天 $time · 全部国服账号", schedOn) {
+                if (BatchCheckin.isEnabled(this@MainActivity)) {
+                    BatchCheckin.disable(this@MainActivity)
+                    toast("定时签到已关闭")
+                } else {
+                    BatchCheckin.enable(this@MainActivity, BatchCheckin.timeText(this@MainActivity))
+                    toast("定时签到已开启：每天 ${BatchCheckin.timeText(this@MainActivity)}")
+                }
+                redraw()
+            })
+            if (schedOn) {
+                addView(topLineSection(4) {
+                    addView(row {
+                        addView(LinearLayout(this@MainActivity).apply {
+                            orientation = LinearLayout.VERTICAL
+                            addView(text("触发时刻", Tokens.TEXT_MD, false))
+                            addView(captionText(time).let { it.setPadding(0, dp(2), 0, 0); it })
+                        }, weighted())
+                        addView(TextAction(this@MainActivity, "修改") { promptPickTime() }, lp(-2, -2))
+                    })
+                }, top(Tokens.SPACE_2))
+            }
+            addView(captionText(
+                "到点若 App 没在后台（重启 / 被系统清理），下次打开会自动补签；手机重启后需打开一次 App 恢复闹钟。"),
+                top(Tokens.SPACE_2))
+        })
+        addView(View(this@MainActivity), lp(-1, dp(84)))
+    }
+
+    /** 「标题 + 副标题 + 右侧开关」一行（账号设置页）。 */
+    private fun toggleRow(title: String, sub: String, on: Boolean, onToggle: () -> Unit): LinearLayout =
+        row {
             addView(LinearLayout(this@MainActivity).apply {
                 orientation = LinearLayout.VERTICAL
-                addView(text(m.label, FS_BODY, true, if (selected) "primary" else "on_surface"))
-                addView(caption(m.note), top(3))
+                addView(text(title, Tokens.TEXT_MD, false))
+                addView(captionText(sub).let { it.setPadding(0, dp(2), 0, 0); it })
             }, weighted())
-            addView(radioDot(selected), lp(dp(22), dp(22), start = 12))
-            setOnClickListener { switchMode(m) }
+            addView(Switch(this@MainActivity, on) { onToggle() }, lp(-2, -2))
         }
-    }
-
-    /** 单选圆点：选中 = 主色实心 + 内圈 on_primary 小点；未选中 = 描边空心。 */
-    private fun radioDot(selected: Boolean): View = FrameLayout(this).apply {
-        background = if (selected) shape("primary", RADIUS_PILL) else shape("surface", RADIUS_PILL, "outline")
-        if (selected) addView(View(this@MainActivity).apply {
-            background = shape("on_primary", RADIUS_PILL)
-        }, FrameLayout.LayoutParams(dp(8), dp(8), Gravity.CENTER))
-    }
-
-    /** 切风格：持久化 → 提示 → 重建。 */
-    private fun switchStyle(s: AppStyle.Style) {
-        if (s.id == AppStyle.current.id) return
-        AppStyle.setStyle(this, s.id)
-        toast("已切换为「${s.label}」")
-        recreate()
-    }
-
-    /** 切亮暗：持久化 → 提示 → 重建（重建会重新走 attachBaseContext 覆写 uiMode）。 */
-    private fun switchMode(m: AppStyle.Mode) {
-        if (m.id == AppStyle.mode.id) return
-        AppStyle.setMode(this, m)
-        toast("亮暗模式：${m.label}")
-        recreate()
-    }
 
     // ------------------------------------------------------------------
     // 底层数据 / 生命周期（保持原逻辑）
@@ -1450,6 +2374,13 @@ class MainActivity : Activity() {
         currentPage = Page.ACCOUNT
         render(Page.ACCOUNT)
         copyLoginUrl(region)
+        // 顺手把系统浏览器拉起来：「立即登录」与下方的「复制国服登录链接」本来是同一个动作
+        // （只复制），用户点完还得自己去桌面找浏览器。这里多做一步，两个入口才有区别。
+        if (!region.canLogin) return
+        val opened = runCatching {
+            startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(TraeAuthApi.buildLoginUrl())))
+        }.isSuccess
+        if (!opened) toast("本机没找到浏览器，链接已复制，请手动打开")
     }
 
     // ------------------------------------------------------------------
@@ -1484,16 +2415,16 @@ class MainActivity : Activity() {
         var dialog: AlertDialog? = null
         val panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(CARD_PAD), dp(CARD_PAD), dp(CARD_PAD), dp(CARD_PAD))
-            addView(text(title, FS_CARD_TITLE, true))
-            addView(text(message, FS_VALUE, false, "on_surface_variant"), top(8))
+            setPadding(dp(Tokens.CARD_PAD), dp(Tokens.CARD_PAD), dp(Tokens.CARD_PAD), dp(Tokens.CARD_PAD))
+            addView(text(title, Tokens.TEXT_MD, true))
+            addView(text(message, Tokens.TEXT_XS, false, "on_surface_variant"), top(8))
             content?.let { addView(it, top(14)) }
             addView(row(8) {
                 if (cancelText != null) {
-                    addView(action(cancelText, outlined = true) { dialog?.dismiss() }, weighted())
+                    addView(ghostBtn(cancelText) { dialog?.dismiss() }, weighted())
                 }
-                addView(action(okText, danger = danger) {
-                    if (okGuard?.invoke() == false) return@action
+                addView(glassButton(okText, if (danger) BtnStyle.DANGER else BtnStyle.PRIMARY, full = false) {
+                    if (okGuard?.invoke() == false) return@glassButton
                     dialog?.dismiss()
                     onOk()
                 }, weighted(start = if (cancelText != null) 8 else 0))
@@ -1501,9 +2432,27 @@ class MainActivity : Activity() {
         }
         val dlg = AlertDialog.Builder(this).setView(panel).create()
         dialog = dlg
+        trackDialog(dlg)
         // 窗口底换成当前风格的 surface + 统一圆角，替掉平台那层灰底
-        dlg.setOnShowListener { dlg.window?.setBackgroundDrawable(shape("surface", RADIUS_CARD)) }
+        dlg.setOnShowListener { dlg.window?.setBackgroundDrawable(shape("surface", Tokens.RADIUS_CARD)) }
+        // 统一进出动画（style: DialogMotion → dialog_enter/dialog_exit）。
+        // 必须在 show() 之前设：窗口动画是窗口被 add 的那一刻取的。
+        Motion.applyDialogMotion(dlg)
         dlg.show()
+        return dlg
+    }
+
+    /**
+     * 活着的应用内弹窗（onDestroy 要关掉）。
+     *
+     * 不收集的话，Activity 被销毁时这些窗口还挂在 WindowManager 上：既泄漏，又会在
+     * 下一次进来时留下一个"没主的"灰框（真机观感：屏幕中间一块半透明）。
+     */
+    private val liveDialogs = mutableListOf<android.app.Dialog>()
+
+    private fun <T : android.app.Dialog> trackDialog(dlg: T): T {
+        liveDialogs += dlg
+        dlg.setOnDismissListener { liveDialogs.remove(dlg) }
         return dlg
     }
 
@@ -1522,8 +2471,8 @@ class MainActivity : Activity() {
      * 切到指定账号：改 active uid，并把**区域切成该账号自己的区域**（转发才会打对 host），
      * 然后重新载入 token（必要时续期）并重绘。
      */
-    private fun switchAccount(uid: String) {
-        val meta = TraeAuthStore.list(this).firstOrNull { it.uid == uid } ?: return
+    private fun switchAccount(meta: TraeAuthStore.AccountMeta) {
+        val uid = meta.uid
         // 切到**未开发区域**的账号会让转发走进半残链路（无多轮/无外部工具），先确认。
         if (!meta.region.isSupported) {
             confirmDialog(
@@ -1539,18 +2488,42 @@ class MainActivity : Activity() {
     }
 
     /** 真正的切号动作（[switchAccount] 确认后调用）。 */
+    /**
+     * 执行切换（**后台线程**：`switchTo` 内含一次同步 commit，不能落主线程）。
+     *
+     * 切换成功的判定点是 `switchTo` 返回 Success —— 本地 active 已写入。
+     * 之后的 `loadAndRefreshToken` 是异步续期，成功与否都不改变"已切换"这个事实。
+     */
     private fun doSwitchAccount(meta: TraeAuthStore.AccountMeta) {
-        TraeAuthStore.setActive(this, meta.uid)
-        // 区域以账号为准并持久化（复用同一处逻辑，别在这里再抄一遍）
-        TraeAuthStore.syncRegionToActiveAccount(this)
-        // 切号 = 换了身份：上一个账号的积分/签到状态必须作废，
-        // 否则新账号会继承"今日已签到"（这是误报的另一个入口）
-        invalidateAccountQuota()
-        Toast.makeText(this, "已切换到 ${meta.nickname.ifBlank { meta.uid }}", Toast.LENGTH_SHORT).show()
-        loadAndRefreshToken()
+        thread(name = "account-switch") {
+            val r = TraeAuthStore.switchTo(this, meta.uid)
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                when (r) {
+                    TraeAuthStore.StoreResult.Success -> {
+                        // 区域以账号为准（锁内校验 active 一致才写，旧线程不会覆盖新账号）
+                        TraeAuthStore.publishRegionIfActive(this, meta.uid, meta.region)
+                        // 切号 = 换了身份：上一个账号的积分/签到状态作废
+                        invalidateAccountQuota()
+                        toast("已切换到 ${meta.nickname.ifBlank { meta.uid }}")
+                        loadAndRefreshToken()
+                        render(Page.ACCOUNT)
+                    }
+                    TraeAuthStore.StoreResult.NotFound -> {
+                        toast("账号已不存在，列表已刷新")
+                        render(Page.ACCOUNT)
+                    }
+                    TraeAuthStore.StoreResult.PersistenceLocked ->
+                        toast("存储异常，已暂停修改。请重启 App 后重试")
+                    TraeAuthStore.StoreResult.PersistFailed ->
+                        toast("保存失败，切换可能未写入；请重试")
+                    else -> toast("切换失败")
+                }
+            }
+        }
     }
 
-    /** 删除账号（二次确认）：连密文一起删，避免残留凭据。 */
+    /** 删除账号（二次确认）：连密文一起删，避免残留凭据。**后台线程**执行写事务。 */
     private fun confirmRemoveAccount(meta: TraeAuthStore.AccountMeta) {
         confirmDialog(
             title = "删除账号",
@@ -1559,11 +2532,31 @@ class MainActivity : Activity() {
             okText = "删除",
             danger = true,
         ) {
-            TraeAuthStore.remove(this, meta.uid)
-            // 删掉的若是当前账号，缓存必须作废（下一个激活账号会不一样）
-            invalidateAccountQuota()
-            toast("已删除")
-            render(currentPage)
+            thread(name = "account-remove") {
+                val r = TraeAuthStore.remove(this, meta.uid)
+                runOnUiThread {
+                    if (isFinishing || isDestroyed) return@runOnUiThread
+                    when (r) {
+                        TraeAuthStore.StoreResult.Success -> {
+                            // 删掉的若是当前账号，缓存必须作废（下一个激活账号不一样）
+                            invalidateAccountQuota()
+                            // active 已回退 → 区域要跟上，否则会用已删账号的区
+                            TraeAuthStore.syncRegionToActiveAccount(this)
+                            toast("已删除")
+                            render(currentPage)
+                        }
+                        TraeAuthStore.StoreResult.NotFound -> {
+                            toast("账号已不存在，列表已刷新")
+                            render(currentPage)
+                        }
+                        TraeAuthStore.StoreResult.PersistenceLocked ->
+                            toast("存储异常，已暂停修改。请重启 App 后重试")
+                        TraeAuthStore.StoreResult.PersistFailed ->
+                            toast("删除失败（存储空间不足？），凭据可能未清理")
+                        else -> toast("删除失败")
+                    }
+                }
+            }
         }
     }
 
@@ -1587,10 +2580,10 @@ class MainActivity : Activity() {
             setTextColor(color("on_surface"))
             setHintTextColor(color("on_surface_variant"))
             // 跟全站的输入框同一套外观，别用平台那根下划线
-            background = shape("surface_container", RADIUS_CONTROL)
+            background = shape("surface_container", Tokens.RADIUS_CONTROL)
             setPadding(dp(14), dp(12), dp(14), dp(12))
         }
-        confirmDialog(
+        val dlg = confirmDialog(
             title = "粘贴回调链接",
             message = "用系统浏览器打开登录链接登录后，把地址栏里那串 " +
                 "http://127.0.0.1:18080/authorize?... 完整粘进来。",
@@ -1615,6 +2608,9 @@ class MainActivity : Activity() {
                 }
             }
         }
+        // 这个弹窗存在的唯一目的就是"粘一串东西"，让用户先点一下输入框才能粘贴是多余的一步。
+        edit.requestFocus()
+        dlg.window?.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE)
     }
 
     private fun copyApiKey() = copyToClipboard("apiKey", apiKey, "已复制 API Key", sensitive = true)
@@ -1662,22 +2658,6 @@ class MainActivity : Activity() {
 
     private fun copyServerUrl() =
         copyToClipboard("serverUrl", "http://127.0.0.1:${LocalFakeServer.PORT}/v1", "已复制本机服务地址")
-
-    /**
-     * 版权信息行：`标签 | 值`，标签列与「版本」等 labelValue 统一走 `minWidth 96dp`，
-     * 所以「作者 / 联系邮箱」两行的值**左边界严格对齐** —— 这正是"两行字"和
-     * "一张排版工整的小表"的区别。邮箱用等宽体：字母数字对齐、`@` 与 `.` 不会被
-     * 比例字体挤在一起，读串的概率低一截。
-     */
-    private fun copyrightLine(label: String, value: String, monoValue: Boolean = false, onCopy: (() -> Unit)? = null): View =
-        labelValue(label, value, monoValue) { v -> onCopy?.let { v.setOnClickListener { it() } } }
-
-    /** 概览页底部的版权卡：整页最后一个元素，用 SOFT 退到背景层，不与业务卡抢注意力。
-     *  详情小表只在「更多」页排（copyrightLine），这里一行 caption 带过，信息不重复。 */
-    private fun copyrightCard(): View = card(tone = CardTone.SOFT) {
-        addView(text("版权信息", FS_CARD_TITLE, true))
-        addView(caption("$AUTHOR_LABEL：$AUTHOR_NAME · $CONTACT_LABEL：$AUTHOR_EMAIL"), top(8))
-    }
 
     /** 邮箱复制：手打 11 位数字容易错，点一下拿完整的比让用户自己抄靠谱。 */
     private fun copyEmail() = copyToClipboard("authorEmail", AUTHOR_EMAIL, "已复制邮箱 $AUTHOR_EMAIL")
@@ -1743,7 +2723,7 @@ class MainActivity : Activity() {
             invalidateAccountQuota()
             toast("积分低于阈值，已自动切到 ${sw.toNick}（余 ${sw.toBalance}）")
             // 账号页要整页重绘：昵称 / UID / 区域都变了，改一行文字覆盖不了
-            if (currentPage == Page.ACCOUNT && !showKeepAlive && !showStyle) redraw()
+            if (currentPage == Page.ACCOUNT && subPage == null) redraw()
             return
         }
         monitorApply?.invoke()
@@ -1758,7 +2738,7 @@ class MainActivity : Activity() {
             setSelection(text.length)
             setTextColor(color("on_surface"))
             setHintTextColor(color("on_surface_variant"))
-            background = shape("surface_container", RADIUS_CONTROL)
+            background = shape("surface_container", Tokens.RADIUS_CONTROL)
             setPadding(dp(14), dp(12), dp(14), dp(12))
         }
         confirmDialog(
@@ -2022,6 +3002,75 @@ class MainActivity : Activity() {
     }
 
     /**
+     * 账号列表「刷新积分」：把**所有可查余额的国服账号**各刷一次。
+     *
+     * 三条硬约束（照 [BatchCheckin.checkinOne] 与 CreditMonitor 的锁纪律）：
+     *  - 只在这一处读一次 `TraeAuthStore.list`（短锁），**绝不持 Gateway.locked 做网络**；
+     *  - token 一律走 `TraeAuthApi.validTokenForUid`（锁内续期、不切 active、不读全局区域）；
+     *  - 查余额显式传 `meta.region`，不看 `TraeRegion.current`（全局随时可能被别的账号改掉）。
+     *
+     * 失败保留旧值：拿不到就什么都不写，列表继续显示上次的数（配「多久之前」）。
+     */
+    private fun refreshAllQuotas() {
+        if (!quotaBulkBusy.compareAndSet(false, true)) {
+            toast("正在刷新积分，请稍候")
+            return
+        }
+        // 批量签到全程在打上游，这时候再插一批余额查询只会互相等
+        if (BatchCheckin.busy.get()) {
+            quotaBulkBusy.set(false)
+            toast("签到进行中，稍后再试")
+            return
+        }
+        quotaBulkLabel?.text = "刷新中…"
+        thread(name = "quota-bulk") {
+            val metas = Gateway.locked { TraeAuthStore.list(this@MainActivity) }
+            val targets = metas.filter { it.region.isSupported && it.region.canQueryQuota }
+            runOnUiThread {
+                if (!isFinishing && !isDestroyed) quotaBulkLabel?.text = "刷新中 0/${targets.size}"
+            }
+            var ok = 0
+            var activeValue: Long? = null
+            val activeUid = runCatching { TraeAuthStore.activeUid(this@MainActivity) }.getOrNull()
+            for ((i, meta) in targets.withIndex()) {
+                // 逐个之间歇一下：连续 5 次上游往返太快容易撞设备维度风控（9074 那类）
+                if (i > 0) runCatching { Thread.sleep(400) }
+                try {
+                    val token = TraeAuthApi.validTokenForUid(this@MainActivity, meta.uid, 3600)
+                    if (!token.isNullOrBlank()) {
+                        val v = TraeUpstream.fetchUsage(token, meta.uid, meta.region)
+                        if (v != null) {
+                            CreditMonitor.storeReading(this@MainActivity, meta.uid, v)
+                            ok++
+                            if (meta.uid == activeUid) activeValue = v
+                        }
+                    }
+                } catch (t: Throwable) {
+                    // 一个账号失败不拖垮整批：续期/网络都可能抛，继续下一个
+                    android.util.Log.w("MainActivity", "刷新积分失败 ${meta.uid}: ${t.javaClass.simpleName}: ${t.message}")
+                }
+                val done = i + 1
+                runOnUiThread {
+                    if (!isFinishing && !isDestroyed) quotaBulkLabel?.text = "刷新中 $done/${targets.size}"
+                }
+            }
+            runOnUiThread {
+                quotaBulkBusy.set(false)
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                quotaBulkLabel?.text = "刷新积分"
+                // 当前账号刷新成功时顺带更新顶上那张「当前可用积分」卡（原地，不重建页面）
+                activeValue?.let {
+                    accountBalance = it
+                    quotaApply?.invoke()
+                }
+                toast("已更新 $ok 个账号")
+                // 列表副标题是整页一部分：重建时保持滚动位置，别把人弹回页首
+                if (currentPage == Page.ACCOUNT && subPage == null) renderKeepingScroll(Page.ACCOUNT)
+            }
+        }
+    }
+
+    /**
      * 拉积分/额度（后台线程，用解密后的真实 token 打 ug 接口），成功后原地更新控件。
      *
      * [quiet] = **自动拉取**（进账号页时触发）：不弹 toast、未登录也不提示。
@@ -2204,6 +3253,8 @@ class MainActivity : Activity() {
                     if (!quiet) toast(if (after > before) "已更新：$before → $after 个模型" else "已是最新（$after 个模型）")
                 }
                 modelsRefreshApply?.invoke()
+                // 只有真拉到表才让列表淡入一次；失败时按钮已经恢复，列表不该跟着闪
+                if (arr != null) modelsListPulse?.invoke()
             }
         }
     }
@@ -2304,8 +3355,14 @@ class MainActivity : Activity() {
     private fun loadAndRefreshToken() {
         thread(name = "trae-load-token") {
             // 与 credProvider **共用同一把锁**（Gateway.locked）：refresh 是轮换的，并发会互相作废。
-            Gateway.locked {
-                TraeAuthApi.restartWithValidToken(this, skewSec = SIXTY_MINUTES_SEC)
+            // ⚠️ token 失效（ExchangeToken 401）是常态而非异常：未捕获的 IOException 会崩掉
+            // 整个进程 —— 必须兜住，失败时 UI 走「未加载/未登录」展示，用户重新登录即可。
+            runCatching {
+                Gateway.locked {
+                    TraeAuthApi.restartWithValidToken(this, skewSec = SIXTY_MINUTES_SEC)
+                }
+            }.onFailure { e ->
+                android.util.Log.w("MainActivity", "token 刷新失败: ${e.javaClass.simpleName}: ${e.message}")
             }
             runOnUiThread { redraw() }
         }
@@ -2324,6 +3381,31 @@ class MainActivity : Activity() {
         quotaLoading = false
         modelsLoading = false
         checkinBusy = false
+        // ---- 动效收尾：动画、待执行任务、原地刷新句柄、弹窗，一个都不能留给已销毁的界面 ----
+        // 让还在跑的 post 全部作废（页面代次一变，过期的入场动画就会自己退出）
+        pageGeneration++
+        if (::contentHost.isInitialized) {
+            // 先摘掉可能还在排队的 toast 隐藏任务，再取消动画
+            val host = findViewById<ViewGroup>(android.R.id.content)
+            toastHide?.let { h -> host?.removeCallbacks(h) }
+            toastView?.let { v ->
+                v.animate().cancel()
+                runCatching { host?.removeView(v) }
+            }
+            toastView = null
+            toastHide = null
+            contentHost.animate().cancel()
+            (contentHost.getChildAt(0))?.animate()?.cancel()
+            // 内容区的滚动位置恢复是 post 到 contentHost 上的，销毁后不会再跑，无需 removeCallbacks
+        }
+        quotaApply = null
+        modelsRefreshApply = null
+        modelsListPulse = null
+        monitorApply = null
+        refreshLabelRef = null
+        // 还开着的应用内弹窗：不关就是窗口泄漏，下次进来还会看到一块没主的半透明面板
+        liveDialogs.toList().forEach { runCatching { it.dismiss() } }
+        liveDialogs.clear()
         // 监测器是 object，活得比 Activity 久：不摘监听就是长驻内存泄漏，且回调还会打到
         // 已销毁的界面上。它自己会继续跑（服务还在），只是不再往这里推。
         // 用身份比对而不是无条件置 null：窗口重建时旧实例的 onDestroy 可能晚于新实例的 onCreate。
@@ -2350,47 +3432,43 @@ class MainActivity : Activity() {
     }
 
     // ------------------------------------------------------------------
-    // View 组装 helper（这就是本项目的"组件库"）
-    // 改样式只改这一段；圆角/间距/字号只看上面跟随风格的 design token。
-    // 颜色**只写语义名**（"primary" / "on_surface" …），色值全在 AppStyle 的风格表里。
+    // View 组装 helper（玻璃质感；对应设计稿 app.css 的类）
+    // 改样式只改这一段；尺寸走 Tokens（tokens.css），颜色走 AppStyle 语义名。
     // ------------------------------------------------------------------
 
+    /** 滚动容器：内边距 = 页边距 20dp；底部留出胶囊高度 + 距底 + 余量（滚到底不被胶囊压住）。 */
     private fun scroll(build: LinearLayout.() -> Unit): ScrollView {
         val sv = ScrollView(this)
         val col = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(PAGE_PAD_H), dp(PAGE_PAD_TOP), dp(PAGE_PAD_H), dp(PAGE_PAD_BOTTOM))
+            setPadding(
+                dp(Tokens.PAGE_PAD_H), dp(Tokens.PAGE_PAD_TOP), dp(Tokens.PAGE_PAD_H),
+                dp(Tokens.NAV_HEIGHT + Tokens.NAV_BOTTOM_MARGIN + Tokens.SPACE_4)
+            )
             build()
         }
         // 平板/横屏下把内容限宽居中，否则一行文字会横跨整个 3440px 屏幕
         sv.addView(col, FrameLayout.LayoutParams(contentWidth(), -2).apply { gravity = Gravity.CENTER_HORIZONTAL })
+        sv.clipToPadding = false
         return sv
     }
 
-    /** 手机竖屏 = 屏宽（不受影响）；平板/横屏 = CONTENT_MAX_DP 并居中。 */
-    private fun contentWidth(): Int = minOf(resources.displayMetrics.widthPixels, dp(CONTENT_MAX_DP))
+    /** 手机竖屏 = 屏宽（不受影响）；平板/横屏 = NAV_MAX_DP 并居中。 */
+    private fun contentWidth(): Int = minOf(resources.displayMetrics.widthPixels, dp(Tokens.NAV_MAX_WIDTH))
 
     /**
-     * 卡片层次（三种，用来拉开信息优先级，而不是每张卡都长一样）。
+     * 玻璃卡（对应设计稿 `.card`）。语气见 [GlassCard.Tone]。
      *
-     * - [NORMAL] `surface` + 1dp 描边 + 阴影 = 常规内容卡，"凸起"在页面之上；
-     * - [SOFT] `surface_container` 无描边无阴影 = 说明 / 空态，退到后面；
-     * - [EMPHASIS] `primary_container` 无描边无阴影 = 本页最该看的那块（如服务地址），最抢眼。
-     *
-     * 底色不是 `surface` 的卡，里面的正文/说明对比度由 `AppStyle.selfCheck()` 单独钉过。
+     * [padH]=0 且 [padV]=0 时得到"分隔线撑满整宽"的行式列表卡（ListRow 同款做法）。
      */
-    private enum class CardTone(val fill: String, val stroke: String?) {
-        NORMAL("surface", "outline_variant"),
-        SOFT("surface_container", null),
-        EMPHASIS("primary_container", null),
-    }
-
-    private fun card(topMargin: Int = GAP, tone: CardTone = CardTone.NORMAL, build: LinearLayout.() -> Unit): LinearLayout = LinearLayout(this).apply {
-        orientation = LinearLayout.VERTICAL
-        setPadding(dp(CARD_PAD), dp(CARD_PAD), dp(CARD_PAD), dp(CARD_PAD))
-        background = shape(tone.fill, RADIUS_CARD, tone.stroke)
-        // 只有常规卡有阴影：有底色的面板靠颜色分层，再叠阴影会显脏
-        elevation = dp(if (tone == CardTone.NORMAL) AppStyle.current.elevation else 0).toFloat()
+    private fun glassCard(
+        tone: GlassCard.Tone = GlassCard.Tone.NORMAL,
+        topMargin: Int = Tokens.CARD_GAP,
+        padH: Int = Tokens.CARD_PAD,
+        padV: Int = (Tokens.CARD_PAD * 0.875f).toInt(),
+        build: LinearLayout.() -> Unit,
+    ): LinearLayout = GlassCard(this, tone).apply {
+        setPadding(dp(padH), dp(padV), dp(padH), dp(padV))
         build()
         layoutParams = lp(-1, -2, top = topMargin)
     }
@@ -2402,37 +3480,389 @@ class MainActivity : Activity() {
         layoutParams = lp(-1, -2, top = top)
     }
 
-    private fun text(value: String, size: Int = FS_BODY, bold: Boolean = false, colorName: String = "on_surface"): TextView = TextView(this).apply {
+    private fun text(value: String, size: Float = Tokens.TEXT_MD, bold: Boolean = false, colorName: String = "on_surface"): TextView = TextView(this).apply {
         text = value
-        textSize = size.toFloat()
+        textSize = size
         setTextColor(color(colorName))
-        if (bold) setTypeface(typeface, Typeface.BOLD)
-        setLineSpacing(0f, 1.12f)
+        if (bold) typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+        setLineSpacing(0f, 1.35f)
+        includeFontPadding = false
     }
 
     /** 等宽文本：地址、模型 id、时间戳用它，数字和标识符能对齐。 */
-    private fun mono(value: String, size: Int = FS_VALUE, bold: Boolean = false, colorName: String = "on_surface"): TextView =
+    private fun mono(value: String, size: Float = Tokens.TEXT_XS, bold: Boolean = false, colorName: String = "on_surface"): TextView =
         TextView(this).apply {
             text = value
-            textSize = size.toFloat()
+            textSize = size
             setTextColor(color(colorName))
             typeface = Typeface.create(Typeface.MONOSPACE, if (bold) Typeface.BOLD else Typeface.NORMAL)
-            setLineSpacing(0f, 1.12f)
+            setLineSpacing(0f, 1.3f)
+            includeFontPadding = false
         }
 
-    private fun caption(value: String): TextView = text(value, FS_CAPTION, false, "on_surface_variant")
+    /** 说明文字（11sp，次要色；tokens.css .caption）。 */
+    private fun captionText(value: String, colorName: String = "on_surface_variant"): TextView =
+        text(value, Tokens.TEXT_XS, false, colorName).apply { setLineSpacing(0f, 1.6f) }
 
-    /** 区块标题：小号灰字；原先 16sp 深色，和卡片标题（17sp）几乎分不出层级。 */
-    private fun section(value: String): TextView = text(value, FS_SECTION, true, "on_surface_variant").apply {
-        letterSpacing = 0.04f
-        setPadding(0, dp(18), 0, dp(8))
+    /**
+     * 区块标题（11sp 600；tokens.css .section-label）。
+     *
+     * letterSpacing 压到 0：0.06em 的加宽是给拉丁字型的，中文加宽后笔画散、
+     * 层级反而糊（unslop 审计 P5）——中文靠颜色和字号分层就够。
+     */
+    private fun section(value: String): TextView = text(value, Tokens.TEXT_XS, true, "on_surface_variant").apply {
+        letterSpacing = 0f
+        setPadding(0, dp(22), 0, dp(8))
+        layoutParams = lp(-1, -2)
     }
 
-    /** 1dp 分隔线：顶栏/底栏与内容区分层。 */
-    private fun divider(): View = View(this).apply {
+    /** [section] 的带间距版本：挂进竖直容器时用（addView 不收 margin 参数）。 */
+    private fun sectionRow(value: String, topMargin: Int = 0): View = section(value).apply {
+        layoutParams = lp(-1, -2, top = topMargin)
+    }
+
+    /**
+     * 卡内分区容器（对应 tokens.css 的 `.card` 内 border-top 分区）。
+     *
+     * 顶部一条 1px outline_variant 分隔线 + 下方内容区（[topPad] dp 顶距）。
+     * GradientDrawable 做不了"只有顶边"的线，所以用「1px View + 内容容器」实现；
+     * 调用形态：`addView(topLineSection(14) { addView(...) }, top(14))`。
+     */
+    private fun topLineSection(topPad: Int, build: LinearLayout.() -> Unit): LinearLayout =
+        LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(View(this@MainActivity).apply {
+                setBackgroundColor(color("outline_variant"))
+            }, lp(-1, dp(1)))
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(0, dp(topPad), 0, 0)
+                build()
+            }, lp(-1, -2))
+            layoutParams = lp(-1, -2)
+        }
+
+    /** 卡内分区行分隔线（挂在 vertical LinearLayout 中间，撑满宽）。 */
+    private fun rowDivider(): View = View(this).apply {
         setBackgroundColor(color("outline_variant"))
-        layoutParams = LinearLayout.LayoutParams(-1, dp(1))
+        layoutParams = lp(-1, dp(1), top = 0)
     }
+
+    /**
+     * 键值行（tokens.css .kv）：标签列 minWidth 84dp，值可长按选择复制。
+     *
+     * [colorValue] 给 Token「有效」这类需要着色的值用；null = 默认正文色。
+     */
+    private fun labelValue(
+        label: String,
+        value: String,
+        monoValue: Boolean = false,
+        colorValue: String? = null,
+        decorate: ((TextView) -> Unit)? = null,
+    ): View = LinearLayout(this).apply {
+        orientation = LinearLayout.HORIZONTAL
+        gravity = Gravity.CENTER_VERTICAL
+        layoutParams = lp(-1, -2)
+        addView(captionText(label).apply { minWidth = dp(84) }, lp(-2, -2))
+        val v = if (monoValue) mono(value, Tokens.TEXT_XS, colorName = colorValue ?: "on_surface")
+        else text(value, Tokens.TEXT_XS, false, colorValue ?: "on_surface")
+        v.setTextIsSelectable(true)
+        decorate?.invoke(v)
+        addView(v, weighted(start = 10))
+        setPadding(0, dp(3), 0, dp(3))
+    }
+
+    /**
+     * 占比条（tokens.css .bar）：整条 = [value] 占 [max] 的比例。
+     * [idx] 决定填充色（首条主色，其后 accent / muted 轮替），与设计稿 records.html 一致。
+     */
+    private fun shareBar(value: Long, max: Long, idx: Int = 0): View = FrameLayout(this).apply {
+        background = shape("surface_container", Tokens.RADIUS_PILL)
+        val fill = View(this@MainActivity).apply {
+            background = shape(
+                when (idx % 3) { 0 -> "primary"; 1 -> "accent"; else -> "on_surface_variant" },
+                Tokens.RADIUS_PILL)
+        }
+        val ratio = if (max <= 0L) 0f else (value.toFloat() / max).coerceIn(0f, 1f)
+        // 初始宽度必须是 **0**，不能是 WRAP_CONTENT：
+        // FrameLayout 里 WRAP_CONTENT 的子 View 会走 View.getDefaultSize(AT_MOST) → 返回 specSize，
+        // 也就是**撑满整行**。于是每次进记录页都先画一条满格彩条，post 里再改成真实长度 ——
+        // 眼睛看到的就是"闪一下满进度然后秒回"。
+        addView(fill, FrameLayout.LayoutParams(0, dp(6)))
+        // 递归等一次真实宽度：post 有可能赶在 layout 之前跑到，那时 width=0，
+        // 按它算出来会永远是一条 6dp 的点。宽度拿到前不落最终值。
+        fun applyRatio() {
+            val w = width
+            if (w <= 0) {
+                // 只有还挂在窗口上才继续等：detach 之后继续 post 会变成无休止的排队
+                // （记录页反复进出时能看到主线程被这些空转 Runnable 占着）。
+                if (isAttachedToWindow) post { applyRatio() }
+                return
+            }
+            fill.layoutParams = FrameLayout.LayoutParams((w * ratio).toInt().coerceAtLeast(dp(6)), dp(6))
+        }
+        post { applyRatio() }
+        minimumHeight = dp(6)
+    }
+
+    /** 搜索框（tokens.css .search：玻璃加强底 + 圆角 12）。 */
+    private fun searchInput(hintText: String): EditText = EditText(this).apply {
+        hint = hintText
+        isSingleLine = true
+        inputType = InputType.TYPE_CLASS_TEXT
+        setTextColor(color("on_surface"))
+        setHintTextColor(color("on_surface_variant"))
+        background = Tokens.alpha(color("glass_strong"), if (AppStyle.isNight) Tokens.GLASS_STRONG_ALPHA_DARK else Tokens.GLASS_STRONG_ALPHA)
+            .let { GradientDrawable().apply { shape = GradientDrawable.RECTANGLE; setColor(it); cornerRadius = dp(Tokens.RADIUS_CONTROL).toFloat() } }
+            .let { d -> d.apply { setStroke(dp(1), Tokens.alpha(color("glass_line"), if (AppStyle.isNight) Tokens.GLASS_LINE_ALPHA_DARK else Tokens.GLASS_LINE_ALPHA)) } }
+        minHeight = dp(Tokens.MIN_TOUCH)
+        setPadding(dp(13), dp(12), dp(13), dp(12))
+    }
+
+    /**
+     * 主/次按钮（tokens.css .btn.primary / .btn.ghost / .btn.danger）。默认高度 44dp。
+     *
+     * [compact] = 行内小按钮（自适应宽度）；缺省撑满（block）。
+     * [heightDp] / [textSize] 供"行内小按钮"用：44dp 高塞进地址行会把整行撑起来，
+     * 文字被顶到行中央，看上去就是"地址和按钮对不齐"。
+     */
+    private fun glassButton(
+        label: String,
+        style: BtnStyle = BtnStyle.PRIMARY,
+        full: Boolean = true,
+        compact: Boolean = false,
+        enabled: Boolean = true,
+        heightDp: Int = 44,
+        textSize: Float = Tokens.TEXT_MD,
+        click: () -> Unit,
+    ): TextView = TextView(this).apply {
+        text = label
+        this.textSize = textSize
+        gravity = Gravity.CENTER
+        minHeight = dp(heightDp)
+        // 左右必须对称。原先右 padding 写的是 0 —— 对撑满宽的 block 按钮没影响（宽度固定、
+        // gravity=CENTER），但 wrap_content 的行内小按钮会把文字顶到最右侧：
+        // 「复制」两个字看着不在按钮中间，而是贴右边缘。
+        val padH = dp(if (compact || !full) 14 else 18)
+        setPadding(padH, 0, padH, 0)
+        isAllCaps = false
+        typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+        isEnabled = enabled
+        alpha = if (enabled) 1f else 0.5f
+        background = when (style) {
+            BtnStyle.PRIMARY -> shape("primary", Tokens.RADIUS_CONTROL)
+            // 深色下玻璃底(#1D242D)与卡片(#141A22)只差 9/255 的亮度 —— 按钮看上去像一行纯文字，
+            // 用户不知道能点。深色改用 surface_variant 垫底 + 半透明 outline 描边，边界才立得住。
+            BtnStyle.GHOST -> GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = dp(Tokens.RADIUS_CONTROL).toFloat()
+                setColor(
+                    if (AppStyle.isNight) color("surface_variant")
+                    else Tokens.alpha(color("glass_strong"), Tokens.GLASS_STRONG_ALPHA)
+                )
+                setStroke(dp(1), if (AppStyle.isNight) Tokens.alpha(color("outline"), 0.55f)
+                else Tokens.alpha(color("glass_line"), Tokens.GLASS_LINE_ALPHA))
+            }
+            BtnStyle.DANGER -> shape("error_container", Tokens.RADIUS_CONTROL)
+        }
+        setTextColor(color(when (style) {
+            BtnStyle.PRIMARY -> "on_primary"
+            BtnStyle.GHOST -> "on_surface"
+            BtnStyle.DANGER -> "error"
+        }))
+        setOnClickListener { if (isEnabled) click() }
+        // 按压反馈：统一走 Motion（按下 0.98 / 70ms，抬起 120ms），不再在这里单写一套
+        // 0.92 + 2dp 下沉 —— 那是全站最重的一处反馈，"点个复制像按了个实体键"。
+        // 触摸监听返回 false：UP 照常分发 click，不加延迟、不拦长按。
+        if (enabled) Motion.installPressFeedback(this)
+        layoutParams = lp(if (full) -1 else -2, dp(44))
+    }
+
+    private enum class BtnStyle { PRIMARY, GHOST, DANGER }
+
+    /** 次按钮（.btn.ghost 的 compact 版本，行内使用、自适应宽）。 */
+    private fun ghostBtn(
+        label: String,
+        full: Boolean = false,
+        danger: Boolean = false,
+        heightDp: Int = 44,
+        textSize: Float = Tokens.TEXT_MD,
+        click: () -> Unit,
+    ): TextView =
+        glassButton(label, if (danger) BtnStyle.DANGER else BtnStyle.GHOST, full = full,
+            heightDp = heightDp, textSize = textSize) { click() }
+
+    /** 呼吸状态点（tokens.css .pulse：绿色圆点 + 光晕；停止时灰色实心）。 */
+    private fun pulseDot(running: Boolean): View = View(this).apply {
+        background = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(color(if (running) "success" else "on_surface_variant"))
+        }
+        layoutParams = lp(-2, -2)
+        contentDescription = if (running) "运行中" else "已停止"
+    }
+
+    /**
+     * 底层胶囊（tokens.css .chip）。语义场景请用 chipOk / chipWarn / chipBad / chipMute / chipStatic。
+     */
+    private fun chip(value: String, backgroundName: String, textName: String, withDot: Boolean = false): LinearLayout =
+        LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            minimumHeight = dp(26)
+            setPadding(dp(9), 0, dp(9), 0)
+            background = shape(backgroundName, Tokens.RADIUS_PILL)
+            if (withDot) addView(View(this@MainActivity).apply {
+                background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(color(textName)) }
+            }, lp(dp(6), dp(6), end = 5))
+            addView(text(value, Tokens.TEXT_XS, true, textName))
+            layoutParams = lp(-2, -2)   // 显式 wrap：否则在竖直容器里会被拉成整条横幅
+        }
+
+    /** 静态文字 chip（POST/GET 标记这类，指定 tone 即可）。 */
+    private fun chipStatic(value: String, tone: String): LinearLayout = when (tone) {
+        "info" -> chip(value, "accent_container", "accent_on_soft")
+        else -> chip(value, "surface_container", "on_surface_variant")
+    }
+
+    private fun chipOk(value: String) = chip(value, "success_container", "success")
+    private fun chipWarn(value: String) = chip(value, "warning_container", "warning")
+    private fun chipBad(value: String) = chip(value, "error_container", "error")
+    private fun chipMute(value: String) = chip(value, "surface_container", "on_surface_variant")
+    private fun chipWithDot(value: String) = chip(value, "success_container", "success", withDot = true)
+
+    /** 圆形头像（首字 + primary_soft 底；tokens.css .acct .av / .av.mute）。 */
+    private fun avatar(name: String?, mute: Boolean = false): FrameLayout = FrameLayout(this).apply {
+        background = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(color(if (mute) "surface_container" else "primary_container"))
+        }
+        addView(text((name?.trim()?.take(1) ?: "T").uppercase(), Tokens.TEXT_MD, true,
+            if (mute) "on_surface_variant" else "primary_on_soft").apply {
+            gravity = Gravity.CENTER
+        }, FrameLayout.LayoutParams(-1, -1, Gravity.CENTER))
+    }
+
+    private fun avatarInitial(name: String): String = (name.trim().take(1) ?: "T").uppercase()
+
+    /** 图标圆徽（list-item 里的 li-icon 等价物：30dp 圆角方块 + 矢量图标）。 */
+    private fun iconBadge(icon: String, bg: String, tint: String): View {
+        val res = when (icon) {
+            "key" -> R.drawable.ic_key; "user" -> R.drawable.ic_account
+            "gift" -> R.drawable.ic_gift; "moon" -> R.drawable.ic_moon
+            "shield" -> R.drawable.ic_shield; "trash" -> R.drawable.ic_trash
+            "info" -> R.drawable.ic_info
+            else -> R.drawable.ic_more
+        }
+        return FrameLayout(this).apply {
+            background = shape(bg, Tokens.RADIUS_SMALL)
+            addView(android.widget.ImageView(this@MainActivity).apply {
+                setImageResource(res)
+                setColorFilter(color(tint))
+            }, FrameLayout.LayoutParams(dp(16), dp(16), Gravity.CENTER))
+        }
+    }
+
+    /** 二级页入口行（设计稿 .list-item：图标 + 标题/副标题 + 箭头，整行可点）。 */
+    private fun subPageRow(title: String, sub: String, icon: String = "more", onClick: () -> Unit): LinearLayout =
+        LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            minimumHeight = dp(48)
+            setPadding(dp(Tokens.CARD_PAD), dp(11), dp(Tokens.CARD_PAD), dp(11))
+            isClickable = true
+            isFocusable = true
+            Motion.installPressFeedback(this)
+            setOnClickListener { onClick() }
+            addView(iconBadge(icon, "surface_container", "on_surface"), lp(dp(30), dp(30)))
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                addView(text(title, Tokens.TEXT_MD, false))
+                addView(captionText(sub).let { it.setPadding(0, dp(1), 0, 0); it })
+            }, weighted(start = 12))
+            addView(android.widget.ImageView(this@MainActivity).apply {
+                setImageResource(R.drawable.ic_chevron_right)
+                setColorFilter(color("on_surface_variant"))
+            }, lp(dp(15), dp(15), start = 6))
+        }
+
+    /** 所有背景的唯一来源。 */
+    private fun shape(fillName: String, radiusDp: Float, strokeName: String? = null, strokeDp: Int = 1): GradientDrawable = GradientDrawable().apply {
+        shape = GradientDrawable.RECTANGLE
+        setColor(color(fillName))
+        cornerRadius = dp(radiusDp).toFloat()
+        strokeName?.let { setStroke(dp(strokeDp), color(it)) }
+    }
+
+    /**
+     * 按语义名取色 —— 风格与亮暗在**运行期**决定。
+     *
+     * ⚠️ 这里**不能**改回 `getColor(R.color.tw_*)`：资源 id 是编译期常量，
+     * 只有 `values/` 与 `values-night/` 两份，换不了风格。
+     */
+    private fun color(name: String) = AppStyle.color(name)
+    /**
+     * 轻提示：贴导航胶囊**上方**弹出。
+     *
+     * 为什么不用系统 `Toast`：Android 11+ 的文本 Toast 固定在屏幕底部（setGravity 被忽略），
+     * 而本项目的底部胶囊是自绘的悬浮层 —— 两者叠在一起，提示会压住「模型/记录」标签
+     * （真机每种提示都复现）。自绘提示条放在导航栏上方，不遮任何控件，也顺带能换主题色。
+     */
+    private fun toast(value: String) {
+        val host = findViewById<ViewGroup>(android.R.id.content) ?: return
+        // 新的顶掉旧的：先 cancel 旧动画再 removeView —— 只 removeView 的话，
+        // 旧 View 上还在跑的透明度动画会把回调打到已移除的控件上（重影/空指针都出现过）。
+        toastView?.let {
+            it.animate().cancel()
+            runCatching { host.removeView(it) }
+        }
+        toastHide?.let { host.removeCallbacks(it) }
+        val play = Motion.animationsEnabled(this)
+        val tv = TextView(this).apply {
+            text = value
+            textSize = Tokens.TEXT_MD
+            setTextColor(color("on_primary_container"))
+            background = shape("primary_container", Tokens.RADIUS_PILL)
+            setPadding(dp(16), dp(11), dp(16), dp(11))
+            gravity = Gravity.CENTER
+            maxLines = 3
+            alpha = if (play) 0f else 1f
+            translationY = if (play) dp(8).toFloat() else 0f
+        }
+        host.addView(tv, FrameLayout.LayoutParams(-2, -2).apply {
+            gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+            bottomMargin = dp(Tokens.NAV_HEIGHT + Tokens.NAV_BOTTOM_MARGIN + 12)
+            marginStart = dp(24)
+            marginEnd = dp(24)
+        })
+        if (play) {
+            tv.animate().alpha(1f).translationY(0f)
+                .setDuration(140).setInterpolator(Motion.ease()).start()
+        }
+        toastView = tv
+        val hide = Runnable {
+            tv.animate().cancel()
+            if (Motion.animationsEnabled(this)) {
+                tv.animate().alpha(0f).translationY(dp(4).toFloat())
+                    .setDuration(120).setInterpolator(Motion.ease())
+                    .withEndAction {
+                        runCatching { host.removeView(tv) }
+                        if (toastView === tv) toastView = null
+                    }.start()
+            } else {
+                runCatching { host.removeView(tv) }
+                if (toastView === tv) toastView = null
+            }
+        }
+        toastHide = hide
+        host.postDelayed(hide, 2300)
+    }
+    private fun dp(value: Int) = (value * resources.displayMetrics.density + 0.5f).toInt()
+    private fun dp(value: Float) = (value * resources.displayMetrics.density + 0.5f).toInt()
+    private fun lp(width: Int, height: Int, start: Int = 0, top: Int = 0, end: Int = 0, bottom: Int = 0) =
+        LinearLayout.LayoutParams(width, height).apply { setMargins(dp(start), dp(top), dp(end), dp(bottom)) }
+    private fun weighted(start: Int = 0) = LinearLayout.LayoutParams(0, -2, 1f).apply { marginStart = dp(start) }
+    private fun top(value: Int) = lp(-1, -2, top = value)
 
     // ------------------------------------------------------------------
     // 多选弹窗（账号导出 / 导入共用）
@@ -2461,7 +3891,7 @@ class MainActivity : Activity() {
      * 那会和单选（[radioDot]）视觉混淆。选中态是"主色实心 + ✓"，不靠颜色单独传达。
      */
     private fun paintCheckBox(box: TextView, checked: Boolean) {
-        val radius = minOf(RADIUS_CONTROL, 6f)
+        val radius = minOf(Tokens.RADIUS_CONTROL, 6f)
         box.text = if (checked) "✓" else ""
         box.setTextColor(color(if (checked) "on_primary" else "on_surface_variant"))
         box.background =
@@ -2482,7 +3912,7 @@ class MainActivity : Activity() {
         var on = checked
         val box = TextView(this).apply {
             gravity = Gravity.CENTER
-            textSize = FS_CHIP.toFloat()
+            textSize = Tokens.TEXT_XS
             typeface = Typeface.DEFAULT_BOLD
         }
         paintCheckBox(box, on)
@@ -2490,13 +3920,13 @@ class MainActivity : Activity() {
         val texts = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             addView(text(
-                item.title, FS_VALUE, true,
+                item.title, Tokens.TEXT_XS, true,
                 if (item.selectable) "on_surface" else "on_surface_variant",
             ).apply {
                 isSingleLine = true
                 ellipsize = TextUtils.TruncateAt.END
             })
-            addView(caption(item.subtitle).apply {
+            addView(captionText(item.subtitle).apply {
                 isSingleLine = true
                 ellipsize = TextUtils.TruncateAt.END
             }, top(2))
@@ -2551,7 +3981,7 @@ class MainActivity : Activity() {
         val appliers = arrayOfNulls<(Boolean) -> Unit>(items.size)
         val selectableCount = items.count { it.selectable }
 
-        val countLabel = text("", FS_CAPTION, true, "on_surface_variant")
+        val countLabel = text("", Tokens.TEXT_XS, true, "on_surface_variant")
         var allBtn: TextView? = null
 
         fun refreshCount() {
@@ -2560,7 +3990,7 @@ class MainActivity : Activity() {
             allBtn?.text = if (selectableCount > 0 && selected.size == selectableCount) "清空" else "全选"
         }
 
-        allBtn = linkAction("全选") {
+        allBtn = TextAction(this@MainActivity, "全选") {
             val selectAll = selected.size < selectableCount
             selected.clear()
             if (selectAll) selected += items.filter { it.selectable }.map { it.uid }
@@ -2578,7 +4008,7 @@ class MainActivity : Activity() {
             }
             appliers[i] = apply
             list.addView(rowView, LinearLayout.LayoutParams(-1, -2))
-            if (i < items.lastIndex) list.addView(divider())
+            if (i < items.lastIndex) list.addView(rowDivider())
         }
         refreshCount()
 
@@ -2607,144 +4037,48 @@ class MainActivity : Activity() {
             okGuard = { selected.isNotEmpty() },
         ) { onConfirm(selected.toSet()) }
     }
+}
 
-    /**
-     * 状态圆点：**形状 + 颜色双编码**（色盲只靠颜色分不出的状态，靠实心/空心也能分）。
-     *
-     * 实心 = 成立 / 进行中；空心（描边）= 未成立 / 已停止。
-     */
-    private fun dot(tone: String, on: Boolean, sizeDp: Int = 9): View = View(this).apply {
-        background = if (on) shape(tone, RADIUS_PILL) else shape("surface", RADIUS_PILL, tone, 2)
-        layoutParams = lp(dp(sizeDp), dp(sizeDp))
+/**
+ * 嵌套在外层 `ScrollView`（整页 `scroll {}`）里的列表滚动容器。
+ *
+ * **为什么需要它**：Android 的 `ScrollView` 在竖直滑动时会在 `onInterceptTouchEvent`
+ * 抢走事件，内层 `ScrollView` 收不到 MOVE → 卡片里滚不动。用 `setOnTouchListener`
+ * 也不行：外层在更早阶段就 intercept，listener 根本不会被调（实测日志为空）。
+ *
+ * 做法：在**事件必经**的 `onInterceptTouchEvent` 里，按"当前滑动方向上内层还能不能滚"
+ * 动态 `requestDisallowInterceptTouchEvent`——
+ * - 内层还能朝该方向滚 → disallow，事件留在内层；
+ * - 内层已到边界 → 放行，继续滑带动整页。
+ *
+ * 这样卡片内滚动和整页滚动各自可用，且到边界能自然衔接，不出现"卡住"。
+ */
+private class NestedListScroll @JvmOverloads constructor(
+    context: Context,
+    attrs: android.util.AttributeSet? = null,
+) : ScrollView(context, attrs) {
+
+    private var lastY = 0f
+
+    override fun onInterceptTouchEvent(ev: android.view.MotionEvent): Boolean {
+        when (ev.actionMasked) {
+            android.view.MotionEvent.ACTION_DOWN -> {
+                lastY = ev.y
+                // 内层只要可滚就先把事件留住（canScrollVertically 任一方向为 true）
+                val scrollable = canScrollVertically(1) || canScrollVertically(-1)
+                parent?.requestDisallowInterceptTouchEvent(scrollable)
+            }
+            android.view.MotionEvent.ACTION_MOVE -> {
+                val dy = ev.y - lastY
+                lastY = ev.y
+                // dy < 0 = 手指上滑 = 内容下移 = 需要"还能往下滚"(1)
+                val canGo = if (dy < 0) canScrollVertically(1) else canScrollVertically(-1)
+                parent?.requestDisallowInterceptTouchEvent(canGo)
+            }
+            android.view.MotionEvent.ACTION_UP,
+            android.view.MotionEvent.ACTION_CANCEL ->
+                parent?.requestDisallowInterceptTouchEvent(false)
+        }
+        return super.onInterceptTouchEvent(ev)
     }
-
-    /**
-     * 底层胶囊。语义场景请用 chipOk / chipWarn / chipInfo / statusChip，别在这里手配颜色对。
-     *
-     * 传了 [dotTone] 会在文字左边加一个状态点（[dotOn] 决定实心还是空心）。
-     */
-    private fun chip(value: String, backgroundName: String, textName: String, dotTone: String? = null, dotOn: Boolean = false): LinearLayout = LinearLayout(this).apply {
-        orientation = LinearLayout.HORIZONTAL
-        gravity = Gravity.CENTER_VERTICAL
-        minimumHeight = dp(32)
-        setPadding(dp(12), 0, dp(12), 0)
-        background = shape(backgroundName, RADIUS_PILL)
-        dotTone?.let { addView(dot(it, dotOn), lp(dp(9), dp(9), end = 7)) }
-        addView(text(value, FS_CHIP, true, textName))
-        layoutParams = lp(-2, -2)   // 显式 wrap：否则在竖直容器里会被拉成整条横幅
-    }
-
-    /** 带状态点的语义胶囊：**状态一眼可见**（点 + 字，不只靠颜色）。 */
-    private fun statusChip(value: String, tone: String, on: Boolean): LinearLayout =
-        chip(value, "${tone}_container", tone, dotTone = tone, dotOn = on)
-
-    private fun chipOk(value: String) = chip(value, "success_container", "success")
-    private fun chipWarn(value: String) = chip(value, "warning_container", "warning")
-    private fun chipInfo(value: String) = chip(value, "primary_container", "primary")
-
-    /**
-     * 键值行：标签列只给最小宽度（不再是死 96dp，长标签能撑开），值可长按复制。
-     *
-     * [monoValue] 给邮箱这类"标识符型"的值用（见 [copyrightLine]）；
-     * [decorate] 让调用方在**不重写这个布局**的前提下附加行为（如整行可点复制）——
-     * 比再写一个几乎一样、只多一行 setOnClickListener 的行构建器省事且不会走样。
-     */
-    private fun labelValue(
-        label: String,
-        value: String,
-        monoValue: Boolean = false,
-        decorate: ((TextView) -> Unit)? = null,
-    ): View = row {
-        addView(caption(label).apply { minWidth = dp(96) }, lp(-2, -2))
-        val v = if (monoValue) mono(value, FS_VALUE) else text(value, FS_VALUE)
-        v.setTextIsSelectable(true)
-        decorate?.invoke(v)
-        addView(v, weighted(start = 12))
-    }
-
-    /**
-     * 占比条：整条 = [value] 占 [max] 的比例（用 weight 分两段，不引任何依赖）。
-     * 给"模型消耗汇总"用 —— 两列数字扫不出谁吃得多，加条一眼就有结论。
-     */
-    private fun shareBar(value: Long, max: Long): View = LinearLayout(this).apply {
-        orientation = LinearLayout.HORIZONTAL
-        background = shape("surface_variant", RADIUS_PILL)
-        val ratio = if (max <= 0L) 0f else (value.toFloat() / max).coerceIn(0f, 1f)
-        addView(View(this@MainActivity).apply { background = shape("primary", RADIUS_PILL) },
-            LinearLayout.LayoutParams(0, dp(6), ratio))
-        if (ratio < 1f) addView(View(this@MainActivity), LinearLayout.LayoutParams(0, dp(6), 1f - ratio))
-    }
-
-    /** 搜索框：与卡片同一套白底 + 描边。 */
-    private fun searchInput(hintText: String): EditText = EditText(this).apply {
-        hint = hintText
-        isSingleLine = true
-        inputType = InputType.TYPE_CLASS_TEXT
-        setTextColor(color("on_surface"))
-        setHintTextColor(color("on_surface_variant"))
-        background = shape("surface", RADIUS_CARD, "outline_variant")
-        setPadding(dp(14), dp(12), dp(14), dp(12))
-    }
-
-    /**
-     * 小胶囊文字按钮。
-     *
-     * [overContainer] 用在**强调卡内部**（底色本身就是 `primary_container`）——
-     * 那时按钮底要改成 `surface`，否则和卡片同色，会只剩一行字飘在那里。
-     */
-    private fun linkAction(label: String, overContainer: Boolean = false, click: () -> Unit): TextView = TextView(this).apply {
-        text = label
-        textSize = FS_CAPTION.toFloat()
-        typeface = Typeface.DEFAULT_BOLD
-        setTextColor(color("primary"))
-        gravity = Gravity.CENTER
-        minHeight = dp(48)   // 触控目标 ≥ 48dp（无障碍最低要求），原来 40dp 偏小
-        minWidth = dp(48)
-        setPadding(dp(14), 0, dp(14), 0)
-        background = shape(if (overContainer) "surface" else "primary_container", RADIUS_PILL)
-        setOnClickListener { click() }
-    }
-
-    /**
-     * 主按钮。
-     *
-     * [danger] 用于**删除**这类破坏性操作：文字与描边走 `error` 色，一眼看出"这个按钮点了会少东西"。
-     * 不给实心红底 —— 色板里没有 `on_error`，浅色的 error 配白字在深色风格下会看不清。
-     */
-    private fun action(label: String, outlined: Boolean = false, full: Boolean = false, danger: Boolean = false, click: () -> Unit): Button = Button(this).apply {
-        text = label
-        isAllCaps = false
-        minHeight = dp(48)
-        minWidth = dp(48)
-        setPadding(dp(18), 0, dp(18), 0)
-        setTextColor(color(if (danger) "error" else if (outlined) "primary" else "on_primary"))
-        background = if (danger) shape("surface", RADIUS_CONTROL, "error")
-        else if (outlined) shape("surface", RADIUS_CONTROL, "outline")
-        else shape("primary", RADIUS_CONTROL)
-        setOnClickListener { click() }
-        if (full) layoutParams = lp(-1, dp(48))
-    }
-
-    /** 所有背景的唯一来源。`strokeDp` 供选中态加粗描边用（如「外观风格」页的选中卡）。 */
-    private fun shape(fillName: String, radiusDp: Float, strokeName: String? = null, strokeDp: Int = 1): GradientDrawable = GradientDrawable().apply {
-        shape = GradientDrawable.RECTANGLE
-        setColor(color(fillName))
-        cornerRadius = dp(radiusDp).toFloat()
-        strokeName?.let { setStroke(dp(strokeDp), color(it)) }
-    }
-
-    /**
-     * 按语义名取色 —— 风格与亮暗在**运行期**决定。
-     *
-     * ⚠️ 这里**不能**改回 `getColor(R.color.tw_*)`：资源 id 是编译期常量，
-     * 只有 `values/` 与 `values-night/` 两份，换不了风格。
-     */
-    private fun color(name: String) = AppStyle.color(name)
-    private fun toast(value: String) = Toast.makeText(this, value, Toast.LENGTH_SHORT).show()
-    private fun dp(value: Int) = (value * resources.displayMetrics.density + 0.5f).toInt()
-    private fun dp(value: Float) = (value * resources.displayMetrics.density + 0.5f).toInt()
-    private fun lp(width: Int, height: Int, start: Int = 0, top: Int = 0, end: Int = 0, bottom: Int = 0) =
-        LinearLayout.LayoutParams(width, height).apply { setMargins(dp(start), dp(top), dp(end), dp(bottom)) }
-    private fun weighted(start: Int = 0) = LinearLayout.LayoutParams(0, -2, 1f).apply { marginStart = dp(start) }
-    private fun top(value: Int) = lp(-1, -2, top = value)
 }

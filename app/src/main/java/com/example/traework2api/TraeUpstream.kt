@@ -88,8 +88,8 @@ object TraeUpstream {
         .readTimeout(15, TimeUnit.SECONDS)
         .build()
 
-    /** OpenAI 请求体 → Trae 请求体（原地改写）。 */
-    fun prepareBody(raw: JSONObject): JSONObject {
+    /** OpenAI 请求体 → Trae 请求体（原地改写）。[quiet] 供自检调用：不把预期内的告警写进用户可见日志。 */
+    fun prepareBody(raw: JSONObject, quiet: Boolean = false): JSONObject {
         raw.put("stream", true)
         raw.put("function", FUNCTION)
 
@@ -125,7 +125,9 @@ object TraeUpstream {
         // 控制字符还能污染日志。上游模型名本来就是 `[A-Za-z0-9._-]` 形状（见 ModelsRepo 的 id），
         // 所以按形状收紧，不合法就直接回落默认模型而不是把垃圾发出去。
         if (!MODEL_ID_RE.matches(model)) {
-            android.util.Log.w(TAG, "模型名非法，回落默认: ${model.take(40)}")
+            // 自检也要走这条路径（否则断言测的不是真代码），但它每次启动都会跑一次，
+            // 打 W 级日志会在「服务日志」面板留下一条"模型名非法"——用户会以为配置坏了。
+            if (!quiet) android.util.Log.w(TAG, "模型名非法，回落默认: ${model.take(40)}")
             model = DEFAULT_MODE
         }
         raw.put("config_name", model)
@@ -437,8 +439,19 @@ object TraeUpstream {
     /**
      * 解析 `config_info_list` → `/v1/models` 数组。空 `config_name` 跳过（reference 同款闸）。
      *
-     * `name` 取 `display_config.display_name`（空则回落 id）；
-     * `context_length` 取 `model_detail_list[0].max_input_tokens`（取不到回落 131072，与静态表一致）。
+     * `name` 取 `display_config.display_name`（空则回落 id）。
+     *
+     * 上下文：**优先 `context_window_tokens.dev`**（上游真实上下文窗口，如 Seed 的 1,000,000），
+     * 取不到才回落 `model_detail_list[0].max_input_tokens`（该字段对不少模型是缺省值 65536），
+     * 都拿不到回落 131072。
+     *
+     * 倍率：埋在 `display_contact_config`（一个 JSON **字符串**）里，要解两层：
+     * `consumption_rate.data.rate` 是当前倍率，`activity_discount.data.current` 里还有
+     * `before_consumption_rate`（原价）与 `discount`（折扣百分比）。实测 dump：
+     * Seed-2.1-Turbo 原价 0.4、补贴 5 折、当前 0.2、会员 0.1。
+     *
+     * 多模态 / 思考：`display_contact_config.multimodal.enable` / `.reasoning.enable`
+     * （比 `reasoning_effort_config.support_thinking` 更直接、覆盖更全）。
      *
      * **过滤**：上游表混着大量非聊天项（`custom_model_*` 占位、`summary` / `file_search_agent` /
      * `browser_use_subagent` 等内部 agent、以及各类子能力项）。它们当 config_name 发过去
@@ -452,18 +465,40 @@ object TraeUpstream {
             val id = cfg.optString("config_name", "").trim()
             if (id.isEmpty()) continue
             if (!isChatModel(cfg)) continue
-            val name = cfg.optJSONObject("display_config")?.optString("display_name", "")?.trim().orEmpty()
-            var ctx = 0L
-            cfg.optJSONArray("model_detail_list")?.optJSONObject(0)
-                ?.let { ctx = it.optLong("max_input_tokens", 0L) }
+            val dc = cfg.optJSONObject("display_config")
+            val name = dc?.optString("display_name", "")?.trim().orEmpty()
+            // 上下文：context_window_tokens.dev 优先（真实值），max_input_tokens 兜底
+            var ctx = cfg.optJSONObject("context_window_tokens")?.optLong("dev", 0L) ?: 0L
+            if (ctx <= 0L) {
+                cfg.optJSONArray("model_detail_list")?.optJSONObject(0)
+                    ?.let { ctx = it.optLong("max_input_tokens", 0L) }
+            }
             if (ctx <= 0L) ctx = 131072L
-            arr.put(
-                JSONObject()
-                    .put("id", id).put("name", name.ifEmpty { id })
-                    .put("config_name", id).put("context_length", ctx)
-                    .put("object", "model").put("owned_by", "trae-solo")
-                    .put("created", 1753600000)
-            )
+            // 倍率 + 能力：display_contact_config 是 JSON 字符串，解两层
+            val contact = runCatching {
+                JSONObject(cfg.optString("display_contact_config", ""))
+            }.getOrNull()
+            val rate = contact?.optJSONObject("consumption_rate")
+                ?.optJSONObject("data")?.optDouble("rate", -1.0) ?: -1.0
+            val promo = contact?.optJSONObject("activity_discount")
+                ?.optJSONObject("data")?.optJSONObject("current")
+            val originalRate = promo?.optDouble("before_consumption_rate", -1.0) ?: -1.0
+            val discount = promo?.optInt("discount", -1) ?: -1
+            val multimodal = contact?.optJSONObject("multimodal")
+                ?.optBoolean("enable", false) ?: false
+            val thinking = contact?.optJSONObject("reasoning")
+                ?.optBoolean("enable", false) ?: false
+
+            val obj = JSONObject()
+                .put("id", id).put("name", name.ifEmpty { id })
+                .put("config_name", id).put("context_length", ctx)
+                .put("multimodal", multimodal).put("thinking", thinking)
+                .put("object", "model").put("owned_by", "trae-solo")
+                .put("created", 1753600000)
+            if (rate >= 0.0) obj.put("rate", rate)
+            if (originalRate >= 0.0) obj.put("original_rate", originalRate)
+            if (discount >= 0) obj.put("discount", discount)
+            arr.put(obj)
         }
         return if (arr.length() == 0) null else arr
     }
@@ -666,7 +701,7 @@ object TraeUpstream {
         check(!MODEL_ID_RE.matches("")) { "自检失败：空 model 必须被拒（走默认回落）" }
         check(!MODEL_ID_RE.matches("a".repeat(65))) { "自检失败：超长 model 必须被拒" }
         // 真跑一遍查表路径：非法名必须真的变成默认模型，而不只是正则判负。
-        val ghost = prepareBody(JSONObject().put("model", "bad\"name").put("messages", JSONArray()))
+        val ghost = prepareBody(JSONObject().put("model", "bad\"name").put("messages", JSONArray()), quiet = true)
         check(ghost.getString("config_name") == DEFAULT_MODE) { "自检失败：非法 model 未回落到默认" }
         check(ghost.getString("model") == DEFAULT_MODE) { "自检失败：非法 model 未同步回落到默认" }
     }

@@ -71,29 +71,49 @@ object Gateway {
         // 这正是 v0.4.8 修过的同一个症状的残余路径。
         ModelsRepo.init(app)
         val s = LocalFakeServer(apiKey(app))
-        s.usageRecorder = { model, usage, ms, ok, err ->
-            UsageStore.record(app, model,
+        s.usageRecorder = { model, uid, usage, ms, ok, err ->
+            UsageStore.record(
+                app, model, uid,
                 usage?.optInt("prompt_tokens", 0) ?: 0,
                 usage?.optInt("completion_tokens", 0) ?: 0,
                 usage?.optInt("total_tokens", 0) ?: 0,
-                ms, ok, err ?: "")
+                ms, ok, err ?: "",
+                // 成功但没有 usage = 上游没给 token 数。要单独标记：否则它会以 0 token 落盘，
+                // 与"真的 0 token"混在一起，把均值/成本统计拉偏，用户也会以为请求没生效。
+                usageMissing = ok && usage == null
+            )
         }
         // 每次转发前取「当下有效」的凭证（必要时续期）。服务是长驻的、token 会过期，
         // 不能只在启动/登录/切账号时推一次快照（那样跑够 14 天后全是 401）。
+        //
+        // **一次快照贯穿**：uid / regionId / accessToken 全部来自同一个
+        // [TraeAuthStore.loadActiveSession] 结果，中间不再二次 `load()` ——
+        // 否则"续期用 A 的 token、取凭证拿到 B 的 region"会打到错误的 host。
         s.credProvider = {
             locked {
-                TraeAuthApi.restartWithValidToken(app, skewSec = SIXTY_MINUTES_SEC)
-                    ?.let { t -> TraeAuthStore.load(app)?.let { c -> c.copy(accessToken = t) } }
+                val session = TraeAuthStore.loadActiveSession(app)
+                if (session !is TraeAuthStore.SessionResult.Success) null
+                else {
+                    val token = TraeAuthApi.ensureValidToken(app, session, SIXTY_MINUTES_SEC)
+                    if (token.isNullOrBlank()) null else session.cred.copy(accessToken = token)
+                }
             }
         }
         // 故障转移：上游**还没吐正文**就失败（token 死了的 401 / 限流 429 / 5xx）时换另一个账号重试一次。
         // 换号会**真的切过去并持久化** —— 否则下一个请求还拿同一个死账号去撞墙。
         // 过滤 CreditMonitor 标了冷却的账号：它刚因低余额被切走，换回它只会让账号来回跳。
         s.failoverProvider = failover@{ failedUid, err ->
+            // 按错误类型决定处置：限流（429）要顺手把这个账号标冷却，
+            // 否则换号只是把同一个尖峰挪到另一个账号上，下一轮又选回它。
+            val action = LocalFakeServer.classifyUpstreamError(err)
+            if (action == LocalFakeServer.Companion.UpstreamAction.COOLDOWN) {
+                CreditMonitor.markCooldown(failedUid)
+                android.util.Log.i(TAG, "转发失败($err) 属限流，账号 $failedUid 冷却 10 分钟")
+            }
             val next = TraeAuthStore.pickFailoverCandidate(
                 TraeAuthStore.list(app).filterNot { CreditMonitor.isDemoted(it.uid) }, failedUid,
             ) ?: return@failover null
-            android.util.Log.i(TAG, "转发失败($err)，自动换到账号 ${next.uid}(${next.regionId})")
+            android.util.Log.i(TAG, "转发失败($err, $action)，自动换到账号 ${next.uid}(${next.regionId})")
             locked {
                 TraeAuthStore.setActive(app, next.uid)
                 // 必须同步区域：否则会拿新账号的 token 打旧区域的 host

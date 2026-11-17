@@ -37,7 +37,7 @@ class LocalFakeServer(private val apiKey: String) {
 
     /** 聊天用量回调：每次转发结束调用（后台线程）。参数=model,usage(可为null),耗时ms,成功,错误类型。 */
     @Volatile
-    var usageRecorder: ((String, org.json.JSONObject?, Long, Boolean, String?) -> Unit)? = null
+    var usageRecorder: ((String, String, org.json.JSONObject?, Long, Boolean, String?) -> Unit)? = null
 
     /**
      * 故障转移：上一个账号**在还没吐出任何正文之前**就失败时，问一次"换哪个账号"。
@@ -60,6 +60,19 @@ class LocalFakeServer(private val apiKey: String) {
     var failoverRollback: ((originalUid: String) -> Unit)? = null
 
     companion object {
+
+    /**
+     * 最近一次转发请求的时刻（0 = 还没收到过请求）。给 CreditMonitor 判断
+     * "现在有没有活跃对话"用：有就暂不自动换号，避免打断进行中的对话。
+     */
+    @Volatile
+    var lastRequestAt: Long = 0L
+        private set
+
+    /** 每次处理聊天请求时调一次（连接线程）。 */
+    fun touchRequest() {
+        lastRequestAt = System.currentTimeMillis()
+    }
         /**
          * 8788 太常见（各类本地服务 demo 都爱用它），容易与其他 App 的测试服务撞端口。
          * 首选 84772 超出 TCP 端口上限（最大 65535，实测 `IllegalArgumentException: Port
@@ -191,10 +204,29 @@ class LocalFakeServer(private val apiKey: String) {
          * 请求本身的问题（400/404/422 参数错）→ 换谁都一样，换号只会白耗另一个账号的额度并把真错误藏起来。
          * 解析不出状态码的（如网络异常、上游非 http 类错误）→ 保守换一次。
          */
-        internal fun retryableUpstreamError(err: String): Boolean {
-            val code = err.substringAfterLast(':').trim().toIntOrNull() ?: return true
-            return code == 401 || code == 403 || code == 429 || code >= 500
+        internal enum class UpstreamAction {
+            /** 认证失效 / 服务端故障：换号有意义 */
+            SWITCH_ACCOUNT,
+            /** 限流（429）：换号 + 把当前账号标记冷却，别下一轮又选回它 */
+            COOLDOWN,
+            /** 请求本身的问题（400/404/422）：换谁都一样，换号只会白耗账号并把真错误藏起来 */
+            FAIL_FAST,
         }
+
+        internal fun classifyUpstreamError(err: String): UpstreamAction {
+            val code = err.substringAfterLast(':').trim().toIntOrNull()
+                ?: return UpstreamAction.SWITCH_ACCOUNT
+            return when (code) {
+                401, 403 -> UpstreamAction.SWITCH_ACCOUNT
+                429 -> UpstreamAction.COOLDOWN
+                in 500..599 -> UpstreamAction.SWITCH_ACCOUNT
+                else -> UpstreamAction.FAIL_FAST
+            }
+        }
+
+        /** 老签名保留：语义 = 分类结果不是 FAIL_FAST。细粒度处置用 [classifyUpstreamError]。 */
+        internal fun retryableUpstreamError(err: String): Boolean =
+            classifyUpstreamError(err) != UpstreamAction.FAIL_FAST
 
         /**
          * 单请求体上限。**不是可调项，是安全边界**：
@@ -213,8 +245,25 @@ class LocalFakeServer(private val apiKey: String) {
          */
         internal const val MAX_HEADER_LINE = 8 * 1024
 
-        /** 并发连接上限（见实例字段 connSlots）。 */
+/** 并发连接上限：服务监听 0.0.0.0，同网段任何设备都能建连，无上限会打爆线程栈。 */
         private const val MAX_CONNS = 32
+        private val connSlots = java.util.concurrent.Semaphore(MAX_CONNS)
+
+        /**
+         * 当前正在处理的连接数（悬浮窗状态点用）：MAX_CONNS - 剩余 permits。
+         * 0 = 空闲待命（绿点），>0 = 有对话正在转发（主色呼吸）。
+         */
+        val activeConns: Int get() = MAX_CONNS - connSlots.availablePermits()
+
+        /**
+         * 单连接看门狗：流式转发超过这个时长还没结束，强制断开。
+         *
+         * 真机实测（vivo + 手机端客户端）：客户端建连后不读数据时 `out.write` 永久阻塞，
+         * 一个连接占死一个 conn 线程；客户端每次重试新建连接，32 个线程全部耗尽后
+         * accept 停摆 —— 整个网关对所有客户端"死亡"，重启 App 才恢复。
+         * 300s = 上游最长思考（readTimeout 180s）+ 流式余量。
+         */
+        private const val CONN_WATCHDOG_MS = 300_000
 
         /** 拿不到空位时最多等多久再丢弃：给瞬时并发一点缓冲，又不会把 accept 线程堵死。 */
         private const val CONN_QUEUE_WAIT_MS = 5_000L
@@ -382,12 +431,6 @@ class LocalFakeServer(private val apiKey: String) {
     private var server: ServerSocket? = null
     private var acceptThread: Thread? = null
 
-    /**
-     * 并发连接上限。服务监听 0.0.0.0，同网段任何设备都能建连；
-     * 无上限时几百条连接就能把线程栈 + 堆打满（每条连接一个线程）。
-     */
-    private val connSlots = java.util.concurrent.Semaphore(MAX_CONNS)
-
     val isRunning: Boolean get() = running.get()
 
     /**
@@ -423,15 +466,16 @@ class LocalFakeServer(private val apiKey: String) {
                     }
                     // 单个连接的异常不得杀掉进程：一个坏请求只应影响它自己。
                     thread(name = "LocalFakeServer-conn", isDaemon = true) {
-                        try { handle(client) } catch (e: Exception) {
+                        try { handle(client) } catch (e: Throwable) {
                             android.util.Log.w(TAG, "连接处理失败: ${e.javaClass.simpleName}: ${e.message}")
                             try { client.close() } catch (_: Exception) {}
                         } finally {
                             connSlots.release()
                         }
                     }
-                } catch (e: Exception) {
+                } catch (e: Throwable) {
                     if (!running.get()) break
+                    android.util.Log.w(TAG, "accept 异常: ${e.javaClass.simpleName}: ${e.message}")
                 }
             }
         }
@@ -472,6 +516,14 @@ class LocalFakeServer(private val apiKey: String) {
             var line0: String?
             do { line0 = readLineRaw() } while (line0 != null && line0.isEmpty())
             if (line0 == null) return
+            // TLS ClientHello 检测：客户端配成 https:// 时首字节是 0x16（TLS handshake）
+            // 而非可打印字符 —— 旧代码当乱码丢弃、一个字节不回，客户端挂死到超时。
+            // 立刻回 400 人话提示，让用户知道要改 http://（真机 Chatbox 实测）。
+            if (line0.isNotEmpty() && line0[0].code == 0x16) {
+                writeRaw(sock.getOutputStream(), 400, "text/plain; charset=utf-8",
+                    "This port speaks plain HTTP. Use http://127.0.0.1:8787 (not https://) in your client.")
+                return
+            }
             val parts = line0.split(" ")
             if (parts.size < 2) return
             val method = parts[0]
@@ -522,6 +574,8 @@ class LocalFakeServer(private val apiKey: String) {
                 }
                 (query == "/v1/chat/completions" || query == "/chat/completions") && method == "POST" -> {
                     if (!authorized(authHeader)) { writeUnauthorized(out); return }
+                    // 记下"现在有对话在跑"：CreditMonitor 靠它暂缓自动换号
+                    touchRequest()
                     // 两种传体方式都要认：多数客户端发 Content-Length，但 **Chatbox 发 chunked**
                     // （实测 `Transfer-Encoding: chunked`，此时 Content-Length 缺失、contentLength=0）。
                     // 只认 Content-Length 的话 chunked 请求的 body 会读成空串 → 上游收到空请求
@@ -559,9 +613,13 @@ class LocalFakeServer(private val apiKey: String) {
                         // 假回复也记一笔用量（0 token、ok）：否则"发了请求但记录页空空如也"，
                         // 用户没法区分"请求没到达"和"没登录走了假回复"。model 取请求里的
                         // 原始 model（还没进 prepareBody，非法名也不经这里）。
-                        val fakeModel = try { org.json.JSONObject(body).optString("model", "") } catch (_: Exception) { "" }
-                        usageRecorder?.invoke(fakeModel.ifBlank { "fake" }, null, 0, true, null)
-                        writeJson(out, 200, fakeCompletion())
+                        val req = try { org.json.JSONObject(body) } catch (_: Exception) { JSONObject() }
+                        val fakeModel = req.optString("model", "").ifBlank { "trae-default" }
+                        // stream 必须真的分流：客户端默认都是流式，回一个整体 JSON 会让它
+                        // 卡在"等待回复"或直接解析失败（Content-Type 对不上）。
+                        val wantStream = req.optBoolean("stream", false)
+                        usageRecorder?.invoke(fakeModel, "", null, 0, true, null)
+                        if (wantStream) writeFakeStream(out, fakeModel) else writeJson(out, 200, fakeCompletion(fakeModel))
                     } else {
                         // X-Uid 必须与本次 token 同属一个账号，否则上游接受连接却不返回数据。
                         //
@@ -569,8 +627,7 @@ class LocalFakeServer(private val apiKey: String) {
                         // OkHttp 会抛 IOException。未兜的话异常穿到连接线程，而**流式响应头是在
                         // prepareBody 之后才写的** —— 客户端已发出请求却收到零字节，
                         // 表现成"连接被重置"，既没有状态行也无法诊断。
-                        try {
-                            streamingChat(out, body, fresh)
+                        try { streamingChat(out, body, fresh, sock)
                         } catch (e: Exception) {                            android.util.Log.w(TAG, "转发失败: ${e.javaClass.simpleName}: ${e.message}")
                             // 只在还没写过任何字节时补错误响应（流式头一旦发了就不能再补）
                             try { writeJson(out, 502, openAIError("upstream_error", "上游转发失败")) } catch (_: Exception) {}
@@ -610,7 +667,7 @@ class LocalFakeServer(private val apiKey: String) {
      * 这样换号成功时客户端**看不到**上一个账号的报错（否则它会先收到 `[DONE]` 又来数据）。
      * 已经在流里的半截回答无法撤回，所以**只允许在未输出时换**，且只换一次。
      */
-    private fun streamingChat(out: OutputStream, body: String, cred: TraeAuthStore.Cred) {
+    private fun streamingChat(out: OutputStream, body: String, cred: TraeAuthStore.Cred, sock: java.net.Socket) {
         // 请求体是信任边界：空体/非法 JSON 必须回 400，绝不能让 JSONException 冒泡
         // 到连接线程（那样会杀掉整个进程）。
         val src = try {
@@ -624,6 +681,18 @@ class LocalFakeServer(private val apiKey: String) {
         val wantsStream = src.optBoolean("stream", false)
         val prepared = TraeUpstream.prepareBody(src)
         val model = prepared.optString("model", "")
+        // 看门狗：客户端不读数据时 write 永久阻塞占死 conn 线程（真机实测：
+        // vivo + 手机端 agent 客户端，长回复 118KB 堆在 send-q），线程耗尽后网关
+        // 对所有客户端静默死亡。到点 close socket 让阻塞的 write 抛异常逃出。
+        // 看门狗贯穿整个连接生命周期（流式中途卡死也要救），正常结束时撤销。
+        val watchdogDone = java.util.concurrent.atomic.AtomicBoolean(false)
+        val wdThread = thread(name = "conn-watchdog", isDaemon = true) {
+            try { Thread.sleep(CONN_WATCHDOG_MS.toLong()) } catch (_: InterruptedException) { return@thread }
+            if (!watchdogDone.get()) {
+                android.util.Log.w(TAG, "单连接超 ${CONN_WATCHDOG_MS}s 未完成，看门狗强制断开")
+                runCatching { sock.close() }
+            }
+        }
         if (wantsStream) {
             out.write("HTTP/1.1 200 OK\r\n".toByteArray())
             out.write("Content-Type: text/event-stream\r\n".toByteArray())
@@ -678,7 +747,7 @@ class LocalFakeServer(private val apiKey: String) {
             if (next == null) {
                 // 收尾：把攒下的（正常情况下是错误事件）交给客户端
                 for (p in pending) writeChunk(p)
-                usageRecorder?.invoke(model, usage, System.currentTimeMillis() - t0, err == null, err)
+                usageRecorder?.invoke(model, cur.uid, usage, System.currentTimeMillis() - t0, err == null, err)
                 // 换了号却没救活 → 还原成用户原来的账号，免得每次请求都换一次、来回跳
                 if (attempt > 0 && err != null) {
                     try { failoverRollback?.invoke(originalUid) } catch (e: Exception) {
@@ -724,13 +793,15 @@ class LocalFakeServer(private val apiKey: String) {
         writeJson(out, 401, openAIError("invalid_api_key", "missing or invalid local API key"))
     }
 
-    /** 固定的测试回复：与真实 Trae 结构一致，但内容是假的。 */
-    private fun fakeCompletion(): JSONObject {
-        val content = "这是本地假服务返回的测试响应。阶段2第2步已跑通：本地 OpenAI 兼容接口可用，" +
-            "下一步再接真实 TraeWork 上游转发。"
+    /** 未登录时的占位回复正文。给用户看的，不是给开发者看的。 */
+    private val FAKE_TEXT = "（本地占位回复）当前还没有登录 Trae 账号，这条是占位内容。" +
+        "到 App「账号」页登录后，同一个接口就会转发到真实上游。"
+
+    /** 固定的测试回复：与真实 Trae 结构一致，但内容是假的。model 回显请求里的那个。 */
+    private fun fakeCompletion(model: String): JSONObject {
         val message = JSONObject()
             .put("role", "assistant")
-            .put("content", content)
+            .put("content", FAKE_TEXT)
         val choice = JSONObject()
             .put("index", 0)
             .put("message", message)
@@ -739,7 +810,7 @@ class LocalFakeServer(private val apiKey: String) {
             .put("id", "chatcmpl-fake-local")
             .put("object", "chat.completion")
             .put("created", System.currentTimeMillis() / 1000)
-            .put("model", "glm-5.2")
+            .put("model", model)
             .put("choices", JSONArray().put(choice))
             .put(
                 "usage", JSONObject()
@@ -747,6 +818,45 @@ class LocalFakeServer(private val apiKey: String) {
                     .put("completion_tokens", 0)
                     .put("total_tokens", 0)
             )
+    }
+
+    /**
+     * 流式假回复：真 SSE（`text/event-stream` + `data:` 帧 + `[DONE]`）。
+     *
+     * 之前不管 stream 与否都回一个 `application/json` 整体响应，客户端（Chatbox / Cherry
+     * 默认流式）会一直转圈或直接报解析错 —— 而这条路径恰恰是**未登录用户第一次试接口**
+     * 会走到的，第一印象就是"这服务坏了"。
+     */
+    private fun writeFakeStream(out: OutputStream, model: String) {
+        val created = System.currentTimeMillis() / 1000
+        out.write("HTTP/1.1 200 OK\r\n".toByteArray())
+        out.write("Content-Type: text/event-stream; charset=utf-8\r\n".toByteArray())
+        out.write("Cache-Control: no-cache\r\n".toByteArray())
+        out.write("Access-Control-Allow-Origin: *\r\n".toByteArray())
+        out.write("Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n".toByteArray())
+        out.write("Access-Control-Allow-Headers: *\r\n".toByteArray())
+        out.write("Connection: close\r\n\r\n".toByteArray())
+        out.flush()
+
+        fun frame(delta: JSONObject, finish: String?) {
+            val choice = JSONObject().put("index", 0).put("delta", delta)
+                .put("finish_reason", finish ?: JSONObject.NULL)
+            val obj = JSONObject()
+                .put("id", "chatcmpl-fake-local")
+                .put("object", "chat.completion.chunk")
+                .put("created", created)
+                .put("model", model)
+                .put("choices", JSONArray().put(choice))
+            out.write("data: $obj\n\n".toByteArray(Charsets.UTF_8))
+            out.flush()
+        }
+
+        frame(JSONObject().put("role", "assistant").put("content", ""), null)
+        // 按 12 字切块：客户端能明显看到"逐字吐出来"，而不是一帧砸完
+        FAKE_TEXT.chunked(12).forEach { frame(JSONObject().put("content", it), null) }
+        frame(JSONObject(), "stop")
+        out.write("data: [DONE]\n\n".toByteArray(Charsets.UTF_8))
+        out.flush()
     }
 
     /** OpenAI 形状的错误体。**status 不进 body**：它由 HTTP 状态行承载（调用方传）。 */

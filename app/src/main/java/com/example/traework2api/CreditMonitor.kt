@@ -39,6 +39,18 @@ object CreditMonitor {
     private const val KEY_AUTO = "auto_switch_enabled"
     private const val KEY_THRESHOLD = "auto_switch_threshold"
 
+    /**
+     * 余额快照的**磁盘**副本：`{"<uid>":{"v":1234,"t":1731...}}`。
+     *
+     * 存在的唯一理由：账号列表要给每个账号显示余额，而余额只来自上游。
+     * 进程重启后内存表是空的，不落盘的话列表全是「积分未刷新」——那等于每次冷启动
+     * 都得把 5 个国服账号挨个打一遍上游才知道显示什么。
+     */
+    private const val BALANCES_KEY = "balances_json"
+
+    /** 落盘只保留最近这么多条（按读数时间倒序）：账号再多也不会把 prefs 撑大。 */
+    private const val BALANCES_KEEP = 50
+
     /** 轮询间隔。改这里就等于改监控灵敏度，别在别处散落写 30000。 */
     const val TICK_MS = 30_000L
 
@@ -53,6 +65,15 @@ object CreditMonitor {
 
     /** 被判低余额的账号，这段时间内不参与自动换号候选（与 failover 共用）。 */
     private const val DEMOTE_MS = 10 * 60_000L
+
+    /**
+     * 「有活跃对话」的判定窗口：最近这么久之内有过转发请求，就先不自动换号。
+     *
+     * 换号会让正在进行的对话换一个上游账号 —— 上下文与 prompt cache 全部作废，
+     * 用户看到的是"忽然变慢、这一轮特别贵"。等一个请求间隙再切，代价只是晚几十秒。
+     * 2 分钟覆盖了绝大多数单轮思考时长（我们实测流式响应多在 1~10 秒，长推理可到 1 分钟）。
+     */
+    private const val ACTIVE_SESSION_IDLE_MS = 2 * 60_000L
 
     private const val DEFAULT_THRESHOLD = 5L
 
@@ -81,6 +102,9 @@ object CreditMonitor {
     private val main = Handler(Looper.getMainLooper())
     private val readings = ConcurrentHashMap<String, Reading>()
     private val demotedUntil = ConcurrentHashMap<String, Long>()
+
+    /** 磁盘快照只装一次（[prime] 幂等靠它）。 */
+    @Volatile private var primed = false
 
     @Volatile private var latest: Snapshot? = null
     @Volatile private var lastSwitch: Switch? = null
@@ -130,6 +154,76 @@ object CreditMonitor {
     }
 
     /**
+     * 最近一次读数，**不做保鲜期过滤** —— 账号列表要显示"上次查到多少"，哪怕它是昨天的。
+     *
+     * 与 [balanceOf] 分开是刻意的：自动换号的判据必须只认真实新鲜的余额，
+     * 而列表展示可以用旧值（并配上"多久之前"的提示）。两者混用就是误切账号的经典写法。
+     *
+     * @return (余额, 读数时间毫秒) 或 null（从未读到）
+     */
+    fun lastKnown(uid: String): Pair<Long, Long>? = readings[uid]?.let { it.value to it.atMs }
+
+    /**
+     * 把磁盘快照装进内存（幂等）。冷启动时网关没起也能显示上次余额。
+     *
+     * 解析失败直接把这个 key 清掉：宁可显示「积分未刷新」，也不要每次启动都撞同一份坏数据。
+     */
+    fun prime(ctx: Context) {
+        if (primed) return
+        val app = ctx.applicationContext
+        val raw = runCatching { prefs(app).getString(BALANCES_KEY, null) }.getOrNull()
+        if (!raw.isNullOrBlank()) {
+            runCatching {
+                val arr = org.json.JSONObject(raw)
+                arr.keys().forEach { uid ->
+                    val o = arr.optJSONObject(uid) ?: return@forEach
+                    val v = o.optLong("v", Long.MIN_VALUE)
+                    val t = o.optLong("t", 0L)
+                    if (v != Long.MIN_VALUE && t > 0L) {
+                        // 只补空缺：内存里已有更新读数时不要被旧盘值覆盖
+                        readings.putIfAbsent(uid, Reading(v, t))
+                    }
+                }
+            }.onFailure {
+                runCatching { prefs(app).edit().remove(BALANCES_KEY).apply() }
+            }
+        }
+        primed = true
+    }
+
+    /** 落盘：只留最近 [BALANCES_KEEP] 条（按读数时间倒序）。`apply` 异步，不阻塞调用线程。 */
+    private fun persistBalances(ctx: Context) {
+        val app = ctx.applicationContext
+        runCatching {
+            val top = readings.entries
+                .sortedByDescending { it.value.atMs }
+                .take(BALANCES_KEEP)
+            val obj = org.json.JSONObject()
+            for (e in top) {
+                obj.put(e.key, org.json.JSONObject().put("v", e.value.value).put("t", e.value.atMs))
+            }
+            prefs(app).edit().putString(BALANCES_KEY, obj.toString()).apply()
+        }
+    }
+
+    /**
+     * 外部写入一条读数并落盘（批量刷新用）。
+     *
+     * 与 tick 里的内存写法分开：tick 每 30 秒一次，跟着写盘太频繁；
+     * 只有用户显式刷新（一次 5 个账号）才值得持久化。
+     */
+    fun storeReading(ctx: Context, uid: String, value: Long) {
+        if (uid.isBlank()) return
+        record(uid, value)
+        persistBalances(ctx)
+    }
+
+    /** 内存写一条读数。tick / 扫描 / 批量刷新共用这一个入口，别在各处重复构造 Reading。 */
+    private fun record(uid: String, value: Long) {
+        readings[uid] = Reading(value, System.currentTimeMillis())
+    }
+
+    /**
      * 该账号是否在冷却期（被判低余额/刚被自动切走）。
      *
      * `Gateway.failoverProvider` 与 `failoverRollback` 都要看它 —— 否则会出现
@@ -148,12 +242,27 @@ object CreditMonitor {
         demotedUntil[uid] = System.currentTimeMillis() + DEMOTE_MS
     }
 
+    /**
+     * 外部主动让某账号冷却（当前只给「转发撞 429 限流」用）。
+     *
+     * 与内部 [demote] 区别：那个是 monitor 自己判低余额时调的，这个是转发路径上
+     * 撞到上游限流后调的 —— 两者都是"这一小阵别再用它"，共用同一个到期表，
+     * 所以 `isDemoted` 的判据仍然只有一处。
+     */
+    fun markCooldown(uid: String) {
+        if (uid.isBlank()) return
+        demote(uid)
+    }
+
     // ------------------------------------------------------------------
     // 生命周期：由 Gateway.start / Gateway.stop 调（只在那两处，别的地方别起线程）
     // ------------------------------------------------------------------
 
     fun start(context: Context) {
         appCtx = context.applicationContext
+        // 先把磁盘上的余额快照装进来：哪怕网关这次没起来，账号列表也显示上次的值。
+        // 幂等，重复调无害。
+        runCatching { prime(context) }
         if (running) return
         running = true
         worker = Thread({ loop() }, "credit-monitor").apply {
@@ -222,9 +331,11 @@ object CreditMonitor {
 
         // ② 取当前账号 token（必要时在锁内续期），③ 锁外查余额
         val token = tokenFor(ctx, activeUid)
-        val balance = if (token.isNullOrBlank()) null else
-            TraeUpstream.fetchUsage(token, activeUid, activeMeta?.region ?: TraeRegion.current)
-        if (balance != null) readings[activeUid] = Reading(balance, System.currentTimeMillis())
+        // **不能**用 `TraeRegion.current` 兜底：此刻全局可能是别的账号的区，
+        // 拿 A 的 token 打 B 区的 host 只会得到莫名其妙的错误。meta 缺失就跳过本次刷新。
+        val balance = if (token.isNullOrBlank() || activeMeta == null) null else
+            TraeUpstream.fetchUsage(token, activeUid, activeMeta.region)
+        if (balance != null) record(activeUid, balance)
 
         val now = System.currentTimeMillis()
         val threshold = threshold(ctx)
@@ -283,7 +394,7 @@ object CreditMonitor {
                 continue
             }
             val b = TraeUpstream.fetchUsage(c.accessToken, m.uid, m.region) ?: continue
-            readings[m.uid] = Reading(b, System.currentTimeMillis())
+            record(m.uid, b)
             if (b > threshold && b > bestBalance) {
                 bestBalance = b
                 bestMeta = m
@@ -299,6 +410,17 @@ object CreditMonitor {
         }
 
         // 落笔：复核 active 还是我们决定时的那个 —— 扫描要几秒，这期间用户可能手动切过号
+        //
+        // 会话亲和（简化版）：**最近有请求在跑就先不切**。
+        // 换号会让正在进行的对话换一个上游账号，上一轮的上下文与 prompt cache 全部作废，
+        // 用户看到的是"忽然变慢 + 这一轮特别贵"。等请求间隙再切，代价只是晚几十秒。
+        // （完整版是按 session_id 绑定账号，需要 per-request 指定出口，架构改动大，先不做。）
+        val idleMs = System.currentTimeMillis() - LocalFakeServer.lastRequestAt
+        if (LocalFakeServer.lastRequestAt > 0L && idleMs < ACTIVE_SESSION_IDLE_MS) {
+            Log.i(TAG, "最近 ${idleMs / 1000}s 内有请求，暂不自动换号（避免打断对话与 prompt cache）")
+            return null
+        }
+
         val applied = Gateway.locked {
             if (TraeAuthStore.activeUid(ctx) != fromUid) {
                 Log.i(TAG, "扫描期间当前账号已被改动，放弃本次自动换号")

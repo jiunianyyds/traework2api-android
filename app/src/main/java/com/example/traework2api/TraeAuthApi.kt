@@ -81,7 +81,11 @@ object TraeAuthApi {
             nickname = user.nickname,
             regionId = region().id,   // 账号自带区域：切换账号时转发才知道该打哪个 host
         )
-        TraeAuthStore.save(context, cred)
+        // 登录成功即保存并设为当前账号（原语义保留）
+        val saved = TraeAuthStore.saveLogin(context, cred)
+        if (saved != TraeAuthStore.StoreResult.Success) {
+            throw IllegalStateException("保存账号失败：${saved.javaClass.simpleName}")
+        }
         Log.i(TAG, "手动粘贴登录成功 (uid=${cred.uid}, region=${cred.regionId})")
         return cred
     }
@@ -236,17 +240,38 @@ object TraeAuthApi {
     }
 
     /**
-     * 启动即用的续期编排：读**当前账号**的加密凭证 → 若 token 在 [skewSec] 内将过期则换新 → 写回。
+     * 启动即用的续期编排：读**当前账号**的一致会话 → 若 token 在 [skewSec] 内将过期则换新 → 写回。
      * 返回当前有效 access token（无可用 token 时 null）。旧 refresh 失败时不破坏已存数据。
      *
-     * 关键：账号自带 region，续期必须打到**该账号自己的** OAuth host。
-     * 这里临时把 [TraeRegion.current] 切到账号的区域再换 token，
-     * 否则国际服账号会被拿去国内服换（或反过来）——那是实打实踩过的坑。
+     * 三个改进（相对旧实现）：
+     * 1. 用 [TraeAuthStore.loadActiveSession] 一次取「uid + meta + 双密文」，三者必然同源。
+     * 2. 续期**显式传 `cred.region`**，不再靠改 [TraeRegion.current] 全局副作用
+     *    （多线程下会被别的账号改掉，导致拿 A 的 refresh 打 B 区的 host）。
+     * 3. 写回走 [TraeAuthStore.saveRenewal] 的**密文 CAS**：续期期间若账号被重新登录/删除，
+     *    本次结果自动作废，不会覆盖新 token。
      */
     fun restartWithValidToken(context: Context, skewSec: Long): String? {
-        val cred = TraeAuthStore.load(context) ?: return null
-        // 让后续 exchangeToken/getUserInfo 走该账号自己的区域
-        TraeRegion.current = cred.region
+        val session = TraeAuthStore.loadActiveSession(context)
+        if (session !is TraeAuthStore.SessionResult.Success) {
+            Log.i(TAG, "取当前会话失败：${session.javaClass.simpleName}")
+            return null
+        }
+        return ensureValidToken(context, session, skewSec)
+    }
+
+    /**
+     * 用**已有的会话快照**保证 token 有效（必要时续期并写回）。
+     *
+     * 单独暴露出来是给 `Gateway.credProvider` 用的：它需要在一次请求内
+     * 让 `uid` / `regionId` / `accessToken` **全部来自同一份快照**，
+     * 不能"续期时读一次、取凭证时再读一次"。
+     */
+    fun ensureValidToken(
+        context: Context,
+        session: TraeAuthStore.SessionResult.Success,
+        skewSec: Long,
+    ): String? {
+        val cred = session.cred
         if (cred.accessToken.isNotBlank() && !expiredWithin(cred.expiresAt, skewSec)) {
             Log.i(TAG, "token 有效，无需续期 (uid=${cred.uid}, region=${cred.regionId}, exp=${cred.expiresAt})")
             return cred.accessToken
@@ -257,16 +282,23 @@ object TraeAuthApi {
             Log.w(TAG, "无 refreshToken，无法续期")
             return cred.accessToken.takeIf { it.isNotBlank() }
         }
-        val ex = exchangeToken(cred.refreshToken)
-        TraeAuthStore.save(context, TraeAuthStore.Cred(
+        // 显式传该账号自己的区域：换 token 的 host 由账号决定，与全局状态无关
+        val ex = exchangeToken(cred.refreshToken, cred.region)
+        val renewed = TraeAuthStore.Cred(
             accessToken = ex.accessToken,
             refreshToken = ex.refreshToken ?: cred.refreshToken,
             expiresAt = ex.expiresAt ?: cred.expiresAt,
             uid = cred.uid,
             nickname = cred.nickname,
             regionId = cred.regionId,
-        ))
-        Log.i(TAG, "续期成功 (新exp=${ex.expiresAt ?: cred.expiresAt}, refresh轮换=${ex.refreshToken != null})")
+        )
+        when (val r = TraeAuthStore.saveRenewal(context, renewed, session.accessCipher, session.refreshCipher)) {
+            TraeAuthStore.StoreResult.Success ->
+                Log.i(TAG, "续期成功 (新exp=${ex.expiresAt ?: cred.expiresAt}, refresh轮换=${ex.refreshToken != null})")
+            TraeAuthStore.StoreResult.CasConflict ->
+                Log.w(TAG, "续期结果作废：凭据已被替换（重新登录/其它续期先完成）uid=${cred.uid}")
+            else -> Log.w(TAG, "续期写回未成功：$r uid=${cred.uid}")
+        }
         return ex.accessToken
     }
 

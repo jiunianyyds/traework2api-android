@@ -14,4 +14,12 @@
         <item name="android:colorControlHighlight">@color/tw_primary_container</item>
         <item name="android:windowActionModeOverlay">true</item>
     </style>
+
+    <!-- 应用内弹窗统一进出（confirmDialog / 列表菜单 / 排序 / TimePicker）。
+         刻意独立成一个只含窗口动画的样式：Theme.TraeWork2API 一个字都不动 ——
+         换的是"怎么出现"，不是配色、圆角或主题。用法见 ui/Motion.applyDialogMotion()。 -->
+    <style name="DialogMotion">
+        <item name="android:windowEnterAnimation">@anim/dialog_enter</item>
+        <item name="android:windowExitAnimation">@anim/dialog_exit</item>
+    </style>
 </resources>
