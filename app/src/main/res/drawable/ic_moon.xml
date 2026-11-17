@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 月亮（深色模式）：对齐设计稿 icons.svg#i-moon（1.8dp 描边 / 圆头）。 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="18dp"
+    android:height="18dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:strokeColor="@color/tw_on_surface_variant"
+        android:strokeWidth="1.8"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M20,14.5 A8.5,8.5 0 0 1 9.5,4 a8.5,8.5 0 1 0 10.5,10.5 z" />
+</vector>

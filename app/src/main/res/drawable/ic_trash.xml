@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 垃圾桶（清空记录）：对齐设计稿 icons.svg#i-trash（1.8dp 描边 / 圆头）。 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="18dp"
+    android:height="18dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:strokeColor="@color/tw_on_surface_variant"
+        android:strokeWidth="1.8"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M4,7 h16 M9.5,7 V4.5 h5 V7 M6.5,7 l0.8,12.3 A1.7,1.7 0 0 0 9,21 h6 a1.7,1.7 0 0 0 1.7,-1.7 L17.5,7" />
+</vector>

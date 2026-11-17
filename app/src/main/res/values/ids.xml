@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 代码里 View.setTag(id, value) 用的自定义 key（账号列表的区域筛选 tag）。 -->
+<resources>
+    <item name="tag_region" type="id" />
+</resources>

@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 弹窗退出：alpha 1→0 / scale 1→0.99 / translationY 0→4dp / 120ms。
+     曲线同 dialog_enter.xml：内联不了 PathInterpolator，取框架最接近的 ease-out；
+     时长与幅度是本轮方案钦定的量，改这里等于改方案。 -->
+<set xmlns:android="http://schemas.android.com/apk/res/android"
+    android:interpolator="@android:interpolator/linear_out_slow_in"
+    android:shareInterpolator="true">
+
+    <alpha
+        android:duration="120"
+        android:fromAlpha="1.0"
+        android:toAlpha="0.0" />
+
+    <scale
+        android:duration="120"
+        android:fromXScale="1.0"
+        android:fromYScale="1.0"
+        android:pivotX="50%"
+        android:pivotY="50%"
+        android:toXScale="0.99"
+        android:toYScale="0.99" />
+
+    <translate
+        android:duration="120"
+        android:fromYDelta="0"
+        android:toYDelta="4dp" />
+
+</set>

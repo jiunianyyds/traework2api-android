@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 弹窗进入：alpha 0→1 / scale 0.98→1 / translationY 8dp→0 / 160ms。
+     曲线用系统 linear_out_slow_in（≈ cubic-bezier(0,0,0.2,1)，强 ease-out）：
+     XML 里内联不了 PathInterpolator，而新增 res/interpolator/ 文件不在本轮允许清单内，
+     故取最接近的框架曲线；代码侧（ViewPropertyAnimator）仍用统一 PathInterpolator。 -->
+<set xmlns:android="http://schemas.android.com/apk/res/android"
+    android:interpolator="@android:interpolator/linear_out_slow_in"
+    android:shareInterpolator="true">
+
+    <alpha
+        android:duration="160"
+        android:fromAlpha="0.0"
+        android:toAlpha="1.0" />
+
+    <scale
+        android:duration="160"
+        android:fromXScale="0.98"
+        android:fromYScale="0.98"
+        android:pivotX="50%"
+        android:pivotY="50%"
+        android:toXScale="1.0"
+        android:toYScale="1.0" />
+
+    <translate
+        android:duration="160"
+        android:fromYDelta="8dp"
+        android:toYDelta="0" />
+
+</set>
